@@ -69,7 +69,7 @@ flag is relative to the shell's current directory. Absolute paths work in
 all three cases. `config_from_dict` leaves paths as supplied.
 
 The base example writes tracked results and HTML/Markdown reports to
-`alpha_lab/runs/` relative to the public bundle. Synthetic results exercise
+`alpha_lab/runs/` relative to the project root. Synthetic results exercise
 the software and are not evidence of investment performance.
 
 For walk-forward runs, report charts, monthly returns, and headline metrics
@@ -78,11 +78,28 @@ in the persisted result tables but is excluded from those summaries. The
 window table still shows the training dates for context. Full-sample
 diagnostic runs retain their complete date range.
 
-## Numbered references in code comments
+## Numbered references in code and error messages
 
-Some docstrings and comments cite an earlier numbering of the timing rules
-("rule N" or "clause N"). They map to the Timing items above: 1-3 (features,
-signal scoring and fitting, target weights) to item 1; 4-5 (holdings lag and
-gross return) to item 2; 6 (trades, drift and turnover) to item 3; 7 (trade
-execution and cost dating) to items 3 and 4; 8 (cost inputs through t-1) to
-item 4.
+Some docstrings, comments and error messages cite an earlier numbering of the
+timing rules ("rule N" or "clause N"). They map to the Timing items above:
+1-3 (features, signal scoring and fitting, target weights) to item 1; 4-5
+(holdings lag and gross return) to item 2; 6 (trades, drift and turnover) to
+item 3; 7 (trade execution and cost dating) to items 3 and 4; 8 (inputs known
+only through t-1: the drift behind each trade and the cost inputs) to items 3
+and 4.
+
+## Forbidden patterns
+
+Library code must avoid:
+
+- `shift(-k)` / negative shifts anywhere in features, signals, portfolio,
+  costs (test code may use them to *plant* leaks for the harness to catch,
+  or to measure forward returns after the fact).
+- Full-sample statistics inside features/signals (e.g. z-scoring a time
+  series by its full-sample mean/std). Cross-sectional per-date
+  standardization is fine; time-series standardization must be rolling or
+  expanding.
+- Fitting on test dates, peeking across the purge gap, or reusing test data
+  to select hyperparameters presented as out-of-sample.
+- Trading on same-day information the trade itself could not have known
+  (Timing items 2-4 above).

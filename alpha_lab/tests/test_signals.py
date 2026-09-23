@@ -53,7 +53,10 @@ def test_xs_momentum_rank_ic_positive(market_long):
     for t in eval_dates:
         s, f = scores.loc[t], fwd_returns.loc[t]
         valid = s.notna() & f.notna()
-        ics.append(s[valid].corr(f[valid], method="spearman"))
+        # Spearman rank-IC as the Pearson correlation of average ranks: the
+        # same value as method="spearman", which would import scipy (not a
+        # dependency).
+        ics.append(s[valid].rank().corr(f[valid].rank()))
     ics = pd.Series(ics, dtype=float).dropna()
     assert len(ics) >= 700
 
