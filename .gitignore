@@ -25,7 +25,7 @@ private/
 config.yaml
 data/raw/
 
-# Research papers, drafts, slides and literature notes are not published
+# Local documents
 /REPORT.md
 paper/
 papers/
