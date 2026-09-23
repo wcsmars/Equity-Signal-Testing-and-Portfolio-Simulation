@@ -20,6 +20,22 @@ dist/
 *.pem
 *.key
 /state/
+credentials/
+private/
+config.yaml
+data/raw/
+
+# Research papers, drafts, slides and literature notes are not published
+/REPORT.md
+paper/
+papers/
+slides/
+literature/
+*.tex
+*.bib
+*.docx
+*.pdf
+*.pptx
 
 # Downloaded data and generated artifacts; retain library data modules
 /data/

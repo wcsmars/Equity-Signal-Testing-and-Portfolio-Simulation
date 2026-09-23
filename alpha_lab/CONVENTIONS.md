@@ -77,3 +77,12 @@ start at the first test-window date. The training and purge warm-up remains
 in the persisted result tables but is excluded from those summaries. The
 window table still shows the training dates for context. Full-sample
 diagnostic runs retain their complete date range.
+
+## Numbered references in code comments
+
+Some docstrings and comments cite an earlier numbering of the timing rules
+("rule N" or "clause N"). They map to the Timing items above: 1-3 (features,
+signal scoring and fitting, target weights) to item 1; 4-5 (holdings lag and
+gross return) to item 2; 6 (trades, drift and turnover) to item 3; 7 (trade
+execution and cost dating) to items 3 and 4; 8 (cost inputs through t-1) to
+item 4.
