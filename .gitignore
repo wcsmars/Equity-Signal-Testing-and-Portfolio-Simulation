@@ -1,0 +1,30 @@
+# Python and local tooling
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Credentials and execution records
+.env
+.env.*
+*.pem
+*.key
+/state/
+
+# Downloaded data and generated artifacts; retain library data modules
+/data/
+/results/
+/alpha_lab/data/
+/alpha_lab/runs/
+/alpha_lab/feature_cache/
+**/.ipynb_checkpoints/

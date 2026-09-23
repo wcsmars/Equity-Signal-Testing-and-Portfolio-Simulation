@@ -1,0 +1,59 @@
+# Example run: 12-1 cross-sectional momentum on synthetic data, walk-forward,
+# assumed transaction costs. Run: python scripts/run_backtest.py --config configs/base.yaml
+experiment:
+  name: synthetic_momentum_demo
+  runs_dir: ../runs  # relative to this config file
+
+data:
+  source: synthetic
+  synthetic:
+    n_assets: 20
+    n_days: 1512
+    seed: 7
+
+# extra features to compute and pass to the signal alongside its required
+# set (in-process only — nothing is persisted unless a cache_dir is wired)
+features:
+  - name: realized_vol
+    params: {window: 63}
+
+signal:
+  name: xs_momentum
+  params: {window: 252, skip: 21}
+
+portfolio:
+  method: quantile_long_short
+  quantile: 0.2
+  weighting: equal
+  dollar_neutral: true
+  gross_leverage: 2.0
+  # Must satisfy names_per_side * max_weight >= gross_leverage / 2, or the
+  # cap is infeasible: every name pins to the cap, gross shrinks, and
+  # gross_leverage/weighting/vol_target all go inert (the constructor warns).
+  # Here: quantile 0.2 of 20 assets = 4 names/side needing 1.0 gross per
+  # side, and universe churn can drop that to 3 names/side -> cap >= 1/3.
+  max_weight: 0.35
+  vol_target: null
+  vol_lookback: 63
+
+costs:
+  model: realistic
+  commission_per_share: 0.005
+  half_spread_bps: 2.5
+  impact_coeff: 0.1
+  adv_window: 21
+  vol_window: 63
+  portfolio_value: 1000000
+
+backtest:
+  execution_lag: 2  # close-t features execute at close t+1; first return is t+2
+  drift_adjust_turnover: true
+  walkforward:
+    scheme: rolling
+    train_days: 504
+    test_days: 126
+    purge_days: 5
+    embargo_days: 0
+
+report:
+  formats: [html, md]
