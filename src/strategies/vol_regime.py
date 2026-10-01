@@ -53,7 +53,7 @@ SPIKE_HOLD_DAYS = 5
 
 
 def build_weights(prices: pd.DataFrame, indices: pd.DataFrame) -> pd.DataFrame:
-    ratio = (indices["^VIX"] / indices["^VIX3M"]).dropna()
+    ratio = (indices["^VIX"] / indices["^VIX3M"]).reindex(prices.index)
     # Use a prior-session index observation to avoid depending on an
     # official index close published after the assumed equity-close fill.
     smoothed = ratio.rolling(SMOOTH_DAYS).mean().shift(1).dropna()
@@ -95,15 +95,14 @@ def _ts_weights(prices: pd.DataFrame, indices: pd.DataFrame, risk: str,
 
 
 def _spike_weights(prices: pd.DataFrame, indices: pd.DataFrame, k: float) -> pd.DataFrame:
-    """VIX-spike mean reversion: 100% SPY for the 5 days after a close where
-    VIX > k * its 20-day rolling mean; cash otherwise.
+    """VIX-spike example using the previous session's official close.
 
-    This historical experiment uses the same-day VIX close without the
-    additional publication lag in build_weights(). It therefore uses
-    information unavailable at the assumed equity-close fill time."""
-    vix = indices["^VIX"].dropna()
-    trigger = vix > k * vix.rolling(SPIKE_MA_DAYS).mean()
-    in_position = trigger.astype(float).rolling(SPIKE_HOLD_DAYS).max()
+    The 4:15pm VIX print is unavailable for a same-day equity close fill.
+    Historical sweep logs predating this lag used a different timing model.
+    """
+    vix = indices["^VIX"].reindex(prices.index)
+    trigger = (vix > k * vix.rolling(SPIKE_MA_DAYS).mean()).shift(1, fill_value=False)
+    in_position = trigger.astype(float).rolling(SPIKE_HOLD_DAYS, min_periods=1).max()
     weights = pd.DataFrame({"SPY": in_position})
     # align signal dates to the price calendar without lookahead
     weights = (

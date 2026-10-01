@@ -2,9 +2,9 @@
 
 Rank eligible equity ETFs by mean 3-, 6- and 12-month adjusted returns.
 Hold three equal-weight positions, retain incumbents through rank nine,
-and fill vacancies from the highest ranks. A SPY 10-month moving-average
-filter sends the portfolio to IEF when disabled; modeled cash covers periods
-before IEF is available. Weights drift between month-end decisions. Costs
+and fill vacancies from the highest ranks. When SPY's month-end close is
+below its 10-month average of month-end closes, the portfolio moves entirely
+to IEF; modeled cash covers periods before IEF is available. Weights drift between month-end decisions. Costs
 assume 3 bps per side and execution at the decision close.
 
 Default execution prints metrics for the buffered, drifting rule. --sweep
@@ -58,6 +58,10 @@ def month_end_closes(px: pd.DataFrame) -> pd.DataFrame:
 def build_targets(px: pd.DataFrame, k: int, skip: bool, breaker: bool,
                   buffer: int) -> pd.DataFrame:
     """Monthly decision rows (post-trade target weights at month-end closes)."""
+    if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or not 1 <= k <= len(EQ_UNIVERSE):
+        raise ValueError("k must be an integer within the equity universe")
+    if isinstance(buffer, bool) or not isinstance(buffer, (int, np.integer)) or buffer < k:
+        raise ValueError("buffer must be an integer >= k")
     cols = EQ_UNIVERSE + [DEFENSIVE]
     m = month_end_closes(px[cols])
 

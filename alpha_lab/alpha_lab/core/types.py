@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
+from pandas.api.types import is_bool_dtype, is_numeric_dtype
 
 from alpha_lab.core.errors import DataError
 
@@ -59,6 +61,9 @@ class MarketData:
             if frame is None:
                 aligned[name] = None
             elif name == "universe":
+                if (not all(is_bool_dtype(dt) for dt in frame.dtypes)
+                        and not frame.map(lambda value: pd.isna(value) or isinstance(value, (bool, np.bool_))).all().all()):
+                    raise DataError("universe must contain boolean values (missing cells are False)")
                 aligned[name] = (
                     frame.reindex(index=close.index, columns=close.columns)
                     .fillna(False)
@@ -71,28 +76,40 @@ class MarketData:
     # -- validation ----------------------------------------------------
 
     def validate(self) -> None:
+        if not isinstance(self.close, pd.DataFrame):
+            raise DataError("close must be a DataFrame")
         idx = self.close.index
         if not isinstance(idx, pd.DatetimeIndex):
             raise DataError("close index must be a DatetimeIndex")
         if idx.tz is not None:
             raise DataError("close index must be tz-naive")
+        if idx.hasnans:
+            raise DataError("close index contains missing dates")
         if not idx.is_monotonic_increasing:
             raise DataError("close index must be ascending")
         if idx.has_duplicates:
             raise DataError("close index has duplicate dates")
         if self.close.columns.has_duplicates:
             raise DataError("close has duplicate tickers")
-        if bool((self.close <= 0).any().any()):
-            bad = self.close.columns[(self.close <= 0).any()].tolist()
-            raise DataError(f"non-positive close prices in {bad}")
-        for name in _OPTIONAL_FIELDS:
+        for name in ("close", *_OPTIONAL_FIELDS):
             frame = getattr(self, name)
             if frame is None:
                 continue
+            if not isinstance(frame, pd.DataFrame):
+                raise DataError(f"{name} must be a DataFrame")
             if not frame.index.equals(idx) or not frame.columns.equals(self.close.columns):
                 raise DataError(
                     f"{name} is not aligned with close; use MarketData.from_frames to align"
                 )
+            if name == "universe":
+                continue
+            if not all(is_numeric_dtype(dt) and not is_bool_dtype(dt) for dt in frame.dtypes):
+                raise DataError(f"{name} must contain numeric values")
+            values = frame.to_numpy(dtype=float, na_value=np.nan)
+            if np.isinf(values).any():
+                raise DataError(f"{name} contains infinite values")
+            if name != "volume" and (values <= 0).any():
+                raise DataError(f"non-positive {name} prices")
         if self.universe is not None and not all(dt == bool for dt in self.universe.dtypes):
             raise DataError("universe must be boolean")
 

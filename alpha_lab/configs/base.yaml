@@ -28,8 +28,9 @@ portfolio:
   dollar_neutral: true
   gross_leverage: 2.0
   # Must satisfy names_per_side * max_weight >= gross_leverage / 2, or the
-  # cap is infeasible: every name pins to the cap, gross shrinks, and
-  # gross_leverage/weighting/vol_target all go inert (the constructor warns).
+  # cap is infeasible: every name pins to the cap, gross shrinks,
+  # gross_leverage/weighting go inert and vol_target can only scale down
+  # (the constructor warns).
   # Here: quantile 0.2 of 20 assets = 4 names/side needing 1.0 gross per
   # side, and universe churn can drop that to 3 names/side -> cap >= 1/3.
   max_weight: 0.35

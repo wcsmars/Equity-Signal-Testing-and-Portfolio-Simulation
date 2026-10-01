@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from alpha_lab.core.errors import ConfigError
+from alpha_lab.config.schema import finite_number, integer_at_least
 
 
 def cap_weights(
@@ -39,6 +40,11 @@ def cap_weights(
     """
     if not isinstance(weights, pd.DataFrame):
         raise ConfigError("cap_weights expects a DataFrame of weights")
+    finite_number(max_weight, "max_weight")
+    finite_number(tol, "tol")
+    if tol < 0:
+        raise ConfigError("tol must be >= 0")
+    integer_at_least(n_iter, "n_iter", 1)
     if max_weight <= 0:
         raise ConfigError("max_weight must be positive")
     if n_iter < 1:
@@ -80,7 +86,9 @@ def _cap_side(mags: np.ndarray, cap: float, n_iter: int, tol: float) -> np.ndarr
     at_cap = np.zeros(w.shape, dtype=bool)
     # Each pass either finishes or moves >= 1 new name into the capped set,
     # so this terminates in at most n_active passes.
-    for _ in range(n_iter):
+    # A user-supplied iteration hint must not silently break the gross
+    # constraint; at most n active names can enter the capped set.
+    for _ in range(max(n_iter, n)):
         over = w > cap + tol
         if not over.any():
             break
@@ -89,8 +97,10 @@ def _cap_side(mags: np.ndarray, cap: float, n_iter: int, tol: float) -> np.ndarr
         at_cap |= over
         free = active & ~at_cap
         free_sum = float(w[free].sum())
-        if free_sum <= tol:
+        if free_sum <= 0.0:
             break
-        w[free] += excess * w[free] / free_sum
+        # Divide before multiplying, preserving tiny positive bucket weights
+        # instead of underflowing their share of the redistributed excess.
+        w[free] += excess * (w[free] / free_sum)
     np.minimum(w, cap, out=w)  # shave tol-level residue at the fixed point
     return w

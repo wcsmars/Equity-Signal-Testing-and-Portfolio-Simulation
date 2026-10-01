@@ -46,7 +46,7 @@ class FeatureSpec:
 
     @property
     def key(self) -> str:
-        inner = ",".join(f"{k}={v}" for k, v in self.params)
+        inner = ",".join(f"{k}={v!r}" for k, v in self.params)
         return f"{self.name}({inner})"
 
 

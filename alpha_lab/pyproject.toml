@@ -8,14 +8,14 @@ version = "0.1.0"
 description = "Daily equity research tools with walk-forward backtests, cost models, and experiment tracking"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.24",
-    "pandas>=2.1",
-    "PyYAML>=6.0",
-    "matplotlib>=3.7",
+    "numpy>=1.24,<3",
+    "pandas>=2.2,<3",
+    "PyYAML>=6.0,<7",
+    "matplotlib>=3.7,<4",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4,<9"]
 parquet = ["pyarrow>=14"]
 
 [tool.setuptools.packages.find]

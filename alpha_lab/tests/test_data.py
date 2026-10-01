@@ -46,6 +46,31 @@ def test_registry_names():
     assert "csv" in SOURCES
 
 
+@pytest.mark.parametrize("field", ["close", "open", "high", "low", "volume", "unadjusted_close"])
+@pytest.mark.parametrize("bad", [np.inf, -np.inf, "invalid"])
+def test_market_rejects_non_numeric_or_infinite_data(field, bad):
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    close = pd.DataFrame({"A": [10.0, 11.0, 12.0]}, index=dates)
+    panel = pd.DataFrame({"A": [10.0, bad, 12.0]}, index=dates)
+    with pytest.raises(DataError, match="numeric|infinite"):
+        MarketData(**({"close": panel} if field == "close" else {"close": close, field: panel}))
+
+
+@pytest.mark.parametrize("field", ["open", "high", "low", "unadjusted_close"])
+def test_market_rejects_nonpositive_optional_prices(field):
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    close = pd.DataFrame({"A": [10.0, 11.0, 12.0]}, index=dates)
+    with pytest.raises(DataError, match="non-positive"):
+        MarketData(close=close, **{field: close * 0.0})
+
+
+def test_market_does_not_cast_text_false_to_universe_membership():
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    close = pd.DataFrame({"A": [10.0, 11.0, 12.0]}, index=dates)
+    with pytest.raises(DataError, match="boolean"):
+        MarketData.from_frames(close, universe=pd.DataFrame("False", index=dates, columns=["A"]))
+
+
 def test_synthetic_source_matches_make_market():
     kwargs = dict(n_assets=6, n_days=120, seed=3, split_asset=False, universe_churn=False)
     loaded = SyntheticSource(**kwargs).load()
@@ -97,6 +122,16 @@ def test_long_csv_round_trip(tmp_path, market_simple):
     assert_panel_close(loaded.close, market_simple.close)
     assert_panel_close(loaded.volume, market_simple.volume)
     assert loaded.open is None and loaded.universe is None
+
+
+def test_long_csv_keeps_numeric_and_na_like_tickers_as_strings(tmp_path):
+    dates = pd.bdate_range("2020-01-01", periods=5)
+    rows = [(d, t, 100.0 + i) for i, d in enumerate(dates) for t in ("10001", "NA", "AAPL")]
+    file = tmp_path / "long.csv"
+    pd.DataFrame(rows, columns=["date", "ticker", "close"]).to_csv(file, index=False)
+    loaded = CSVSource(file, format="long", tickers=["10001", "NA"]).load()
+    assert list(loaded.close.columns) == ["10001", "NA"]
+    assert loaded.close.notna().all().all()
 
 
 def test_tickers_start_end_filtering(tmp_path, market_simple):
@@ -269,3 +304,61 @@ def test_store_missing_raises(tmp_path, market_simple):
     store.save(market_simple, "panel", snapshot="20240101-000000")
     with pytest.raises(DataError, match="missing-snap"):
         store.load("panel", "missing-snap")
+
+
+def test_store_rejects_overwrite_without_changing_existing_snapshot(tmp_path, market_simple):
+    store = MarketDataStore(tmp_path)
+    path = store.save(market_simple, "panel", "fixed")
+    original = (path / "close.csv").read_bytes()
+    with pytest.raises(DataError, match="already exists"):
+        store.save(market_simple.slice_until(market_simple.dates[10]), "panel", "fixed")
+    assert (path / "close.csv").read_bytes() == original
+
+
+def test_failed_snapshot_save_never_becomes_latest(tmp_path, market_simple, monkeypatch):
+    from pathlib import Path
+
+    store = MarketDataStore(tmp_path)
+    original = store.save(market_simple, "panel", "20240101")
+    write_bytes = Path.write_bytes
+
+    def fail_volume(path, content):
+        if path.name == "volume.csv":
+            raise OSError("simulated disk failure")
+        return write_bytes(path, content)
+
+    monkeypatch.setattr(Path, "write_bytes", fail_volume)
+    with pytest.raises(DataError, match="could not save"):
+        store.save(market_simple, "panel", "20240201")
+    # A crash (which cannot run cleanup) may also leave a pending directory.
+    (original.parent / ".pending-abandoned").mkdir()
+    assert store.list_snapshots("panel") == ["20240101"]
+    pd.testing.assert_frame_equal(store.load("panel").close, market_simple.close, check_freq=False, check_names=False)
+
+
+@pytest.mark.parametrize("field", ["close", "volume", "unadjusted_close", "universe"])
+def test_store_verifies_all_input_field_checksums(tmp_path, market_simple, field):
+    store = MarketDataStore(tmp_path)
+    path = store.save(market_simple, "panel", "fixed")
+    file = path / f"{field}.csv"
+    file.write_bytes(file.read_bytes() + b"\n")
+    with pytest.raises(DataError, match="checksum"):
+        store.load("panel", "fixed")
+
+
+def test_store_preserves_integer_security_identifiers_and_exact_prices(tmp_path):
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    data = MarketData(pd.DataFrame({10001: [0.12345678901234567, 0.12345678901234568, 1000.1234567890123]}, index=dates))
+    store = MarketDataStore(tmp_path)
+    store.save(data, "panel", "fixed")
+    loaded = store.load("panel", "fixed")
+    pd.testing.assert_frame_equal(loaded.close, data.close, check_freq=False, check_names=False, check_exact=True)
+
+
+def test_legacy_snapshot_parses_false_universe_cells(tmp_path):
+    directory = tmp_path / "panel" / "old"
+    directory.mkdir(parents=True)
+    (directory / "close.csv").write_text("date,A\n2024-01-01,100\n2024-01-02,101\n")
+    (directory / "universe.csv").write_text("date,A\n2024-01-01,false\n2024-01-02,\n")
+    data = MarketDataStore(tmp_path).load("panel", "old")
+    assert not data.universe.any().any()

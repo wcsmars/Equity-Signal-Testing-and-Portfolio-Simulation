@@ -7,12 +7,25 @@ mid-backtest.
 
 import dataclasses
 import datetime
+import math
+import numbers
 import types
 import typing
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from alpha_lab.core.errors import ConfigError
+
+
+def finite_number(value, name: str) -> None:
+    """Validate numbers for direct Python construction as well as YAML."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value):
+        raise ConfigError(f"{name} must be a finite number")
+
+
+def integer_at_least(value, name: str, minimum: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value < minimum:
+        raise ConfigError(f"{name} must be an integer >= {minimum}")
 
 
 # --------------------------------------------------------------------------
@@ -70,6 +83,9 @@ def _coerce(hint: Any, val: Any, path: str) -> Any:
     if hint is float:
         if isinstance(val, bool) or not isinstance(val, (int, float)):
             raise ConfigError(f"{path}: expected number, got {val!r}")
+        if not math.isfinite(val):
+            # NaN slips past every range check (all comparisons are False)
+            raise ConfigError(f"{path}: expected a finite number, got {val!r}")
         return float(val)
     if hint is str:
         # YAML parses unquoted dates (`start: 2018-01-01`) to datetime.date;
@@ -98,6 +114,13 @@ class SyntheticConfig:
     universe_churn: bool = True      # one late entrant, one delisting
 
     def __post_init__(self) -> None:
+        integer_at_least(self.n_assets, "n_assets", 2)
+        integer_at_least(self.n_days, "n_days", 10)
+        integer_at_least(self.seed, "seed", 0)
+        for name in ("drift_dispersion", "base_vol"):
+            finite_number(getattr(self, name), name)
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0")
         if self.n_assets < 2 or self.n_days < 10:
             raise ValueError("synthetic panel too small")
 
@@ -163,6 +186,14 @@ class PortfolioConfig:
     min_names: int = 4               # dates with fewer valid names get zero weights
 
     def __post_init__(self) -> None:
+        for name in ("quantile", "gross_leverage", "max_weight"):
+            finite_number(getattr(self, name), name)
+        integer_at_least(self.vol_lookback, "vol_lookback", 5)
+        integer_at_least(self.min_names, "min_names", 0)
+        if self.vol_target is not None:
+            finite_number(self.vol_target, "vol_target")
+            if self.vol_target <= 0:
+                raise ValueError("vol_target must be positive when set")
         if not 0 < self.quantile <= 0.5:
             raise ValueError("quantile must be in (0, 0.5]")
         if self.weighting not in ("equal", "score"):
@@ -187,9 +218,15 @@ class CostConfig:
     portfolio_value: float = 1_000_000.0
 
     def __post_init__(self) -> None:
+        if self.model not in ("realistic", "fixed_bps", "zero"):
+            raise ConfigError(f"unknown cost model '{self.model}'")
+        integer_at_least(self.adv_window, "adv_window", 5)
+        integer_at_least(self.vol_window, "vol_window", 10)
         for name in ("commission_per_share", "half_spread_bps", "impact_coeff", "fixed_bps"):
+            finite_number(getattr(self, name), name)
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be >= 0")
+        finite_number(self.portfolio_value, "portfolio_value")
         if self.portfolio_value <= 0:
             raise ValueError("portfolio_value must be positive")
 
@@ -203,6 +240,10 @@ class WalkForwardConfig:
     embargo_days: int = 0
 
     def __post_init__(self) -> None:
+        integer_at_least(self.train_days, "train_days", 1)
+        integer_at_least(self.test_days, "test_days", 1)
+        integer_at_least(self.purge_days, "purge_days", 0)
+        integer_at_least(self.embargo_days, "embargo_days", 0)
         if self.scheme not in ("rolling", "expanding"):
             raise ValueError(f"unknown walk-forward scheme '{self.scheme}'")
         if self.train_days <= 0 or self.test_days <= 0:
@@ -218,6 +259,7 @@ class BacktestConfig:
     walkforward: Optional[WalkForwardConfig] = field(default_factory=WalkForwardConfig)
 
     def __post_init__(self) -> None:
+        integer_at_least(self.execution_lag, "execution_lag", 1)
         if self.execution_lag < 1:
             raise ValueError(
                 "execution_lag must be >= 1 — lag 0 trades on information "

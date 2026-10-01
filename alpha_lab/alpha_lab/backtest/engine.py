@@ -19,6 +19,8 @@ The law, restated (clauses 4-8):
 from __future__ import annotations
 
 import copy
+import numbers
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -72,7 +74,14 @@ class BacktestEngine:
         the FeatureStore — legal even under walk-forward because features are
         point-in-time by contract (CONVENTIONS.md clause 1).
         """
+        data.validate()  # callers may have mutated a panel after construction
+        if data.close.empty:
+            raise DataError("cannot backtest an empty market panel")
+        if not np.isfinite(self.portfolio_value) or self.portfolio_value <= 0:
+            raise DataError("portfolio_value must be finite and positive")
         lag = self.config.execution_lag
+        if isinstance(lag, bool) or not isinstance(lag, numbers.Integral):
+            raise LookaheadError("execution_lag must be a positive integer")
         if lag < 1:
             # Defense in depth: the schema rejects lag < 1 too, but a config
             # object can be built or mutated programmatically.
@@ -83,6 +92,11 @@ class BacktestEngine:
 
         if features is None:
             features = self._compute_features(data)
+        for key, panel in features.items():
+            if (not isinstance(panel, pd.DataFrame)
+                    or not panel.index.equals(data.dates)
+                    or not panel.columns.equals(data.close.columns)):
+                raise DataError(f"feature '{key}' is not aligned to the data panel")
 
         if self.config.walkforward is None:
             scores, windows, mode = self._score_insample(data, features), None, "insample"
@@ -91,19 +105,39 @@ class BacktestEngine:
             mode = "walkforward"
 
         weights = self.constructor.weights(scores, data)
+        if not isinstance(weights, pd.DataFrame):
+            raise DataError("constructor weights must be a DataFrame")
         if not weights.index.equals(data.dates) or not weights.columns.equals(data.close.columns):
             raise DataError("constructor weights are not aligned to the data panel")
-        weights = weights.fillna(0.0)
+        try:
+            weights = weights.astype(float).fillna(0.0)
+        except (TypeError, ValueError) as exc:
+            raise DataError("constructor weights must be numeric") from exc
+        if not np.isfinite(weights.to_numpy()).all():
+            raise DataError("constructor weights must be finite")
 
         # Clause 4: the timing law. H_t = W_{t-lag}; pre-history holds cash.
         holdings = weights.shift(lag).fillna(0.0)
 
         returns = data.returns()
-        # A delisted asset held into its NaN-return days contributes 0 that
-        # day (position closed at last realized return; the constructor
-        # zeroes its weight from the delisting date). Never a forward-fill.
+        if np.isinf(returns.to_numpy(dtype=float)).any():
+            raise DataError("non-finite asset returns; check extreme price ratios")
+        missing_held = int(((holdings != 0.0) & returns.isna()).to_numpy().sum())
+        if missing_held:
+            warnings.warn(
+                f"{missing_held} held asset-return cells are missing and contribute zero; "
+                "review price gaps and delisting assumptions before using these results",
+                UserWarning, stacklevel=2,
+            )
+        # A held asset with a missing return contributes zero. This does not
+        # model a delisting payout or a liquidation at the last valid price;
+        # see CONVENTIONS.md. Prices are never forward-filled.
         rr = returns.fillna(0.0)
         gross = (holdings * rr).sum(axis=1)
+        if not np.isfinite(gross.to_numpy()).all():
+            raise DataError("non-finite portfolio returns; check prices and weights")
+        if (gross <= -1.0).any():
+            raise DataError("portfolio loses at least 100% before costs; insolvency is unsupported")
 
         if self.config.drift_adjust_turnover:
             # Clause 6: drift(H_{t-1})_i = H_{t-1,i} (1 + r_{t-1,i}) / (1 + gross_{t-1}).
@@ -112,11 +146,9 @@ class BacktestEngine:
             # per-date drift factor is computed on each date's own returns and
             # then shifted forward one day. Using day-t returns here would make
             # trades_t (and hence cost_t) depend on a close that prints after
-            # the trade is fixed — a rule-8 lookahead. The denom guard handles
-            # pathological rows where 1 + gross == 0 (a -100% day wipes the
-            # book; the drifted position is treated as flat).
+            # the trade is fixed — a rule-8 lookahead. Insolvent paths are
+            # rejected above rather than restarting a wiped-out book.
             denom = 1.0 + gross
-            denom = denom.mask(denom == 0.0, np.nan)
             drifted = holdings.mul(1.0 + rr).div(denom, axis=0).shift(1)
         else:
             drifted = holdings.shift(1)
@@ -124,10 +156,24 @@ class BacktestEngine:
 
         trades = holdings - drifted
         turnover = trades.abs().sum(axis=1)
+        if not np.isfinite(trades.to_numpy()).all() or not np.isfinite(turnover.to_numpy()).all():
+            raise DataError("non-finite trades or turnover; check leverage and portfolio returns")
 
         costs = self.cost_model.cost(trades, data, self.portfolio_value)
-        costs = costs.reindex(data.dates).fillna(0.0)
+        # Misaligned or NaN cost output must not silently become zero cost.
+        if not isinstance(costs, pd.Series):
+            raise DataError("cost model output must be a Series")
+        if not costs.index.equals(data.dates):
+            raise DataError("cost model output is not aligned to the data panel")
+        try:
+            costs = costs.astype(float)
+        except (TypeError, ValueError) as exc:
+            raise DataError("cost model output must be numeric") from exc
+        if not np.isfinite(costs.to_numpy()).all() or (costs < 0).any():
+            raise DataError("cost model output must be finite and non-negative")
         net = gross - costs
+        if (net <= -1.0).any():
+            raise DataError("portfolio loses at least 100% after costs; insolvency is unsupported")
 
         return BacktestResult(
             gross_returns=gross,
@@ -142,6 +188,7 @@ class BacktestEngine:
                 "mode": mode,
                 "execution_lag": lag,
                 "portfolio_value": self.portfolio_value,
+                "missing_held_return_cells": missing_held,
             },
         )
 
@@ -151,7 +198,17 @@ class BacktestEngine:
         """One fit + one score over every date. Diagnostic only, never OOS."""
         sig = copy.deepcopy(self.signal)
         sig.fit(features, data, data.dates)
-        return sig.score(features, data)
+        return self._align_scores(sig.score(features, data), data)
+
+    @staticmethod
+    def _align_scores(scores: pd.DataFrame, data: MarketData) -> pd.DataFrame:
+        if not isinstance(scores, pd.DataFrame):
+            raise DataError("signal scores must be a DataFrame")
+        if scores.index.has_duplicates or scores.columns.has_duplicates:
+            raise DataError("signal scores contain duplicate dates or tickers")
+        if len(scores.index.difference(data.dates)) or len(scores.columns.difference(data.close.columns)):
+            raise DataError("signal scores contain dates or tickers not in the data panel")
+        return scores.reindex(index=data.dates, columns=data.close.columns)
 
     def _score_walkforward(
         self, data: MarketData, features: FeatureSet
@@ -170,10 +227,15 @@ class BacktestEngine:
             # Scoring the full panel then masking to the test rows is
             # equivalent to day-by-day scoring: signals are pure per-date
             # maps of point-in-time features (CONVENTIONS.md clause 2).
-            full = sig.score(features, data)
+            full = self._align_scores(sig.score(features, data), data)
+            # Align by label before stitching: a row-only .loc assignment
+            # copies a DataFrame by column POSITION, so a score panel holding
+            # the same tickers in another order (e.g. built by pivot) would
+            # hand each ticker another ticker's score.
+            full = full.reindex(index=data.dates, columns=data.close.columns)
             stitched.loc[window.test_start : window.test_end] = full.loc[
                 window.test_start : window.test_end
-            ]
+            ].to_numpy()
         return stitched, windows
 
     # -- features ---------------------------------------------------------

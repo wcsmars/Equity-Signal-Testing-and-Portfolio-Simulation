@@ -11,7 +11,7 @@ Synthetic data demonstrate the research pipeline; these results are not evidence
 | ann_vol | 19% |
 | sharpe_net | 0.1572 |
 | sharpe_gross | 0.3732 |
-| sharpe_se | 0.03156 |
+| sharpe_se_ann | 0.501 |
 | sortino | 0.2288 |
 | max_drawdown | -34.09% |
 | max_drawdown_peak | 2017-02-15T00:00:00 |

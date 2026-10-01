@@ -30,10 +30,11 @@ def main() -> None:
     ap.add_argument("--snapshot", default=None,
                     help="as-of date for future-period checks")
     ap.add_argument("--max-detail", type=int, default=25,
-                    help="max WARN lines printed per check (FAILs always print)")
+                    help="max WARN lines printed in total (FAILs always print)")
     ap.add_argument("--known", type=Path,
                     default=ROOT / "data" / "dq_known_events.csv",
-                    help="adjudicated real-event allowlist (WARN -> INFO)")
+                    help="adjudicated real-event allowlist (WARN -> INFO); "
+                         "optional, skipped when the file is absent")
     ap.add_argument("--strict", action="store_true",
                     help="ignore the known-events allowlist")
     args = ap.parse_args()
@@ -43,18 +44,29 @@ def main() -> None:
         fund = (pd.read_csv(args.fundamentals)
                 if args.fundamentals is not None else None)
     except Exception as e:  # noqa: BLE001
-        # unreadable input is a FAIL, not a crash: python's default exit 1
-        # would read as "WARN - eyeball" to the pipeline gating on us
-        print(f"data quality: FAIL - cannot load inputs: {e!r}")
-        out = ROOT / "results" / "data_quality.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({"worst": "FAIL", "n_findings": 1,
-                                   "findings": [{"check": "load",
-                                                 "severity": "FAIL",
-                                                 "ticker": "", "date": "",
-                                                 "detail": repr(e)}]},
-                                  indent=1))
-        sys.exit(2)
+        _fail("load", "cannot load inputs", e)
+    try:
+        _check_and_report(args, bundle, fund)
+    except Exception as e:  # noqa: BLE001
+        _fail("run", "check run crashed", e)
+
+
+def _fail(check: str, what: str, e: Exception) -> None:
+    """A crash is a FAIL, not python's default exit 1, which would read as
+    "WARN - eyeball" to the pipeline gating on us."""
+    print(f"data quality: FAIL - {what}: {e!r}")
+    out = ROOT / "results" / "data_quality.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"worst": "FAIL", "n_findings": 1,
+                               "findings": [{"check": check,
+                                             "severity": "FAIL",
+                                             "ticker": "", "date": "",
+                                             "detail": repr(e)}]},
+                              indent=1))
+    sys.exit(2)
+
+
+def _check_and_report(args, bundle, fund) -> None:
     report = run_all(bundle, fundamentals=fund, snapshot_date=args.snapshot)
     if not args.strict and args.known.exists():
         known = pd.read_csv(args.known, dtype=str, keep_default_na=False)

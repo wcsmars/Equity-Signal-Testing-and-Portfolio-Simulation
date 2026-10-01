@@ -26,7 +26,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from qcore.backtest import metrics, run_backtest  # noqa: E402
+from qcore.backtest import drift_weights, metrics, run_backtest  # noqa: E402
 from qcore.calendar import confirmed_month_ends  # noqa: E402
 from qcore.costs import IBKRHKCostModel  # noqa: E402
 from qcore.data import load_prices  # noqa: E402
@@ -49,13 +49,16 @@ def build_signals(px: pd.DataFrame):
     mom121 = ((mp.shift(1) / mp.shift(12) - 1) > 0).astype(float)  # 12-1 mom
     vol_me = (px[RISK].pct_change(fill_method=None)
               .rolling(60).std().loc[mp.index])             # 60d vol at decision date
-    elig = mp.rolling(13).count().eq(13) & vol_me.notna()
+    elig = mp.rolling(13).count().eq(13) & vol_me.notna() & vol_me.gt(0)
     shy_ok = px[CASH].loc[mp.index].notna()
     sigs = {"ma10": ma10, "mom121": mom121, "blend": 0.5 * (ma10 + mom121)}
     return sigs, elig, vol_me, shy_ok
 
 
 def month_end_weights(sig, elig, vol_me, shy_ok, weighting: str, sleeve: str):
+    if weighting not in {"ew", "iv"} or sleeve not in {"cash", "shy"}:
+        raise ValueError("weighting must be ew/iv and sleeve must be cash/shy")
+    elig = elig & vol_me.gt(0) & np.isfinite(vol_me)
     s = sig * elig
     if weighting == "ew":
         n = elig.sum(axis=1)
@@ -71,28 +74,14 @@ def month_end_weights(sig, elig, vol_me, shy_ok, weighting: str, sleeve: str):
     return w
 
 
-def to_daily_drift(w_me: pd.DataFrame, px: pd.DataFrame) -> pd.DataFrame:
-    """Expand month-end targets to daily rows that drift with prices, so the
-    engine charges turnover only at the monthly rebalance (true buy-and-hold
-    between month-ends). The drift model holds the cash remainder constant,
-    ignoring the engine's T-bill credit on it - sub-bp/yr turnover effect."""
-    pxf = px.ffill()
-    P, W = pxf.values, w_me.reindex(px.index).values
-    out = np.zeros_like(P)
-    cur = None
-    p0 = None
-    cash = 0.0
-    for i in range(len(P)):
-        if not np.isnan(W[i]).all():                 # rebalance day: set target
-            cur = np.nan_to_num(W[i])
-            p0 = P[i].copy()
-            cash = 1.0 - cur.sum()
-            out[i] = cur
-        elif cur is not None:                        # drift day
-            g = np.where(np.isnan(P[i] / p0), 1.0, P[i] / p0)
-            vals = cur * g
-            out[i] = vals / (vals.sum() + cash)
-    return pd.DataFrame(out, index=px.index, columns=w_me.columns)
+def to_daily_drift(w_me: pd.DataFrame, px: pd.DataFrame,
+                   cash_rate: float | pd.Series | None = None) -> pd.DataFrame:
+    """Use the engine's drift convention, including idle-cash accrual.
+
+    Prices are aligned by ticker, so caller column order cannot change the
+    portfolio. Pass the same cash_rate used by run_backtest.
+    """
+    return drift_weights(w_me, px, cash_rate=cash_rate)
 
 
 def run_variant(px, sigs, elig, vol_me, shy_ok, signal, weighting, sleeve):
@@ -139,7 +128,8 @@ def main():
 
     m = run_variant(px, sigs, elig, vol_me, shy_ok, **BEST)
     out = {"params": BEST, "slippage_bps": SLIPPAGE_BPS, "universe": RISK,
-           "off_sleeve": CASH, "metrics": m}
+           "off_sleeve": CASH if BEST["sleeve"] == "shy" else "T-bill cash (^IRX - 10bp)",
+           "metrics": m}
     print(json.dumps(out, indent=2))
 
 

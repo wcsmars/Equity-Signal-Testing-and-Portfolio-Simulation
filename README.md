@@ -92,7 +92,10 @@ python src/strategies/mean_reversion.py
 Run the data-quality command separately and inspect its findings before
 continuing: exit code `0` means no warning/failure, `1` means warnings, and `2`
 means failures. It writes `results/data_quality.json`. Strategy scripts print
-computed metrics; supported sweeps also write variant tables in `results/`.
+computed metrics. `pairs_statarb.py` also saves `results/pairs_statarb.json`,
+`tsmom_voltarget.py` runs its variant study and saves
+`results/tsmom_voltarget*.{csv,json}`, and the `--sweep` options write
+variant tables in `results/`.
 
 | Script in `src/strategies/` | Research example |
 | --- | --- |
@@ -120,6 +123,11 @@ computed metrics; supported sweeps also write variant tables in `results/`.
   assumptions. They are not a verified current broker schedule or a complete
   account-specific cost model. QCore does not charge margin interest centrally;
   the volatility-scaling example adds its own financing approximation.
+- Share counts for commissions come from a split-adjusted close, so stocks
+  with large later splits pay the 1%-of-notional commission cap in early years
+  (costs overstated), and reverse splits understate them. Dividends are
+  inferred from adjusted versus unadjusted prices, so spin-off adjustments can
+  be charged withholding as if they were dividends.
 - Missing-price treatment, synthetic universe membership, and simplified
   delisting behaviour limit what the backtests establish. Passing tests checks
   implemented behaviours and known failure cases, not profitability or the
@@ -136,13 +144,16 @@ src/qcore/            original backtest, costs, calendar, statistics, quality ch
 src/strategies/       market-data strategy examples
 src/download_data.py  optional market-data downloader
 scripts/data_quality.py
-tests/               synthetic data-corruption tests
+tests/               QCore engine, downloader and data-quality tests (synthetic data)
 examples/            synthetic report and charts, viewable directly on GitHub
 ```
 
-Local validation: the test suite passed on Python 3.11.7; the offline example
-and report rebuild also completed from a standalone copy in a folder containing spaces.
+Local validation: 472 tests passed on Python 3.11.7 in isolated environments
+using current compatible dependencies and the declared minimum versions,
+without SciPy. The offline example, report rebuild, and package wheel build
+and import completed from standalone copies in folders containing spaces.
 The GitHub workflow is configured to run the tests and offline example on
-Python 3.11 and 3.12. The live market-data download was not rerun for this copy.
+Python 3.11 and 3.12. A small live downloader smoke test covered SPY, QQQ,
+SGOV and two index series; it does not validate every instrument or historical bar.
 
 Released under the [MIT License](LICENSE).

@@ -19,7 +19,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from alpha_lab.config.schema import CostConfig
+from alpha_lab.config.schema import CostConfig, finite_number, integer_at_least
 from alpha_lab.core.errors import ConfigError
 from alpha_lab.core.interfaces import CostModel, ZeroCost
 from alpha_lab.core.registry import Registry
@@ -37,6 +37,7 @@ class FixedBps(CostModel):
     """Flat proportional cost: cost_t = sum_i |trade_{t,i}| * bps * 1e-4."""
 
     def __init__(self, bps: float = 5.0) -> None:
+        finite_number(bps, "bps")
         if bps < 0:
             raise ConfigError("fixed_bps: bps must be >= 0")
         self.bps = float(bps)
@@ -69,7 +70,9 @@ class RealisticCost(CostModel):
 
     If the data has no ``unadjusted_close``, the model warns once (per
     instance) and falls back to the adjusted close — degraded mode, because
-    adjusted prices misstate share counts across splits.
+    adjusted prices misstate share counts across splits. Individual cells
+    with a missing raw price but a valid adjusted close fall back the same
+    way (one warning per instance), so they are never commission-free.
     """
 
     #: conservative defaults for traded cells with missing rolling history
@@ -92,23 +95,24 @@ class RealisticCost(CostModel):
             ("half_spread_bps", half_spread_bps),
             ("impact_coeff", impact_coeff),
         ):
+            finite_number(val, name)
             if val < 0:
                 raise ConfigError(f"realistic cost model: {name} must be >= 0")
         # min_periods below are max(5, w//2) and max(10, w//2); shorter windows
         # would make min_periods exceed the window and pandas would reject it
-        if adv_window < 5:
-            raise ConfigError("realistic cost model: adv_window must be >= 5")
-        if vol_window < 10:
-            raise ConfigError("realistic cost model: vol_window must be >= 10")
+        integer_at_least(adv_window, "adv_window", 5)
+        integer_at_least(vol_window, "vol_window", 10)
         self.commission_per_share = float(commission_per_share)
         self.half_spread_bps = float(half_spread_bps)
         self.impact_coeff = float(impact_coeff)
         self.adv_window = int(adv_window)
         self.vol_window = int(vol_window)
         self._warned_no_unadjusted = False
+        self._warned_partial_unadjusted = False
 
     def cost(self, trades: pd.DataFrame, data, portfolio_value: float) -> pd.Series:
         """Total cost per date as a NAV fraction (index = trades.index)."""
+        finite_number(portfolio_value, "portfolio_value")
         if portfolio_value <= 0:
             raise ConfigError("realistic cost model: portfolio_value must be positive")
 
@@ -131,6 +135,22 @@ class RealisticCost(CostModel):
                 )
                 self._warned_no_unadjusted = True
             price_raw = data.close
+        else:
+            # per-cell fallback: a raw price missing where the adjusted close
+            # exists would otherwise make that cell's commission free
+            gaps = price_raw.isna() & data.close.notna()
+            n_gaps = int(gaps.to_numpy().sum())
+            if n_gaps:
+                if not self._warned_partial_unadjusted:
+                    warnings.warn(
+                        f"unadjusted_close is missing on {n_gaps} cells where the "
+                        "adjusted close exists; those cells fall back to the "
+                        "adjusted close for share math",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    self._warned_partial_unadjusted = True
+                price_raw = price_raw.where(~gaps, data.close)
 
         # -- spread ------------------------------------------------------
         spread = abs_tr.sum(axis=1) * self.half_spread_bps * 1e-4
@@ -154,7 +174,10 @@ class RealisticCost(CostModel):
         # through t-1 — compute rolling panels on data's index, then shift(1).
         if data.volume is not None:
             adv_dollars = (
-                (data.volume * price_raw)
+                # Negative volume is a reported data-quality error. If the
+                # caller deliberately proceeds, treat it as missing history
+                # so sqrt(negative participation) cannot erase impact costs.
+                (data.volume.where(data.volume >= 0) * price_raw)
                 .rolling(self.adv_window, min_periods=max(5, self.adv_window // 2))
                 .mean()
                 .shift(1)

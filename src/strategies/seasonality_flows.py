@@ -2,9 +2,8 @@
 
 Hold SPY through the last four trading days of a month and the first two
 of the next, with modeled cash otherwise. Weights anticipate the next
-session's calendar window and the engine shifts them by one row. Historical
-window dates come from the cached calendar; incomplete trailing months are
-excluded using qcore.calendar's heuristic. Costs assume 2 bps per side.
+session's calendar window and the engine shifts them by one row. Window dates use approximate NYSE holiday rules independently of the
+price sample; future unscheduled closures are not assumed known. Costs assume 2 bps per side.
 
 Default execution prints metrics. --sweep compares window/filter settings
 and writes a variants CSV; --overnight-note reports a descriptive gross
@@ -23,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from qcore.backtest import OOS_SPLIT, TRADING_DAYS, metrics, run_backtest
-from qcore.calendar import in_complete_month
+from qcore.quality import SPECIAL_CLOSURES, nyse_bdays
 from qcore.costs import IBKRHKCostModel
 from qcore.data import load, load_prices
 
@@ -34,25 +33,39 @@ SLIPPAGE_BPS = 2.0
 
 def tom_weights(spy: pd.Series, n_last: int = N_LAST, m_first: int = M_FIRST,
                 dma_filter: bool = False) -> pd.DataFrame:
-    """Target weights decided at each close (engine applies the 1-day lag).
+    """Target at each close for the next scheduled NYSE session.
 
-    Live edge: 'days left in the month' is calendar information, exact for
-    completed months but UNKNOWABLE from a data file whose last month is
-    partial (the file's final row always looks like a month-end). The
-    last-N leg is therefore masked off in an incomplete trailing month
-    (qcore.calendar) - a live operator entering the month-end window must
-    confirm the window against the published NYSE calendar. The first-M
-    leg is backward-looking and always live-safe."""
+    Compute the complete calendar month independently of the price sample,
+    including at the live edge. Future special closures are excluded only
+    after they occur, since an unscheduled closure is not known in advance.
+    Regular holiday rules are approximate; verify the live exchange calendar.
+    """
+    if any(isinstance(v, bool) or not isinstance(v, (int, np.integer)) or v < 0
+           for v in (n_last, m_first)):
+        raise ValueError("window lengths must be nonnegative integers")
     idx = spy.index
-    months = idx.to_period("M")
-    ones = pd.Series(1, index=idx)
-    rank_from_start = ones.groupby(months).cumcount() + 1   # 1 = first td of month
-    days_left = ones.groupby(months).transform("size") - rank_from_start  # 0 = last td
+    if not isinstance(idx, pd.DatetimeIndex) or not idx.is_unique or not idx.is_monotonic_increasing:
+        raise ValueError("prices need unique, sorted dates")
+    if idx.empty:
+        return pd.DataFrame({"SPY": pd.Series(dtype=float)}, index=idx)
+    # Include future special-closure weekdays initially. Each decision can
+    # remove only closures already observed by that date.
+    start = idx[0].to_period("M").start_time
+    end = (idx[-1].to_period("M") + 1).end_time.normalize()
+    regular = nyse_bdays(start, end).union(
+        SPECIAL_CLOSURES[(SPECIAL_CLOSURES >= start) & (SPECIAL_CLOSURES <= end)]
+    ).sort_values()
+    hold = pd.Series(False, index=idx)
+    for date in idx:
+        calendar = regular.difference(SPECIAL_CLOSURES[SPECIAL_CLOSURES <= date])
+        future = calendar[calendar > date]
+        if future.empty:
+            continue
+        next_day = future[0]
+        month = calendar[calendar.to_period("M") == next_day.to_period("M")]
+        rank = int(month.get_loc(next_day))
+        hold.loc[date] = rank < m_first or len(month) - rank <= n_last
 
-    complete = in_complete_month(idx)
-    in_window = ((days_left <= n_last - 1) & complete) | (rank_from_start <= m_first)
-    # hold on day d+1 iff d+1 is in the window: decide at close d
-    hold = in_window.shift(-1, fill_value=False).astype(bool)
     if dma_filter:
         hold &= spy > spy.rolling(200).mean()
     return pd.DataFrame({"SPY": hold.astype(float)}, index=idx)

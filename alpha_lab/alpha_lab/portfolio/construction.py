@@ -14,7 +14,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from alpha_lab.config.schema import PortfolioConfig
+from alpha_lab.config.schema import PortfolioConfig, finite_number, integer_at_least
 from alpha_lab.core.errors import ConfigError, DataError
 from alpha_lab.core.interfaces import PortfolioConstructor
 from alpha_lab.core.registry import Registry
@@ -32,7 +32,8 @@ _EPS = 1e-9
 class QuantileLongShort(PortfolioConstructor):
     """Long the top score quantile, short the bottom (or long-only top).
 
-    Per date, among names in the effective universe with a non-NaN score:
+    Per date, among names in the effective universe with a finite score
+    (NaN and +-inf count as no opinion):
     ``k = max(1, floor(n * quantile))`` names go in each bucket. ``equal``
     weighting spreads gross_leverage/2 evenly per side; ``score`` weighting
     is proportional to the score's distance from the bucket's worst score.
@@ -42,7 +43,9 @@ class QuantileLongShort(PortfolioConstructor):
     With ``vol_target`` set (annualized), each row is scaled by
     ``clip(target_daily / est_t, 0, 3)`` where ``est_t`` is a diagonal
     portfolio-vol estimate from trailing per-name vol through t, then the
-    per-name cap is re-applied.
+    per-name cap is re-applied. Rows with no usable estimate keep their
+    unscaled weights: rows holding nothing, and rows where any held name
+    lacks ``vol_lookback // 2`` days of return history (e.g. a new entrant).
     """
 
     def __init__(
@@ -56,6 +59,12 @@ class QuantileLongShort(PortfolioConstructor):
         vol_lookback: int = 63,
         min_names: int = 4,
     ) -> None:
+        for name, value in (("quantile", quantile), ("gross_leverage", gross_leverage), ("max_weight", max_weight)):
+            finite_number(value, name)
+        if vol_target is not None:
+            finite_number(vol_target, "vol_target")
+        integer_at_least(vol_lookback, "vol_lookback", 5)
+        integer_at_least(min_names, "min_names", 0)
         if not 0 < quantile <= 0.5:
             raise ConfigError("quantile must be in (0, 0.5]")
         if weighting not in ("equal", "score"):
@@ -97,7 +106,9 @@ class QuantileLongShort(PortfolioConstructor):
         out = pd.DataFrame(0.0, index=scores.index, columns=scores.columns)
         min_active = max(self.min_names, 2)
         for t in scores.index:
-            row = masked.loc[t].dropna()
+            # float first: object/bool score rows would break isfinite
+            row = pd.to_numeric(masked.loc[t], errors="coerce").astype(float)
+            row = row[np.isfinite(row)]  # NaN and +-inf scores: no opinion
             n = len(row)
             if n < min_active:
                 continue  # no-opinion row stays all-zero
@@ -122,8 +133,9 @@ class QuantileLongShort(PortfolioConstructor):
         out = cap_weights(out, self.max_weight)
         # The infeasible-cap branch of cap_weights silently flattens every
         # active name to exactly max_weight and SHRINKS the row's gross. In
-        # that regime gross_leverage / weighting / vol_target are all inert
-        # knobs — warn once so a sweep over them isn't read as "no effect".
+        # that regime gross_leverage / weighting are inert knobs (vol_target
+        # can only scale down) — warn once so a sweep over them isn't read as
+        # "no effect".
         if not self._warned_infeasible_cap:
             capped_gross = out.abs().sum(axis=1)
             shrunk = capped_gross < requested_gross * (1.0 - 1e-9) - 1e-12
@@ -135,9 +147,10 @@ class QuantileLongShort(PortfolioConstructor):
                     f"requested gross on {n_bad} of {int(active.sum())} active "
                     f"dates: every selected name is flattened to the cap and "
                     f"achieved gross falls short of gross_leverage="
-                    f"{self.gross_leverage} — gross_leverage, weighting and "
-                    f"vol_target have no effect in this regime. Raise "
-                    f"max_weight or lower gross_leverage/quantile.",
+                    f"{self.gross_leverage} — gross_leverage and weighting "
+                    f"have no effect in this regime and vol_target can only "
+                    f"scale the book down. Raise max_weight or quantile, or "
+                    f"lower gross_leverage.",
                     UserWarning,
                     stacklevel=2,
                 )

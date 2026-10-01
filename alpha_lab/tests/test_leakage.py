@@ -14,7 +14,7 @@ import pytest
 
 from alpha_lab.backtest.costs import RealisticCost
 from alpha_lab.core.errors import DataError, LookaheadError
-from alpha_lab.core.interfaces import CostModel
+from alpha_lab.core.interfaces import CostModel, PortfolioConstructor, Signal
 from alpha_lab.features import FEATURES
 from alpha_lab.portfolio import QuantileLongShort
 from alpha_lab.signals import CrossSectionalMomentum, ShortTermReversal
@@ -98,6 +98,9 @@ def test_constructor_pit_vol_target(momentum_scores, market):
 
 # -- cost model (Timing item 4: market inputs through t-1) ------------------
 
+# The harness fills same-day missing cells (e.g. a delisted close) to probe
+# missingness dependence, which triggers the per-cell raw-price fallback.
+@pytest.mark.filterwarnings("ignore:unadjusted_close is missing on:UserWarning")
 def test_realistic_cost_pit(market):
     trades = pd.DataFrame(0.0, index=market.dates, columns=market.tickers)
     trades.iloc[100, 0] = 0.05    # pre-split trade in the split name
@@ -212,3 +215,80 @@ def test_unknown_truncation_date_is_a_data_error(market_simple):
 def test_clean_callable_passes(market_simple):
     # sanity: the harness does not cry wolf on a trivially trailing compute
     assert_truncation_invariant(lambda d: d.close.rolling(5).mean(), market_simple)
+
+
+# -- every exported checker must catch a planted violation -------------------
+
+
+class _LeakySignal(Signal):
+    """Scores with tomorrow's close — a lookahead the signal check must catch."""
+
+    name = "leaky_signal"
+
+    def score(self, features, data):
+        return data.close.shift(-1) / data.close - 1.0
+
+
+class _FullSampleZSignal(Signal):
+    """Full-sample time-series z-score — no NaN tell, only value deviation."""
+
+    name = "full_sample_z"
+
+    def score(self, features, data):
+        c = data.close
+        return (c - c.mean()) / c.std()
+
+
+@pytest.mark.parametrize("signal", [_LeakySignal(), _FullSampleZSignal()], ids=lambda s: s.name)
+def test_signal_pit_catches_leaks(signal, market_simple):
+    with pytest.raises(LookaheadError, match=signal.name):
+        assert_signal_pit(signal, market_simple)
+
+
+class _LeakyConstructor(PortfolioConstructor):
+    """Ranks tomorrow's scores — the constructor check must catch it."""
+
+    def weights(self, scores, data):
+        nxt = scores.shift(-1)
+        return nxt.sub(nxt.mean(axis=1), axis=0).fillna(0.0)
+
+
+def test_constructor_pit_catches_leak(momentum_scores, market):
+    with pytest.raises(LookaheadError, match="_LeakyConstructor"):
+        assert_constructor_pit(_LeakyConstructor(), momentum_scores, market)
+
+
+class _InfIfFutureCost(CostModel):
+    """Cost at dates[-2] is +inf only when the next row exists — a future-row
+    dependence that a relative tolerance on inf would wave through."""
+
+    def __init__(self, last):
+        self.last = last
+
+    def cost(self, trades, data, portfolio_value):
+        out = trades.abs().sum(axis=1) * 1e-4
+        if data.dates[-1] == self.last:
+            out.iloc[-2] = np.inf
+        return out
+
+
+def test_cost_pit_catches_infinite_value_change(market_simple):
+    trades = pd.DataFrame(0.01, index=market_simple.dates, columns=market_simple.tickers)
+    with pytest.raises(LookaheadError):
+        assert_cost_pit(_InfIfFutureCost(market_simple.dates[-1]), trades, market_simple,
+                        1_000_000.0, dates=[market_simple.dates[-2]])
+
+
+def test_infinite_value_change_is_caught(market_simple):
+    # the full-panel value is +inf only because a future row exists; a
+    # relative tolerance on an infinite value must not wave it through
+    last = market_simple.dates[-1]
+
+    def inf_if_future(data):
+        out = data.close.copy()
+        if data.dates[-1] == last:
+            out.iloc[-2] = np.inf
+        return out
+
+    with pytest.raises(LookaheadError, match="infinite"):
+        assert_truncation_invariant(inf_if_future, market_simple, dates=[market_simple.dates[-2]])

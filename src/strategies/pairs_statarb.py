@@ -9,7 +9,8 @@ screened by standalone pre-2018 net Sharpe and share a 1.5 gross budget.
 Costs include 3 bps per-side slippage and a fixed annual stock-borrow proxy.
 Borrow availability, variable lending fees and margin calls are not modeled.
 Signals assume same-close execution. This is an exploratory example; run
-the module to calculate metrics on the locally obtained cache.
+the module to calculate metrics on the locally obtained cache and save them
+to results/pairs_statarb.json.
 """
 import json
 import sys
@@ -21,7 +22,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from qcore.backtest import metrics, run_backtest
+from qcore.backtest import MAX_ABS_WEIGHT, metrics, run_backtest
 from qcore.costs import IBKRHKCostModel
 from qcore.data import load_prices
 
@@ -36,7 +37,16 @@ GROSS_CAP, BORROW_RATE, SLIPPAGE_BPS = 1.5, 0.01, 3.0
 
 def pair_weights(px: pd.DataFrame, a: str, b: str, gross: float = 1.0) -> pd.DataFrame:
     """Daily target weights for one pair, unit gross while in a trade."""
-    sub = np.log(px[[a, b]].dropna())
+    if not np.isfinite(gross) or gross < 0:
+        raise ValueError("gross must be finite and nonnegative")
+    sub = px[[a, b]]
+    common = sub.notna().all(axis=1)
+    if not common.any():
+        return pd.DataFrame(0.0, index=px.index, columns=[a, b])
+    sub = sub.loc[common[common].index[0]:]
+    if sub.isna().to_numpy().any() or not (np.isfinite(sub) & (sub > 0)).to_numpy().all():
+        raise ValueError("pair prices must be complete and positive after both assets start")
+    sub = np.log(sub)
     la, lb = sub[a], sub[b]
     beta = la.rolling(H).cov(lb) / lb.rolling(H).var()
     m_a, m_b = la.rolling(Z).mean(), lb.rolling(Z).mean()
@@ -71,12 +81,15 @@ def pair_weights(px: pd.DataFrame, a: str, b: str, gross: float = 1.0) -> pd.Dat
             if abs(zt) < EXIT_Z or days >= TIMEOUT:
                 sign, blocked = 0, True
         w_a[t], w_b[t] = (cw_a, cw_b) if sign != 0 else (0.0, 0.0)
-    return pd.DataFrame({a: w_a, b: w_b}, index=sub.index)
+    return pd.DataFrame({a: w_a, b: w_b}, index=sub.index).reindex(px.index, fill_value=0.0)
 
 
 def apply_borrow(result: dict, weights: pd.DataFrame) -> dict:
     """1%/yr borrow on short notional (lagged weights = in force)."""
-    short = weights.clip(upper=0).abs().sum(axis=1).shift(1).fillna(0.0)
+    # Align before lagging, matching run_backtest's zero-target convention
+    # for omitted price-calendar rows.
+    aligned = weights.reindex(result["returns"].index).fillna(0.0).clip(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT)
+    short = aligned.clip(upper=0).abs().sum(axis=1).shift(1).fillna(0.0)
     drag = (BORROW_RATE / 252.0) * short.reindex(result["returns"].index).fillna(0.0)
     result = dict(result)
     result["returns"] = result["returns"] - drag
@@ -103,7 +116,7 @@ def main():
     passing = [tuple(p.split("/")) for p, s in
                zip(per_pair["pair"], per_pair["IS_Sharpe"]) if s > 0]
 
-    scale = GROSS_CAP / len(passing)
+    scale = GROSS_CAP / len(passing) if passing else 0.0
     cols = sorted({t for p in passing for t in p})
     combo = pd.DataFrame(0.0, index=px.index, columns=cols)
     for p in passing:
