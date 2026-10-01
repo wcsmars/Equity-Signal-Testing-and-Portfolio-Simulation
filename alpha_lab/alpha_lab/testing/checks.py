@@ -21,6 +21,7 @@ broken feature proving the detector actually detects.
 from __future__ import annotations
 
 import copy
+import math
 from typing import Callable, Iterable, Sequence
 
 import numpy as np
@@ -89,8 +90,18 @@ def _compare_rows(
     both = ~full_na
     if not both.any():
         return
-    diff = (trunc_row[both] - full_row[both]).abs()
-    tol = atol + rtol * full_row[both].abs()
+    t_vals, f_vals = trunc_row[both].astype(float), full_row[both].astype(float)
+    # +-inf must match exactly: with an infinite value the relative tolerance
+    # is infinite too and would accept any deviation
+    inf_bad = (np.isinf(t_vals) | np.isinf(f_vals)) & (t_vals != f_vals)
+    if inf_bad.any():
+        raise LookaheadError(
+            f"{label}: infinite values at {t.date()} change under truncation for "
+            f"tickers {list(inf_bad.index[inf_bad])} — the computation is using future rows"
+        )
+    finite = np.isfinite(f_vals)
+    diff = (t_vals[finite] - f_vals[finite]).abs()
+    tol = atol + rtol * f_vals[finite].abs()
     viol = diff > tol
     if viol.any():
         worst = diff[viol].sort_values(ascending=False)
@@ -119,8 +130,12 @@ def _compare_scalars(
         )
     if full_na:
         return
-    dev = abs(float(trunc_val) - float(full_val))
-    if dev > atol + rtol * abs(float(full_val)):
+    changed, original = float(trunc_val), float(full_val)
+    if math.isinf(changed) or math.isinf(original):
+        dev = 0.0 if changed == original else math.inf
+    else:
+        dev = abs(changed - original)
+    if math.isinf(dev) or dev > atol + rtol * abs(original):
         raise LookaheadError(
             f"{label}: value at {t.date()} changes under {check} "
             f"(changed {trunc_val!r} vs original {full_val!r}, deviation {dev:.6e}) "

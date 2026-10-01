@@ -121,7 +121,13 @@ def test_entrant_has_nan_score_before_entry(market, signal):
     assert scores.loc[pre_entry, entrant].isna().all()
 
 
-def test_universe_mask_overrides_valid_prices(market_simple):
+@pytest.mark.parametrize(
+    "signal, warmup",
+    [(ShortTermReversal(window=5, min_names=5), 10),
+     (CrossSectionalMomentum(window=63, skip=5, min_names=5), 70)],
+    ids=["reversal", "momentum"],
+)
+def test_universe_mask_overrides_valid_prices(market_simple, signal, warmup):
     # SYM00 keeps valid prices but is declared out of the universe: the
     # score must be NaN from the mask alone, not from missing data.
     universe = pd.DataFrame(
@@ -129,10 +135,10 @@ def test_universe_mask_overrides_valid_prices(market_simple):
     )
     universe["SYM00"] = False
     data = MarketData.from_frames(market_simple.close, universe=universe)
-    scores = _score(ShortTermReversal(window=5, min_names=5), data)
+    scores = _score(signal, data)
     assert scores["SYM00"].isna().all()
     # the remaining 5 names still meet min_names=5 and score normally
-    others = scores.drop(columns=["SYM00"]).iloc[10:]
+    others = scores.drop(columns=["SYM00"]).iloc[warmup:]
     assert others.notna().all().all()
 
 

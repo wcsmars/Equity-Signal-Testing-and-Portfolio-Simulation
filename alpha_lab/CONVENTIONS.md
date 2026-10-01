@@ -42,8 +42,11 @@ For `r_t = close_t / close_{t-1} - 1`:
    `t-1`, and are charged to the return indexed by `t`:
    `net_t = gross_t - cost_t`. The spread, commission, and square-root impact
    parameters are assumptions, not calibrated execution estimates. The
-   model uses a fixed reference portfolio value for participation and
-   ignores financing, borrow availability, and borrow fees.
+  model uses a fixed reference portfolio value for participation and
+  ignores financing, borrow availability, and borrow fees.
+  Drift uses gross returns and costs are subtracted additively; fee-induced
+  rescaling of holdings is not modeled. The engine rejects a loss of 100%
+  or more, before or after costs, because insolvency is unsupported.
 
 ## Walk-forward and missing data
 
@@ -58,7 +61,8 @@ For `r_t = close_t / close_{t-1} - 1`:
   Missing returns contribute zero, and lagged positions can persist after
   prices disappear. No delisting payout or forced liquidation is modeled;
   turnover costs still follow the configured cost model. Results involving
-  missing prices require separate review.
+  missing prices require separate review. A run warns and records
+  `meta.missing_held_return_cells` whenever a held return is missing.
 
 ## Paths and outputs
 
@@ -71,6 +75,13 @@ all three cases. `config_from_dict` leaves paths as supplied.
 The base example writes tracked results and HTML/Markdown reports to
 `alpha_lab/runs/` relative to the project root. Synthetic results exercise
 the software and are not evidence of investment performance.
+
+Feature cache identities cover every input date and value. Clear the cache
+after changing a feature's implementation: data identity does not version
+code. Market-data snapshots are published only after all fields are written,
+reject an existing snapshot id, and verify each recorded field checksum on
+load. Older snapshots without manifests remain readable but cannot offer
+checksum verification.
 
 For walk-forward runs, report charts, monthly returns, and headline metrics
 start at the first test-window date. The training and purge warm-up remains

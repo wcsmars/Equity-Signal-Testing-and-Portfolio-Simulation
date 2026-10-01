@@ -40,6 +40,10 @@ def build_weights(px: pd.DataFrame, K: int = K, lam: float = LAM) -> pd.DataFram
     reversal from past month-end closes, vol from trailing daily returns,
     z-scores computed cross-sectionally (per date, never across time).
     """
+    if isinstance(K, bool) or not isinstance(K, (int, np.integer)) or not 1 <= K <= len(px.columns):
+        raise ValueError("K must be an integer within the stock universe")
+    if not np.isfinite(lam) or lam < 0:
+        raise ValueError("lam must be finite and nonnegative")
     me_dates = confirmed_month_ends(px.index)  # live-edge safe (qcore.calendar)
     pm = px.loc[me_dates]
 
@@ -52,7 +56,7 @@ def build_weights(px: pd.DataFrame, K: int = K, lam: float = LAM) -> pd.DataFram
     def zscore(df):
         mu = df.mean(axis=1)
         sd = df.std(axis=1)
-        return df.sub(mu, axis=0).div(sd.replace(0, np.nan), axis=0)
+        return df.sub(mu, axis=0).div(sd.where(sd != 0, 1.0), axis=0)
 
     score = zscore(mom.where(elig)) - lam * zscore(ret1m.where(elig))
 

@@ -22,6 +22,8 @@ EULER_GAMMA = 0.5772156649015329
 
 def _clean(excess: pd.Series) -> np.ndarray:
     r = pd.Series(excess).dropna().to_numpy(dtype=float)
+    if not np.isfinite(r).all():
+        raise ValueError("returns must be finite")
     if len(r) < 60:
         raise ValueError(f"need >= 60 daily observations, got {len(r)}")
     return r
@@ -30,13 +32,19 @@ def _clean(excess: pd.Series) -> np.ndarray:
 def sharpe_daily(excess: pd.Series) -> float:
     r = _clean(excess)
     sd = r.std(ddof=1)
-    return 0.0 if sd == 0 else float(r.mean() / sd)
+    if np.ptp(r) == 0:
+        if r[0] == 0:
+            return 0.0
+        raise ValueError("Sharpe is undefined for constant nonzero excess returns")
+    return float(r.mean() / sd)
 
 
 def probabilistic_sharpe(excess: pd.Series, sr_benchmark_daily: float = 0.0) -> dict:
     """PSR: probability the TRUE Sharpe exceeds the benchmark, given the
     estimated Sharpe, sample length, skewness and kurtosis (fat tails and
     negative skew widen the estimator's variance and lower PSR)."""
+    if not math.isfinite(sr_benchmark_daily):
+        raise ValueError("Sharpe benchmark must be finite")
     r = _clean(excess)
     s = pd.Series(r)
     T = len(r)
@@ -57,8 +65,14 @@ def expected_max_sharpe_daily(n_trials: int, var_trials_daily: float) -> float:
     """E[max SR] of n_trials independent zero-true-Sharpe trials whose
     estimated Sharpes have variance var_trials_daily (daily^2 units).
     This is the hurdle a search's winner must clear to mean anything."""
-    n = max(2, int(n_trials))
-    sd = math.sqrt(max(var_trials_daily, 1e-18))
+    if isinstance(n_trials, bool) or not isinstance(n_trials, (int, np.integer)) or n_trials < 1:
+        raise ValueError("n_trials must be a positive integer")
+    if not math.isfinite(var_trials_daily) or var_trials_daily < 0:
+        raise ValueError("trial variance must be finite and nonnegative")
+    n = int(n_trials)
+    if n == 1 or var_trials_daily == 0:
+        return 0.0
+    sd = math.sqrt(var_trials_daily)
     return sd * ((1.0 - EULER_GAMMA) * _PHI.inv_cdf(1.0 - 1.0 / n)
                  + EULER_GAMMA * _PHI.inv_cdf(1.0 - 1.0 / (n * math.e)))
 
@@ -72,9 +86,11 @@ def deflated_sharpe(excess: pd.Series, n_trials: int,
     JUDGMENT CALL (correlated variants are not independent trials): report
     results under more than one assumption rather than hiding the choice."""
     if var_trials_daily is None:
-        if not trial_sharpes_ann or len(trial_sharpes_ann) < 2:
+        if trial_sharpes_ann is None or len(trial_sharpes_ann) < 2:
             raise ValueError("need trial_sharpes_ann (>=2) or var_trials_daily")
         arr = np.array(trial_sharpes_ann, dtype=float) / math.sqrt(TRADING_DAYS)
+        if not np.isfinite(arr).all():
+            raise ValueError("trial Sharpes must be finite")
         var_trials_daily = float(arr.var(ddof=1))
     sr0 = expected_max_sharpe_daily(n_trials, var_trials_daily)
     out = probabilistic_sharpe(excess, sr_benchmark_daily=sr0)
@@ -95,6 +111,13 @@ def block_bootstrap_sharpe_ci(excess: pd.Series, n_boot: int = 2000,
     short-range autocorrelation/vol-clustering that iid resampling destroys."""
     r = _clean(excess)
     T = len(r)
+    observed = sharpe_daily(pd.Series(r))
+    if isinstance(n_boot, bool) or not isinstance(n_boot, (int, np.integer)) or n_boot < 1:
+        raise ValueError("n_boot must be a positive integer")
+    if isinstance(block, bool) or not isinstance(block, (int, np.integer)) or not 1 <= block <= T:
+        raise ValueError("block must be an integer between 1 and the sample length")
+    if not math.isfinite(alpha) or not 0 < alpha < 1:
+        raise ValueError("alpha must be strictly between 0 and 1")
     rng = np.random.default_rng(seed)
     n_blocks = math.ceil(T / block)
     starts = rng.integers(0, T - block + 1, size=(n_boot, n_blocks))
@@ -102,10 +125,10 @@ def block_bootstrap_sharpe_ci(excess: pd.Series, n_boot: int = 2000,
     samples = r[idx]
     mu = samples.mean(axis=1)
     sd = samples.std(axis=1, ddof=1)
-    sr = np.where(sd > 0, mu / sd, 0.0) * math.sqrt(TRADING_DAYS)
+    sr = np.divide(mu, sd, out=np.zeros_like(mu), where=sd > 0) * math.sqrt(TRADING_DAYS)
     lo, hi = np.quantile(sr, [alpha / 2, 1 - alpha / 2])
     return {
-        "sharpe_ann": round(float(r.mean() / r.std(ddof=1)) * math.sqrt(TRADING_DAYS), 3),
+        "sharpe_ann": round(observed * math.sqrt(TRADING_DAYS), 3),
         "ci": [round(float(lo), 3), round(float(hi), 3)],
         "alpha": alpha, "n_boot": n_boot, "block": block, "T": T,
         "prob_sharpe_le_0": round(float((sr <= 0).mean()), 4),

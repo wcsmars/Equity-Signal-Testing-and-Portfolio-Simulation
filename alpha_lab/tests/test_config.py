@@ -5,7 +5,7 @@ import datetime
 
 import pytest
 
-from alpha_lab.config.loader import config_from_dict, load_config
+from alpha_lab.config.loader import config_from_dict, config_hash, load_config
 from alpha_lab.config.schema import DataConfig, ReportConfig
 from alpha_lab.core.errors import ConfigError
 
@@ -18,6 +18,51 @@ def test_invalid_yaml_is_config_error(tmp_path):
     bad.write_text("name: [unclosed\n")
     with pytest.raises(ConfigError, match="invalid YAML"):
         load_config(bad)
+
+
+def test_duplicate_yaml_key_is_config_error(tmp_path):
+    # a repeated section must not silently reset the first one to defaults
+    cfg = tmp_path / "dup.yaml"
+    cfg.write_text("costs:\n  model: fixed_bps\nbacktest:\n  execution_lag: 2\ncosts:\n  model: zero\n")
+    with pytest.raises(ConfigError, match="duplicate key 'costs'"):
+        load_config(cfg)
+
+
+def test_yaml_merge_keys_still_load(tmp_path):
+    # anchors + '<<' merges are standard YAML; explicit keys override merged
+    # ones, and duplicate explicit keys next to a merge are still rejected
+    cfg = tmp_path / "merge.yaml"
+    cfg.write_text(
+        "_shared: &cost\n  model: fixed_bps\n  fixed_bps: 5.0\n"
+        "costs:\n  <<: *cost\n  fixed_bps: 9.0\n"
+    )
+    import yaml
+    from alpha_lab.config.loader import _StrictLoader
+    raw = yaml.load(cfg.read_text(), Loader=_StrictLoader)
+    assert raw["costs"] == {"model": "fixed_bps", "fixed_bps": 9.0}
+    dup = tmp_path / "dup_merge.yaml"
+    dup.write_text("_s: &s\n  a: 1\nc:\n  <<: *s\n  b: 2\n  b: 3\n")
+    with pytest.raises(ConfigError, match="duplicate key 'b'"):
+        load_config(dup)
+
+
+@pytest.mark.parametrize("value", [".nan", ".inf", "-.inf"])
+def test_non_finite_number_is_config_error(tmp_path, value):
+    cfg = tmp_path / "nan.yaml"
+    cfg.write_text(f"costs:\n  half_spread_bps: {value}\n")
+    with pytest.raises(ConfigError, match="expected a finite number"):
+        load_config(cfg)
+
+
+def test_config_hash_ignores_output_locations(tmp_path):
+    for name in ("a", "b"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "c.yaml").write_text("backtest:\n  execution_lag: 2\n")
+    a, b = load_config(tmp_path / "a" / "c.yaml"), load_config(tmp_path / "b" / "c.yaml")
+    assert a.experiment.runs_dir != b.experiment.runs_dir
+    assert config_hash(a) == config_hash(b)
+    changed = load_config(tmp_path / "a" / "c.yaml", {"backtest.execution_lag": 3})
+    assert config_hash(changed) != config_hash(a)
 
 
 def test_directory_path_is_config_error(tmp_path):

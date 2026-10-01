@@ -138,7 +138,9 @@ class CSVSource(DataSource):
         if not self.path.is_file():
             raise DataError(f"long csv source expects a single file: {self.path}")
         try:
-            raw = pd.read_csv(self.path, parse_dates=["date"])
+            # tickers stay literal strings, as in the wide format and config:
+            # no numeric inference ('10001') and no NA conversion ('NA')
+            raw = pd.read_csv(self.path, parse_dates=["date"], converters={"ticker": str})
         except (ValueError, KeyError) as exc:
             raise DataError(f"{self.path}: could not parse long csv ({exc})") from exc
         required = {"date", "ticker", "close"}

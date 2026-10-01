@@ -6,6 +6,8 @@ assets x 756 days with a 4:1 split on SYM00, a late entrant (last ticker),
 and a delisting (second-to-last ticker).
 """
 
+import copy
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -93,6 +95,39 @@ def test_zero_weights_before_first_test_window(wf_result, market):
     assert float(pre.abs().to_numpy().sum()) == 0.0
     # and weights are nonzero somewhere after it, so the assertion has teeth
     assert wf_result.target_weights.iloc[pos:].abs().to_numpy().sum() > 0
+
+
+def test_universe_check_catches_planted_violations(wf_result, market):
+    from alpha_lab.core.errors import LookaheadError
+
+    delisted = market.tickers[-2]
+    _, last = _membership_bounds(market, delisted)
+    lag = wf_result.meta["execution_lag"]
+    # target weight after delisting
+    bad_w = wf_result.target_weights.copy()
+    bad_w.iloc[last + 1, bad_w.columns.get_loc(delisted)] = 0.1
+    res = copy.copy(wf_result)
+    res.target_weights = bad_w
+    with pytest.raises(LookaheadError, match="target_weights"):
+        assert_no_position_outside_universe(res, market)
+    # holding beyond the lag carryover
+    bad_h = wf_result.holdings.copy()
+    bad_h.iloc[last + lag + 1, bad_h.columns.get_loc(delisted)] = 0.1
+    res = copy.copy(wf_result)
+    res.holdings = bad_h
+    with pytest.raises(LookaheadError, match="holdings"):
+        assert_no_position_outside_universe(res, market)
+
+
+def test_purge_check_catches_short_gap(wf_result, market):
+    from alpha_lab.core.errors import LookaheadError
+    from alpha_lab.core.results import WalkForwardWindow
+
+    w = wf_result.windows[0]
+    pos = market.dates.get_loc(w.train_end)
+    leaky = WalkForwardWindow(w.train_start, market.dates[pos + 1], w.test_start, w.test_end)
+    with pytest.raises(LookaheadError, match="purge gap"):
+        assert_purge_gap([leaky], market.dates, PURGE_DAYS, EMBARGO_DAYS)
 
 
 # -- (c) purge gap ------------------------------------------------------------

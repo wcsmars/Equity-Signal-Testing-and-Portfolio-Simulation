@@ -115,6 +115,23 @@ def test_adv_requires_volume(market_simple):
         ADVDollars().compute(data)
 
 
+def test_rsi_exact(market_simple):
+    delta = market_simple.close.diff()
+    gain, loss = delta.clip(lower=0.0), (-delta).clip(lower=0.0)
+    g = gain.rolling(14, min_periods=14).mean()
+    expected = 100.0 * g / (g + loss.rolling(14, min_periods=14).mean())
+    pd.testing.assert_frame_equal(RSI(window=14).compute(market_simple), expected)
+
+
+def test_rsi_edge_cases():
+    dates = pd.bdate_range("2020-01-02", periods=8)
+    close = pd.DataFrame(
+        {"UP": np.arange(8.0) + 10, "DOWN": 20 - np.arange(8.0), "FLAT": 15.0}, index=dates
+    )
+    last = RSI(window=4).compute(MarketData.from_frames(close)).iloc[-1]
+    assert last["UP"] == 100.0 and last["DOWN"] == 0.0 and last["FLAT"] == 50.0
+
+
 def test_rsi_bounded(market_simple):
     panel = RSI().compute(market_simple)
     vals = panel.to_numpy().ravel()
@@ -259,6 +276,14 @@ def test_store_unknown_feature_is_config_error(market_simple):
         FeatureStore().get(FeatureSpec.make("does_not_exist"), market_simple)
 
 
+def test_feature_cache_does_not_confuse_numeric_and_text_parameters(market_simple):
+    store = FeatureStore()
+    store.get(FeatureSpec.make("returns", window=1), market_simple)
+    # A textual '1' used to share the cache key and skip parameter validation.
+    with pytest.raises(ConfigError, match="integer"):
+        store.get(FeatureSpec.make("returns", window="1"), market_simple)
+
+
 def test_store_disk_cache_roundtrip(tmp_path, market_simple):
     registry1, calls1 = _counting_registry()
     store1 = FeatureStore(registry=registry1, cache_dir=tmp_path)
@@ -294,6 +319,45 @@ def test_store_disk_cache_csv_fallback(tmp_path, market_simple, monkeypatch):
     pd.testing.assert_frame_equal(loaded, computed, check_freq=False)
 
 
+def test_store_csv_fallback_keeps_integer_ticker_labels(tmp_path, market_simple, monkeypatch):
+    # The csv round trip turns integer labels into strings; a cache hit must
+    # still align to data.close, bit-exactly, or signals silently go flat.
+    def no_pyarrow(self, *args, **kwargs):
+        raise ImportError("pyarrow unavailable")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", no_pyarrow)
+    ids = list(range(10001, 10001 + market_simple.close.shape[1]))
+    fields = ("close", "open", "high", "low", "volume", "unadjusted_close", "universe")
+    data = MarketData(**{
+        f: None if getattr(market_simple, f) is None else getattr(market_simple, f).set_axis(ids, axis=1)
+        for f in fields
+    })
+    spec = FeatureSpec.make("returns", window=1)
+    computed = FeatureStore(cache_dir=tmp_path).get(spec, data)
+    registry2, calls2 = _counting_registry()
+    loaded = FeatureStore(registry=registry2, cache_dir=tmp_path).get(spec, data)
+    assert calls2["n"] == 0
+    assert loaded.columns.equals(data.close.columns)
+    pd.testing.assert_frame_equal(loaded, computed, check_freq=False, check_exact=True)
+
+
+def test_store_ignores_misaligned_disk_panel(tmp_path, market_simple):
+    spec = FeatureSpec.make("returns", window=1)
+    store = FeatureStore(cache_dir=tmp_path)
+    store.get(spec, market_simple)
+    [path] = list(tmp_path.iterdir())
+    frame = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path, index_col=0, parse_dates=True)
+    frame = frame.iloc[:-1]  # a stale/corrupt cache file
+    if path.suffix == ".parquet":
+        frame.to_parquet(path)
+    else:
+        frame.to_csv(path)
+    registry2, calls2 = _counting_registry()
+    loaded = FeatureStore(registry=registry2, cache_dir=tmp_path).get(spec, market_simple)
+    assert calls2["n"] == 1  # recomputed, not served misaligned
+    assert loaded.index.equals(market_simple.close.index)
+
+
 def test_fingerprint_distinguishes_seeds():
     data7 = make_market(n_assets=6, n_days=150, seed=7)
     data8 = make_market(n_assets=6, n_days=150, seed=8)
@@ -305,6 +369,43 @@ def test_fingerprint_distinguishes_seeds():
 def test_fingerprint_distinguishes_truncation(market_simple):
     t = market_simple.dates[300]
     assert fingerprint(market_simple) != fingerprint(market_simple.slice_until(t))
+
+
+@pytest.mark.parametrize("field", ["close", "open", "high", "low", "volume", "unadjusted_close", "universe"])
+def test_fingerprint_sees_historical_corrections_between_sampled_rows(market_simple, field):
+    import copy
+
+    corrected = copy.deepcopy(market_simple)
+    panel = getattr(corrected, field)
+    panel.iloc[13, 0] = not panel.iloc[13, 0] if field == "universe" else panel.iloc[13, 0] * 1.01
+    assert fingerprint(corrected) != fingerprint(market_simple)
+
+
+def test_fingerprint_sees_interior_date_changes(market_simple):
+    import copy
+
+    revised = copy.deepcopy(market_simple)
+    dates = list(revised.dates)
+    dates[13] += pd.Timedelta(hours=1)
+    for field in ("close", "open", "high", "low", "volume", "unadjusted_close", "universe"):
+        getattr(revised, field).index = pd.DatetimeIndex(dates)
+    assert fingerprint(revised) != fingerprint(market_simple)
+
+
+def test_memory_and_disk_cache_recompute_after_interior_price_correction(tmp_path, market_simple):
+    import copy
+
+    corrected = copy.deepcopy(market_simple)
+    corrected.close.iloc[13, 0] *= 1.1
+    spec = FeatureSpec.make("returns", window=1)
+    store = FeatureStore(cache_dir=tmp_path)
+    original = store.get(spec, market_simple)
+    memory = store.get(spec, corrected)
+    disk = FeatureStore(cache_dir=tmp_path).get(spec, corrected)
+    expected = corrected.returns()
+    assert memory.iloc[13, 0] != original.iloc[13, 0]
+    pd.testing.assert_frame_equal(memory, expected)
+    pd.testing.assert_frame_equal(disk, expected, check_freq=False)
 
 
 def test_fingerprint_sees_every_feature_input_field():

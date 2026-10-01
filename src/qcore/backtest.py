@@ -8,14 +8,19 @@ actual execution needs separately available signals or a later fill model.
 Turnover incurs modeled commissions, regulatory fees and slippage. The
 cached dividend-unadjusted close supplies share-count estimates; yfinance
 still adjusts that series for splits, so it is not historical tape price.
-Missing close data falls back to adjusted prices. Missing returns are filled
-with zero, so the data-quality gate is necessary before interpretation.
+Where later splits push that close below $0.50 (e.g. NVDA, NFLX, AAPL before
+their splits), the per-share commission exceeds the 1%-of-notional cap and
+early costs are overstated; reverse splits understate them.
+Missing close data falls back to adjusted prices. Missing held-asset returns and missing execution prices raise an error.
+The data-quality gate remains necessary before interpretation.
 
 Idle long cash earns the prior ^IRX observation minus a fixed haircut.
 Short proceeds earn no rebate. Margin interest and stock borrow are not
 charged here; strategies using leverage or shorts must model them separately.
 Dividend withholding uses inferred payouts and fixed Treasury exemptions,
 which are approximations rather than fund/year-specific tax accounting.
+Inferred payouts cannot separate cash dividends from spin-off adjustments,
+so spin-off dates can be charged withholding.
 
 Metrics include a fixed 2018 split and excess-return Sharpe. The split alone
 does not establish untouched evaluation data or validate parameter selection.
@@ -29,6 +34,7 @@ from .costs import IBKRHKCostModel, QII_EXEMPT_TREASURY, US_DIV_WITHHOLDING
 OOS_SPLIT = "2018-01-01"
 TRADING_DAYS = 252
 TBILL_HAIRCUT_BPS = 10.0  # fixed annual cash-return haircut assumption
+MAX_ABS_WEIGHT = 1.5  # per-asset weight clip in run_backtest
 
 _IRX_CACHE: list[pd.Series] = []
 _DIVYIELD_CACHE: list[pd.DataFrame] = []
@@ -41,7 +47,7 @@ def _raw_close() -> pd.DataFrame:
         try:
             from .data import load
             _RAWCLOSE_CACHE.append(load("close"))
-        except Exception:  # no close.csv: use adjusted-price share-count estimates
+        except FileNotFoundError:  # no close.csv: use adjusted-price share-count estimates
             import warnings
             warnings.warn("close.csv unavailable - per-share commissions use "
                           "adjusted closes, overstating costs early in the "
@@ -56,7 +62,7 @@ def _dividend_yields() -> pd.DataFrame:
         try:
             from .data import dividend_yields
             _DIVYIELD_CACHE.append(dividend_yields())
-        except Exception:  # no close.csv: no withholding charged, but say so
+        except FileNotFoundError:  # no close.csv: no withholding charged, but say so
             import warnings
             warnings.warn("close.csv unavailable - dividend withholding NOT "
                           "charged (rerun src/download_data.py)")
@@ -70,7 +76,7 @@ def _irx_series() -> pd.Series:
         try:
             from .data import load_indices
             _IRX_CACHE.append(load_indices()["^IRX"].dropna())
-        except Exception:  # no data file: legacy 0% cash, but say so
+        except (FileNotFoundError, KeyError):  # no data/rate: say so
             import warnings
             warnings.warn("indices.csv / ^IRX unavailable - crediting 0% on cash")
             _IRX_CACHE.append(pd.Series(dtype=float))
@@ -90,9 +96,47 @@ def cash_daily_return(index: pd.Index) -> pd.Series:
     irx = _irx_series()
     if irx.empty:
         return pd.Series(0.0, index=index)
-    ann = (irx.reindex(irx.index.union(index)).ffill().reindex(index)
-           .sub(TBILL_HAIRCUT_BPS / 100.0).clip(lower=0.0))
-    return _annual_pct_to_daily(ann).shift(1).fillna(0.0)
+    ann = irx.sub(TBILL_HAIRCUT_BPS / 100.0).clip(lower=0.0)
+    return _lagged_annual_rate(ann, index)
+
+
+def _lagged_annual_rate(annual: pd.Series, index: pd.Index) -> pd.Series:
+    """Latest observation strictly before each return date, including data
+    before a sliced backtest starts. Same-day rates cannot earn that day."""
+    if not annual.index.is_unique or not annual.index.is_monotonic_increasing:
+        raise ValueError("cash-rate dates must be unique and sorted")
+    values = annual.dropna().astype(float)
+    if not np.isfinite(values).all() or (values <= -100.0).any():
+        raise ValueError("annual cash rates must be finite and greater than -100%")
+    union = values.index.union(index).sort_values()
+    prior = values.reindex(union).ffill().shift(1).reindex(index)
+    return _annual_pct_to_daily(prior).fillna(0.0)
+
+
+def _validate_inputs(weights: pd.DataFrame, prices: pd.DataFrame) -> None:
+    for label, frame in (("weights", weights), ("prices", prices)):
+        if not isinstance(frame.index, pd.DatetimeIndex) or frame.index.hasnans:
+            raise ValueError(f"{label} needs a DatetimeIndex without NaT")
+        if not frame.index.is_unique or not frame.index.is_monotonic_increasing:
+            raise ValueError(f"{label} dates must be unique and sorted")
+        if not frame.columns.is_unique:
+            raise ValueError(f"{label} columns must be unique")
+        if np.isinf(frame.to_numpy(dtype=float)).any():
+            raise ValueError(f"{label} must not contain infinite values")
+    if len(prices.index) == 0:
+        raise ValueError("prices must contain at least one date")
+    if not weights.columns.isin(prices.columns).all():
+        raise ValueError("weight columns missing from prices")
+    if not weights.index.isin(prices.index).all():
+        raise ValueError("weight dates missing from prices")
+    if (prices[weights.columns] <= 0).to_numpy().any():
+        raise ValueError("observed prices must be positive")
+
+
+def _check_held_returns(weights_lag: pd.DataFrame, prices: pd.DataFrame) -> None:
+    missing = prices.isna() | prices.shift(1).isna()
+    if ((weights_lag != 0) & missing).to_numpy().any():
+        raise ValueError("missing price for a held asset; repair data before backtesting")
 
 
 def _resolve_cash_rate(cash_rate, index: pd.Index) -> pd.Series:
@@ -101,10 +145,11 @@ def _resolve_cash_rate(cash_rate, index: pd.Index) -> pd.Series:
     if cash_rate is None:
         return cash_daily_return(index)
     if isinstance(cash_rate, pd.Series):
-        ann = cash_rate.reindex(cash_rate.index.union(index)).ffill().reindex(index)
-        return _annual_pct_to_daily(ann).shift(1).fillna(0.0)
-    return pd.Series(_annual_pct_to_daily(pd.Series(float(cash_rate), index=index)),
-                     index=index)
+        return _lagged_annual_rate(cash_rate, index)
+    rate = float(cash_rate)
+    if not np.isfinite(rate) or rate <= -100.0:
+        raise ValueError("annual cash rate must be finite and greater than -100%")
+    return _annual_pct_to_daily(pd.Series(rate, index=index))
 
 
 def run_backtest(
@@ -124,18 +169,35 @@ def run_backtest(
     US_DIV_WITHHOLDING (0.30) charged on each long position's ex-date
     dividend yield, pure-Treasury ETFs exempt (QII); 0.0 disables.
 
+    Each weight is clipped to +/-MAX_ABS_WEIGHT (1.5) per asset, with a
+    warning when the clip binds; drift_weights does not clip, so keep
+    targets inside that band to preserve its zero-turnover property.
+
     Returns dict with 'returns' (net daily), 'equity', 'gross_returns',
     'turnover' (daily one-side), 'costs' (daily, as return drag),
     'cash_returns' (daily credit), 'rf_daily' (cash rate in force),
     'withholding' (daily dividend-tax drag).
     """
+    _validate_inputs(weights, prices)
     cm = cost_model or IBKRHKCostModel()
+    cm.validate()
+    rate = US_DIV_WITHHOLDING if withholding is None else float(withholding)
+    if not np.isfinite(rate) or not 0.0 <= rate <= 1.0:
+        raise ValueError("withholding must be between 0 and 1")
     px = prices.reindex(columns=weights.columns)
-    w = weights.reindex(px.index).fillna(0.0).clip(-1.5, 1.5)
+    w = weights.reindex(px.index).fillna(0.0)
+    if (w.abs() > MAX_ABS_WEIGHT).to_numpy().any():
+        import warnings
+        warnings.warn(f"{name}: weights beyond +/-{MAX_ABS_WEIGHT} per asset "
+                      "are clipped", stacklevel=2)
+    w = w.clip(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT)
     rets = px.pct_change(fill_method=None).fillna(0.0)
 
     # weights in force during day t's return = decided at close t-1
     w_lag = w.shift(1).fillna(0.0)
+    _check_held_returns(w_lag, px)
+    if ((w != 0) & px.isna()).to_numpy().any():
+        raise ValueError("missing execution price for a nonzero target")
     rf_daily = _resolve_cash_rate(cash_rate, px.index)
     # idle cash = un-deployed long capital; shorts post proceeds as
     # collateral (no retail rebate), leverage>1 is not charged here
@@ -147,7 +209,6 @@ def run_backtest(
     # an ex-date's dividend goes to whoever held INTO day t, i.e. w_lag.
     # Shorts owe payments-in-lieu at the gross rate - no tax relief either
     # way, so only long weights are charged.
-    rate = US_DIV_WITHHOLDING if withholding is None else float(withholding)
     withheld = pd.Series(0.0, index=px.index)
     if rate > 0.0:
         dy = _dividend_yields()
@@ -157,7 +218,9 @@ def run_backtest(
             withheld = rate * (w_lag[cols].clip(lower=0.0) * dy).sum(axis=1)
 
     # drifted weights just before rebalancing at close t
-    denom = (1.0 + gross).replace(0.0, np.nan)
+    if (gross <= -1.0).any():
+        raise ValueError("portfolio equity is exhausted; leveraged bankruptcy is unsupported")
+    denom = 1.0 + gross
     w_drift = (w_lag * (1.0 + rets)).div(denom, axis=0).fillna(0.0)
     trade = (w - w_drift).abs()  # per-asset one-side turnover at close t
 
@@ -165,10 +228,8 @@ def run_backtest(
     # share-count estimates use the dividend-unadjusted close instead of the
     # dividend-adjusted close, with a per-column fallback to adjusted prices
     cost_bps = pd.DataFrame(0.0, index=trade.index, columns=trade.columns)
-    px_filled = px.ffill()
     raw = _raw_close()
-    px_trade = px_filled if raw.empty else (
-        raw.reindex(index=px.index, columns=px.columns).ffill().fillna(px_filled))
+    px_trade = px if raw.empty else raw.reindex(index=px.index, columns=px.columns).fillna(px)
     for col in trade.columns:
         notional = trade[col] * cm.capital
         active = notional > 1e-9
@@ -176,6 +237,8 @@ def run_backtest(
             continue
         p = px_trade.loc[active, col]
         n = notional[active]
+        if not (np.isfinite(p) & (p > 0)).all():
+            raise ValueError(f"invalid execution price for {col}")
         shares = n / p
         commission = np.minimum(
             np.maximum(cm.min_commission, cm.commission_per_share * shares),
@@ -186,11 +249,13 @@ def run_backtest(
 
     daily_cost = (trade * cost_bps).sum(axis=1) / 1e4  # return drag, charged at close t
     net = gross - daily_cost - withheld
+    if (net <= -1.0).any():
+        raise ValueError("portfolio equity is exhausted after costs")
     # trim leading dead period before first position (no pure-cash prelude),
     # keeping the entry day itself so the first trade's cost is charged
-    live = w_lag.abs().sum(axis=1) > 0
+    live = w.abs().sum(axis=1) > 0
     if live.any():
-        start = px.index[max(int(np.argmax(live.values)) - 1, 0)]
+        start = px.index[int(np.argmax(live.values))]
         net, gross = net.loc[start:], gross.loc[start:]
         daily_cost, trade = daily_cost.loc[start:], trade.loc[start:]
         cash_ret, rf_daily = cash_ret.loc[start:], rf_daily.loc[start:]
@@ -226,25 +291,34 @@ def drift_weights(targets: pd.DataFrame, prices: pd.DataFrame,
     close (rows must be dates present in prices.index). Pass the same
     cash_rate you pass to run_backtest.
     """
+    _validate_inputs(targets, prices)
     cols = list(targets.columns)
     if not targets.index.isin(prices.index).all():
         raise ValueError("drift_weights: target dates missing from prices index")
     px = prices[cols]
     rets = px.pct_change(fill_method=None).fillna(0.0).to_numpy()
     rf = _resolve_cash_rate(cash_rate, px.index).to_numpy()
-    tgt = {t: targets.loc[t].to_numpy(dtype=float) for t in targets.index}
+    # NaN target == 0 weight, as in run_backtest (a NaN would otherwise
+    # propagate through the drift and blank every later row)
+    tgt = {t: targets.loc[t].fillna(0.0).to_numpy(dtype=float) for t in targets.index}
 
     out = np.zeros((len(px.index), len(cols)))
     w = np.zeros(len(cols))
     for i, t in enumerate(px.index):
         if i > 0:
+            held = w != 0
+            if (px.iloc[[i - 1, i], held].isna()).to_numpy().any():
+                raise ValueError("missing price for a held asset in drift_weights")
             r = rets[i]
             cash_w = max(0.0, 1.0 - w.clip(min=0.0).sum())
             gross = float(w @ r) + cash_w * rf[i]
-            if 1.0 + gross != 0.0:
-                w = w * (1.0 + r) / (1.0 + gross)
+            if gross <= -1.0:
+                raise ValueError("portfolio equity is exhausted in drift_weights")
+            w = w * (1.0 + r) / (1.0 + gross)
         if t in tgt:
             w = tgt[t].copy()
+            if px.iloc[i, w != 0].isna().any():
+                raise ValueError("missing execution price for a nonzero target")
         out[i] = w
     return pd.DataFrame(out, index=px.index, columns=cols)
 
@@ -252,15 +326,18 @@ def drift_weights(targets: pd.DataFrame, prices: pd.DataFrame,
 def _stats(r: pd.Series, rf: pd.Series) -> dict:
     """cagr/vol/maxdd from TOTAL returns r; Sharpe from EXCESS returns r - rf."""
     r = r.dropna()
-    if len(r) < 60 or r.std() == 0:
+    if len(r) < 60:
         return {"cagr": np.nan, "vol": np.nan, "sharpe": np.nan, "maxdd": np.nan}
     ex = r - rf.reindex(r.index).fillna(0.0)
     eq = (1 + r).cumprod()
     years = len(r) / TRADING_DAYS
     cagr = eq.iloc[-1] ** (1 / years) - 1
     vol = r.std() * np.sqrt(TRADING_DAYS)
-    dd = (eq / eq.cummax() - 1).min()
-    sharpe = 0.0 if ex.std() == 0 else float(ex.mean() / ex.std() * np.sqrt(TRADING_DAYS))
+    dd = (eq / eq.cummax().clip(lower=1.0) - 1).min()
+    ex_sd = float(ex.std())
+    sharpe = (0.0 if np.allclose(ex.to_numpy(), 0.0, rtol=0.0, atol=1e-15)
+              else (float("nan") if ex_sd < 1e-15
+                    else float(ex.mean() / ex_sd * np.sqrt(TRADING_DAYS))))
     return {
         "cagr": round(float(cagr), 4),
         "vol": round(float(vol), 4),
@@ -275,6 +352,8 @@ def metrics(result: dict, oos_split: str = OOS_SPLIT) -> dict:
     'rf_daily' when present, else the default ^IRX series)."""
     r = result["returns"].dropna()
     g = result["gross_returns"].dropna()
+    if r.empty:
+        raise ValueError("metrics requires at least one return observation")
     rf = result.get("rf_daily")
     rf = rf.reindex(r.index).fillna(0.0) if rf is not None else cash_daily_return(r.index)
     split = pd.Timestamp(oos_split) - pd.Timedelta(days=1)

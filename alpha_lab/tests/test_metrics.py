@@ -21,6 +21,25 @@ def _series(values, start="2020-01-06"):
 # --------------------------------------------------------------------------
 
 class TestPointMetrics:
+    def test_annual_return_avoids_intermediate_compounding_overflow(self):
+        # 11^1000 overflows, while 11^252 (the annual result) is finite.
+        assert m.ann_return(_series([10.0] * 1000)) == pytest.approx(11.0**252 - 1.0, rel=1e-12)
+        assert math.isnan(m.ann_return(_series([100.0])))  # annual value itself is unrepresentable
+
+    def test_annual_return_distinguishes_total_loss_from_impossible_recovery(self):
+        assert m.ann_return(_series([0.1, -1.0, 0.2])) == -1.0
+        assert math.isnan(m.ann_return(_series([-2.0, -2.0])))
+
+    def test_sharpe_moments_scale_without_overflow(self):
+        ordinary = _series([1.0, -2.0, 3.0, -1.0, 0.5])
+        huge = ordinary * 1e150
+        for fn in (m.sharpe, m.skewness, m.kurtosis, m.psr):
+            assert fn(huge) == pytest.approx(fn(ordinary), rel=1e-12)
+
+    @pytest.mark.parametrize("fn", [m.ann_return, m.sharpe, m.hit_rate, m.sortino])
+    def test_infinite_returns_are_invalid_not_positive_days(self, fn):
+        assert math.isnan(fn(_series([0.01, np.inf, -0.01])))
+
     def test_ann_return_constant(self):
         r = _series([0.001] * 252)
         assert m.ann_return(r) == pytest.approx(1.001**252 - 1.0, rel=1e-12)
@@ -93,6 +112,14 @@ class TestPointMetrics:
 # --------------------------------------------------------------------------
 
 class TestDrawdown:
+    def test_long_positive_path_does_not_overflow(self):
+        dd = m.drawdown_series(_series([10.0] * 1000 + [-0.1]))
+        assert np.isfinite(dd).all()
+        assert dd.iloc[-1] == pytest.approx(-0.1, abs=1e-12)
+
+    def test_invalid_loss_path_returns_degenerate_drawdown(self):
+        assert math.isnan(m.max_drawdown(_series([-2.0, -2.0]))["depth"])
+
     def test_max_drawdown_exact_path(self):
         # equity: 1.10 (peak) -> 0.88 (trough, -20%) -> 0.968 -> 1.1132 (recovered)
         r = _series([0.10, -0.20, 0.10, 0.15])
@@ -231,7 +258,7 @@ class TestTables:
 
 SUMMARY_KEYS = {
     "ann_return_net", "ann_return_gross", "ann_vol", "sharpe_net",
-    "sharpe_gross", "sharpe_se", "sortino", "max_drawdown",
+    "sharpe_gross", "sharpe_se_ann", "sortino", "max_drawdown",
     "max_drawdown_peak", "max_drawdown_trough", "calmar", "hit_rate",
     "psr", "dsr", "n_trials", "turnover_daily_mean", "turnover_ann",
     "cost_drag_ann", "n_days", "start", "end", "n_windows", "mode",
@@ -280,7 +307,17 @@ class TestSummary:
         assert s["max_drawdown"] <= 0.0
         assert "T" in s["max_drawdown_peak"] or s["max_drawdown_peak"] == ""  # iso string
         assert 0.0 <= s["psr"] <= 1.0
-        assert s["dsr"] <= s["psr"]  # 5 trials deflate
+        assert s["dsr"] < s["psr"]  # 5 trials deflate
+        # Sharpe-family statistics come from NET returns; n_trials reaches DSR
+        net, gross = result.net_returns, result.gross_returns
+        assert s["sharpe_net"] == m.sharpe(net)
+        assert s["sharpe_gross"] == m.sharpe(gross)
+        assert s["sharpe_net"] < s["sharpe_gross"]
+        assert s["ann_vol"] == m.ann_vol(net)
+        assert s["psr"] == m.psr(net)
+        assert s["dsr"] == m.dsr(net, 5)
+        assert s["sharpe_se_ann"] == pytest.approx(m.sharpe_se(net) * math.sqrt(252), rel=1e-12)
+        assert m.summary(result, n_trials=np.int64(5))["dsr"] == s["dsr"]
 
     def test_walkforward_summary_trims_flat_prefix(self):
         """Regression: metrics of a walk-forward result must cover the ACTIVE
@@ -314,3 +351,28 @@ class TestSummary:
         assert s["sharpe_net"] == pytest.approx(m.sharpe(active), rel=1e-12)
         assert s["hit_rate"] == pytest.approx(m.hit_rate(active), rel=1e-12)
         assert s["turnover_daily_mean"] == pytest.approx(0.2, rel=1e-12)
+
+
+# --------------------------------------------------------------------------
+# PSR / DSR pinned to independent reference values
+# --------------------------------------------------------------------------
+
+def _skewed_fat_tailed():
+    rng = np.random.default_rng(2024)
+    return pd.Series(
+        0.0004 + 0.01 * rng.standard_t(5, 750) + 0.004 * (rng.exponential(1.0, 750) - 1.0)
+    )
+
+
+def test_psr_dsr_match_reference_values():
+    """Reference numbers computed once with scipy.stats (bias=True skew,
+    fisher=False kurtosis, norm.cdf/ppf) and hard-coded, so CI needs no scipy."""
+    r = _skewed_fat_tailed()
+    assert m.skewness(r) == pytest.approx(0.27831086499026986, rel=1e-10)
+    assert m.kurtosis(r) == pytest.approx(6.386032552594862, rel=1e-10)
+    assert m.psr(r) == pytest.approx(0.9776326200054409, rel=1e-9)
+    assert m.psr(r, sr_star=0.02) == pytest.approx(0.9273249310322265, rel=1e-9)
+    assert m.sharpe_se(r) == pytest.approx(0.03629854372616901, rel=1e-10)
+    assert m.expected_max_sharpe(10, 1.0) == pytest.approx(1.57459830134575, rel=1e-8)
+    assert m.dsr(r, 7) == pytest.approx(0.7324914166404943, rel=1e-8)
+    assert m.dsr(r, np.int64(7)) == m.dsr(r, 7)

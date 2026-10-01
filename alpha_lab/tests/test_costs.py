@@ -338,6 +338,30 @@ def test_participation_cap_engages():
     assert cost.loc[t] < uncapped
 
 
+def test_negative_volume_cannot_silently_eliminate_impact():
+    data = _alternating_market(100.0, 104.0, volume=-1.0)
+    trades = _zero_trades(data)
+    t = data.dates[60]
+    trades.loc[t, "AAA"] = 0.1
+    model = RealisticCost(commission_per_share=0.0, half_spread_bps=0.0, vol_window=10)
+    cost = model.cost(trades, data, NAV)
+    expected = 0.1 * model.impact_coeff * _alt_vol(100.0, 104.0, window=10) * math.sqrt(model.PARTICIPATION_FALLBACK)
+    assert cost.loc[t] == pytest.approx(expected, rel=1e-12)
+    assert cost.loc[t] > 0
+
+
+@pytest.mark.parametrize("kwargs", [{"impact_coeff": np.nan}, {"commission_per_share": np.inf}, {"half_spread_bps": -np.inf}, {"adv_window": 5.5}, {"vol_window": True}])
+def test_realistic_cost_rejects_invalid_direct_parameters(kwargs):
+    with pytest.raises(ConfigError):
+        RealisticCost(**kwargs)
+
+
+@pytest.mark.parametrize("bps", [np.nan, np.inf, True])
+def test_fixed_bps_rejects_nonfinite_or_boolean(bps):
+    with pytest.raises(ConfigError):
+        FixedBps(bps)
+
+
 # --------------------------------------------------------------------------
 # unadjusted_close missing: warn once, fall back to adjusted close
 # --------------------------------------------------------------------------
@@ -359,3 +383,40 @@ def test_missing_unadjusted_close_warns_and_falls_back():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         model.cost(trades, data, NAV)
+
+
+def test_partially_missing_unadjusted_close_falls_back_per_cell():
+    # CONVENTIONS.md: missing raw prices fall back to adjusted prices with a
+    # warning — a single missing raw print must not make a trade commission-free
+    data = _flat_market({"AAA": 80.0, "BBB": 40.0}, {"AAA": 1e6, "BBB": 1e6})
+    raw = data.unadjusted_close.copy()
+    t = data.dates[65]
+    raw.loc[data.dates[64], "AAA"] = np.nan  # t-1 is the execution price
+    data = MarketData.from_frames(data.close, volume=data.volume, unadjusted_close=raw)
+    trades = _zero_trades(data)
+    trades.loc[t, "AAA"] = 0.02
+
+    model = RealisticCost(half_spread_bps=0.0, impact_coeff=0.0)
+    with pytest.warns(UserWarning, match="missing on 1 cells"):
+        cost = model.cost(trades, data, NAV)
+    assert cost.loc[t] == pytest.approx((0.02 * NAV / 80.0) * 0.005 / NAV, rel=1e-12)
+
+
+def test_split_regression_impact_uses_raw_dollar_adv_and_its_own_window():
+    # Impact only: participation = |trade| * NAV / ADV_dollars, with dollar
+    # ADV from RAW close x raw volume over adv_window, shifted one day.
+    data = make_market(n_assets=6, n_days=400, seed=5, split_asset=True, universe_churn=False)
+    t = data.dates[120]  # pre-split: raw close is 4x adjusted
+    trades = _zero_trades(data)
+    trades.loc[t, "SYM00"] = 0.04
+    nav = 2_000_000.0
+    for adv_window in (10, 21):
+        model = RealisticCost(commission_per_share=0.0, half_spread_bps=0.0,
+                              impact_coeff=0.1, adv_window=adv_window, vol_window=63)
+        cost = model.cost(trades, data, nav)
+        adv = ((data.volume * data.unadjusted_close)
+               .rolling(adv_window, min_periods=max(5, adv_window // 2)).mean().shift(1))
+        vol = data.returns().rolling(63, min_periods=31).std().shift(1)
+        part = min(0.04 * nav / adv.loc[t, "SYM00"], RealisticCost.PARTICIPATION_CAP)
+        expected = 0.04 * 0.1 * vol.loc[t, "SYM00"] * np.sqrt(part)
+        assert cost.loc[t] == pytest.approx(expected, rel=1e-12)

@@ -314,14 +314,22 @@ def test_volume_unit_break_fails():
     assert any("stepped" in f.detail for f in hits), hits
 
 
-def test_shifted_series_fails_lead_lag():
+def _assert_shift_fails_lead_lag(shift: int, day: str) -> None:
     b = copy_bundle(CLEAN)
     for f in PriceBundle.FIELDS:
         df = getattr(b, f)
-        df["AAA"] = df["AAA"].shift(1)
+        df["AAA"] = df["AAA"].shift(shift)
     hits = grab(run(b), "lead_lag", "FAIL", "AAA")
-    assert any("shifted" in f.detail for f in hits), \
+    assert any("shifted" in f.detail and day in f.detail for f in hits), \
         "a whole-history one-day shift is look-ahead poison"
+
+
+def test_shifted_series_fails_lead_lag():
+    _assert_shift_fails_lead_lag(1, "previous")  # stale by one day
+
+
+def test_future_shifted_series_fails_lead_lag():
+    _assert_shift_fails_lead_lag(-1, "next")  # leaks tomorrow
 
 
 def test_interpolated_segment_warns():
@@ -337,16 +345,84 @@ def test_interpolated_segment_warns():
 
 
 def test_sub_gate_glitch_attributed_to_print_day():
+    # EEE (no dividends/splits) is re-levered to ~2.5x its daily moves, so
+    # a -25% print sits below BOTH gates (30% idio; 15x trailing vol) while
+    # the +33% bounce trips the idio gate: only the previous-day attribution
+    # branch can put the FAIL on the print day.
     b = copy_bundle(CLEAN)
+    t = "EEE"
+    r = b.adj_close[t].pct_change().fillna(0.0)
+    scale = (1.0 + 2.5 * r).cumprod() / (1.0 + r).cumprod()
+    for f in ["open", "high", "low", "adj_close", "close"]:
+        getattr(b, f)[t] *= scale
     d_pos = 600
     for f in ["open", "high", "low", "adj_close", "close"]:
         df = getattr(b, f)
-        df.iloc[d_pos, df.columns.get_loc("DDD")] *= 0.75  # -25%: below gate
+        df.iloc[d_pos, df.columns.get_loc(t)] *= 0.75  # -25%: below gate
     glitch_day = str(b.adj_close.index[d_pos].date())
-    hits = grab(run(b), "extreme_returns", "FAIL", "DDD")
-    assert any(f.date == glitch_day and "bad print" in f.detail
+    hits = grab(run(b), "extreme_returns", "FAIL", t)
+    assert any(f.date == glitch_day and "fully reversed by the next day's" in f.detail
                for f in hits), \
         "the FAIL must land on the glitch day, not the bounce day"
+
+
+def test_premise_mode_missed_split_in_close_fails():
+    # yfinance premise: close.csv is split-adjusted at source, so GGG's
+    # tape-price split jump means close.csv missed a split adj_close applied
+    b = copy_bundle(CLEAN)
+    b.raw_split_adjusted = True
+    hits = grab(run(b), "split_adjustment", "FAIL", SPLIT_TICKER)
+    assert any("missed a split" in f.detail for f in hits), hits
+
+
+def test_clean_bundle_premise_mode_has_no_fail_or_warn():
+    b = copy_bundle(CLEAN)
+    b.raw_split_adjusted = True
+    c = b.close.columns.get_loc(SPLIT_TICKER)
+    b.close.iloc[:SPLIT_POS, c] /= SPLIT_RATIO  # split-adjust the raw close
+    bad = [f for f in run(b) if f.severity in ("FAIL", "WARN")]
+    assert not bad, bad
+
+
+def _indices(idx):
+    rng = np.random.default_rng(3)
+    return pd.DataFrame({"^VIX": 18 + np.cumsum(rng.normal(0, 0.3, len(idx))).clip(-10, 30),
+                         "^IRX": np.full(len(idx), 1.5)}, index=idx)
+
+
+def test_indices_pinned_vix_warns_and_out_of_range_rate_fails():
+    b = copy_bundle(CLEAN)
+    b.indices = _indices(b.adj_close.index)
+    assert not grab(run(b), "indices")  # clean series: no findings
+    b.indices.iloc[300:310, 0] = 21.5  # VIX pinned for 10 days
+    b.indices.iloc[400, 1] = 60.0  # T-bill yield of 60%
+    found = run(b)
+    assert grab(found, "indices", "WARN", "^VIX"), found
+    assert grab(found, "indices", "FAIL", "^IRX"), found
+
+
+def test_indices_holes_and_closed_day_rows_warn():
+    b = copy_bundle(CLEAN)
+    b.indices = _indices(b.adj_close.index)
+    b.indices.iloc[500:502, 0] = np.nan  # two missing VIX prints
+    columbus = pd.Timestamp("2021-10-11")  # Treasury market closed, NYSE open
+    b.indices.loc[columbus, "^IRX"] = np.nan
+    closed = pd.Timestamp("2021-05-31")  # Memorial Day row with a value
+    b.indices.loc[closed] = [20.0, 1.5]
+    b.indices = b.indices.sort_index()
+    found = grab(run(b), "indices", "WARN")
+    assert any(f.ticker == "^VIX" and "2 missing" in f.detail for f in found), found
+    assert not [f for f in found if f.ticker == "^IRX"], "bond holiday is not a hole"
+    assert any(f.date == "2021-05-31" and "NYSE-closed" in f.detail for f in found), found
+
+
+def test_header_only_indices_fail_per_series_without_crashing():
+    # e.g. every index download failed: download_data writes a header-only file
+    b = copy_bundle(CLEAN)
+    b.indices = _indices(b.adj_close.index).iloc[0:0]
+    found = grab(run(b), "indices", "FAIL")
+    assert {f.ticker for f in found} == {"^VIX", "^IRX"}, found
+    assert all(f.detail == "no data" for f in found)
 
 
 # -------------------------------------------------------------- known events
@@ -516,3 +592,16 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def test_infinity_in_raw_close_fails_even_with_missing_ohlc():
+    b = copy_bundle(CLEAN)
+    b.close.iloc[20, 0] = np.inf
+    b.open.iloc[20, 0] = np.nan
+    assert grab(run(b), "numeric_values", "FAIL", "AAA")
+
+
+def test_infinite_volume_fails():
+    b = copy_bundle(CLEAN)
+    b.volume.iloc[20, 0] = np.inf
+    assert grab(run(b), "numeric_values", "FAIL", "AAA")

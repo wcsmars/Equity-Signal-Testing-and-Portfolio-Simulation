@@ -21,7 +21,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 from pandas.tseries.holiday import (
-    AbstractHolidayCalendar, GoodFriday, Holiday, USLaborDay,
+    AbstractHolidayCalendar, GoodFriday, Holiday, USColumbusDay, USLaborDay,
     USMartinLutherKingJr, USMemorialDay, USPresidentsDay, USThanksgivingDay,
     nearest_workday, sunday_to_monday)
 
@@ -66,7 +66,13 @@ EXPECT_DIVIDENDS = {
     "SPY", "QQQ", "IWM", "DIA", "MDY", "EFA", "EEM", "VGK",
 }
 
-# Ratios a real split can take. Forward splits include 3:2 / 4:3 / 5:4;
+# Ratios a real split can take. Forward splits include 3:2 / 4:3 / 5:4.
+# Their raw moves (-33% / -25% / -20%) sit below SPLIT_RAW_JUMP, so
+# check_split_adjustment never sees them; check_adjustment_factor matches
+# factor jumps against these candidates instead. A close.csv that misses a
+# 3:2 split raises its split-shaped WARN, and a missed 4:3 its trailing-year
+# yield WARN, but a missed 5:4 on a non-dividend payer passes as a 20%
+# dividend. Closing that gap needs the vendor's split events.
 # reverse splits are INTEGER-only (1:8 GE, 1:10 C) - fractional reverse
 # splits do not exist, and admitting them (e.g. 2:3) would misread real
 # +50%/+33% earnings moves as splits (AMD +52.3% on 2016-04-22 is a real
@@ -87,9 +93,13 @@ SPECIAL_CLOSURES = pd.DatetimeIndex([
 
 SEVERITIES = ["ok", "INFO", "WARN", "FAIL"]
 
+# rate series that follow the bond-market calendar (see _BondOnlyHolidays)
+BOND_ONLY_SERIES = {"^IRX", "^TNX"}
+
 
 class _NYSEHolidays(AbstractHolidayCalendar):
-    """Approximate NYSE holiday rules (see calendar.py: no official file yet).
+    """Approximate NYSE holiday rules; no official exchange calendar file is
+    used. Also drives qcore.calendar.confirmed_month_ends.
 
     Correct for regular holidays 2000+; special closures live in
     SPECIAL_CLOSURES. New Year's uses sunday_to_monday because the NYSE
@@ -113,6 +123,13 @@ class _NYSEHolidays(AbstractHolidayCalendar):
 
 def nyse_holidays(start, end) -> pd.DatetimeIndex:
     return _NYSEHolidays().holidays(pd.Timestamp(start), pd.Timestamp(end))
+
+
+class _BondOnlyHolidays(AbstractHolidayCalendar):
+    """Days the Treasury market closes while the NYSE trades: rate series
+    (^IRX, ^TNX) legitimately have no print on these dates."""
+    rules = [USColumbusDay,
+             Holiday("VeteransDay", month=11, day=11, observance=nearest_workday)]
 
 
 def nyse_bdays(start, end) -> pd.DatetimeIndex:
@@ -580,6 +597,9 @@ def check_split_adjustment(b: PriceBundle) -> list[Finding]:
     and the mirror image:
       adj split-sized jump, raw quiet -> phantom adjustment applied to a
                                          split that never happened (FAIL)
+    Only raw moves beyond SPLIT_RAW_JUMP (40%) are examined, so 3:2, 4:3
+    and 5:4 splits are left to check_adjustment_factor (see
+    _SPLIT_CANDIDATES).
     """
     out = []
     common = b.close.columns.intersection(b.adj_close.columns)
@@ -589,7 +609,8 @@ def check_split_adjustment(b: PriceBundle) -> list[Finding]:
         raw_jump = r_raw.index[
             r_raw[t].notna() & (r_raw[t].abs() > SPLIT_RAW_JUMP)]
         for d in raw_jump:
-            ratio = _match_split_ratio(1.0 / (1.0 + r_raw.at[d, t]))
+            factor = 1.0 + r_raw.at[d, t]
+            ratio = _match_split_ratio(1.0 / factor) if np.isfinite(factor) and factor > 0 else None
             adj_r = r_adj.at[d, t]
             if np.isnan(adj_r):
                 out.append(Finding("split_adjustment", "WARN", t, _fmt_d(d),
@@ -821,6 +842,31 @@ def check_lead_lag(b: PriceBundle) -> list[Finding]:
     return out
 
 
+def check_numeric_values(b: PriceBundle) -> list[Finding]:
+    """Infinity and impossible individual fields must fail even when another
+    OHLC field is missing on the same row."""
+    out = []
+    frames = b.frames()
+    if b.indices is not None:
+        frames["indices"] = b.indices
+    for name, df in frames.items():
+        for col in df.columns:
+            values = df[col]
+            if not pd.api.types.is_numeric_dtype(values):
+                out.append(Finding("numeric_values", "FAIL", str(col), "",
+                                   f"{name}: nonnumeric values"))
+                continue
+            invalid = values.notna() & ~np.isfinite(values)
+            if name not in {"indices", "volume"}:
+                invalid |= values <= 0
+            elif name == "volume":
+                invalid |= values < 0
+            for date in values.index[invalid][:10]:
+                out.append(Finding("numeric_values", "FAIL", str(col), _fmt_d(date),
+                                   f"{name}: invalid numeric value {values.loc[date]}") )
+    return out
+
+
 def check_ohlc_consistency(b: PriceBundle) -> list[Finding]:
     """low <= {open, close} <= high, and all prices positive. open/high/low
     in this cache are ADJUSTED, so they are compared against adj_close -
@@ -913,7 +959,8 @@ def check_symbol_mapping(b: PriceBundle,
     for c in sorted(universe - ref):
         out.append(Finding("symbol_mapping", "FAIL", c, "",
                            "in registered universe but absent from cache"))
-    for c in sorted(ref - universe):
+    from qcore.data import OPERATIONAL_UNIVERSE
+    for c in sorted(ref - universe - set(OPERATIONAL_UNIVERSE)):
         out.append(Finding("symbol_mapping", "WARN", c, "",
                            "in cache but not in registered universe"))
     for t in b.adj_close.columns:
@@ -959,6 +1006,29 @@ def check_indices(b: PriceBundle) -> list[Finding]:
         if lag > DELIST_GRACE_DAYS:
             out.append(Finding("indices", "WARN", t, _fmt_d(s.index[-1]),
                                f"series ends {lag} days before price cache"))
+        # holes inside the series' life on days the NYSE traded (a missing
+        # ^IRX/^VIX3M print is silently forward-filled downstream)
+        expected = nyse_bdays(s.index[0], s.index[-1]).intersection(b.adj_close.index)
+        if t in BOND_ONLY_SERIES:
+            expected = expected.difference(
+                _BondOnlyHolidays().holidays(s.index[0], s.index[-1]))
+        holes = expected[s.reindex(expected).isna().to_numpy()]
+        if len(holes):
+            out.append(Finding(
+                "indices", "WARN", t, _fmt_d(holes[-1]),
+                f"{len(holes)} missing value(s) inside the series on NYSE "
+                f"trading days, latest {', '.join(_fmt_d(d) for d in holes[-3:])}"))
+    # rows on days the NYSE was closed (vendor rows on holidays)
+    idx = b.indices.index
+    if len(idx) == 0:
+        return out  # header-only file: the per-series "no data" FAILs stand
+    off = idx.difference(nyse_bdays(idx[0], idx[-1]))
+    off = off[b.indices.loc[off].notna().any(axis=1).to_numpy()] if len(off) else off
+    if len(off):
+        out.append(Finding(
+            "indices", "WARN", "", _fmt_d(off[-1]),
+            f"{len(off)} row(s) with values on NYSE-closed days, latest "
+            f"{', '.join(_fmt_d(d) for d in off[-3:])}"))
     return out
 
 
@@ -1114,7 +1184,10 @@ def apply_known_events(report: DQReport,
     """Downgrade findings a human has already adjudicated as real market
     events (not data errors) to INFO, so the steady-state dashboard is
     quiet and only NEW anomalies alarm. `known` needs columns
-    check,ticker,date,note - see data/dq_known_events.csv. Never silences
+    check,ticker,date,note, with `date` equal to the finding's date or range
+    string (e.g. 2000-07-21..2000-07-27). scripts/data_quality.py reads it
+    from a local data/dq_known_events.csv, or --known; none is distributed
+    with the project, and the report runs without one. Never silences
     FAILs: a FAIL is a data defect by construction and must be fixed in
     the data, not acknowledged away.
 
@@ -1147,6 +1220,7 @@ PRICE_CHECKS: list[Callable[[PriceBundle], list[Finding]]] = [
     check_calendar_alignment,
     check_calendar_gaps,
     check_symbol_mapping,
+    check_numeric_values,
     check_missing_prices,
     check_duplicate_rows,
     check_stale_prices,

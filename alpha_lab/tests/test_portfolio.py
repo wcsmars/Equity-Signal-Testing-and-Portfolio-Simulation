@@ -46,6 +46,24 @@ def test_cap_iterates_to_fixed_point():
     assert abs(capped.iloc[0].sum() - 1.0) < 1e-9
 
 
+def test_cap_preserves_feasible_gross_despite_small_iteration_hint():
+    w = pd.DataFrame([[0.6, 0.35, 0.05]], columns=list("ABC"))
+    capped = cap_weights(w, 0.4, n_iter=1)
+    np.testing.assert_allclose(capped.iloc[0], [0.4, 0.4, 0.2], atol=1e-12)
+
+
+def test_cap_redistributes_to_tiny_positive_positions():
+    w = pd.DataFrame([[1.0, 1e-15, 1e-15]], columns=list("ABC"))
+    capped = cap_weights(w, 0.4)
+    np.testing.assert_allclose(capped.iloc[0], [0.4, 0.3, 0.3], atol=1e-12)
+
+
+@pytest.mark.parametrize("kwargs", [{"gross_leverage": np.nan}, {"max_weight": np.inf}, {"vol_target": np.nan}, {"vol_lookback": 5.5}, {"min_names": True}])
+def test_constructor_rejects_invalid_direct_parameters(kwargs):
+    with pytest.raises(ConfigError):
+        QuantileLongShort(**kwargs)
+
+
 def test_cap_infeasible_side_shrinks_gross_without_error():
     # 3 names, cap 0.05, side target 1.0: 3 * 0.05 < 1.0 is infeasible;
     # documented behaviour is everyone at the cap, gross shrinks to 0.15
@@ -123,6 +141,53 @@ def test_long_only_sums_to_gross(market_simple):
     w = ctor.weights(_scores(market_simple), market_simple)
     assert (w.to_numpy() >= 0.0).all()
     np.testing.assert_allclose(w.sum(axis=1), 1.0, atol=1e-9)
+
+
+@pytest.mark.parametrize("weighting", ["equal", "score"])
+def test_longs_are_top_scores_and_shorts_bottom(market_simple, weighting):
+    scores = _scores(market_simple)
+    ctor = QuantileLongShort(quantile=0.34, weighting=weighting, max_weight=1.0, min_names=2)
+    w = ctor.weights(scores, market_simple)
+    for t in market_simple.dates[::37]:
+        row, sc = w.loc[t], scores.loc[t]
+        longs, shorts = sc[row > 0], sc[row < 0]
+        assert len(longs) and len(shorts)
+        assert longs.min() > sc[row == 0].max() > shorts.max()
+        assert row[sc.idxmax()] > 0 and row[sc.idxmin()] < 0
+
+
+def test_long_only_holds_top_scores(market_simple):
+    scores = _scores(market_simple)
+    ctor = QuantileLongShort(quantile=0.34, dollar_neutral=False, max_weight=1.0, min_names=2)
+    w = ctor.weights(scores, market_simple)
+    t = market_simple.dates[100]
+    held = scores.loc[t][w.loc[t] > 0]
+    assert set(held.index) == set(scores.loc[t].nlargest(len(held)).index)
+
+
+@pytest.mark.parametrize("weighting", ["equal", "score"])
+def test_infinite_scores_count_as_no_opinion(market_simple, weighting):
+    scores = _scores(market_simple)
+    t = market_simple.dates[50]
+    scores.loc[t, scores.columns[0]] = np.inf
+    scores.loc[t, scores.columns[1]] = -np.inf
+    ctor = QuantileLongShort(quantile=0.25, weighting=weighting, max_weight=1.0, min_names=2)
+    w = ctor.weights(scores, market_simple)
+    row = w.loc[t]
+    assert row.iloc[:2].eq(0.0).all()
+    assert abs(row.sum()) < 1e-9
+    assert row.abs().sum() == pytest.approx(2.0)
+
+
+def test_object_dtype_scores_are_accepted(market_simple):
+    # e.g. a boolean signal stitched into a float panel becomes object dtype
+    scores = _scores(market_simple)
+    ctor = QuantileLongShort(quantile=0.34, max_weight=1.0, min_names=2)
+    expected = ctor.weights(scores, market_simple)
+    got = ctor.weights(scores.astype(object), market_simple)
+    pd.testing.assert_frame_equal(got, expected)
+    flags = (scores > 0).astype(object)
+    assert ctor.weights(flags, market_simple).notna().all().all()
 
 
 def test_bucket_size_matches_quantile(market_simple):
@@ -218,6 +283,22 @@ def test_vol_target_shrinks_gross_when_trailing_vol_high():
     assert g_wild.mean() < g_calm.mean()  # higher trailing vol -> smaller book
     assert (g_wild < g_off - 1e-9).all()  # and strictly below the unscaled gross
     np.testing.assert_allclose(g_off, 2.0, atol=1e-9)
+
+
+def test_vol_target_scale_matches_hand_formula():
+    data = make_market(n_assets=6, n_days=300, seed=5, base_vol=0.30, split_asset=False, universe_churn=False)
+    kwargs = dict(quantile=0.5, gross_leverage=2.0, max_weight=1.0, min_names=2, vol_lookback=63)
+    scores = _scores(data)
+    raw = QuantileLongShort(vol_target=None, **kwargs).weights(scores, data)
+    scaled = QuantileLongShort(vol_target=0.10, **kwargs).weights(scores, data)
+    sigma = data.returns().rolling(63, min_periods=31).std()
+    for t in data.dates[[120, 200, 299]]:
+        w = raw.loc[t]
+        est = np.sqrt((w.pow(2) * sigma.loc[t].pow(2)).sum())
+        scale = np.clip(0.10 / np.sqrt(252) / est, 0.0, 3.0)
+        expected = cap_weights((w * scale).to_frame().T, 1.0).iloc[0]
+        np.testing.assert_allclose(scaled.loc[t], expected, rtol=1e-12, atol=1e-15)
+        assert scaled.loc[t].abs().max() <= 1.0 + 1e-12
 
 
 # ---------------------------------------------------------------------------

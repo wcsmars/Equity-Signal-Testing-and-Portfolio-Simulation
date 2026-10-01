@@ -33,18 +33,41 @@ SLIPPAGE_BPS = 3.0
 
 def rsi(px: pd.DataFrame, period: int = 2) -> pd.DataFrame:
     """Wilder RSI computed with rolling data only (no lookahead)."""
+    if isinstance(period, bool) or not isinstance(period, (int, np.integer)) or period < 1:
+        raise ValueError("period must be a positive integer")
     delta = px.diff()
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
-    ag = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    al = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    def wilder(values):
+        out = np.full(values.shape, np.nan, dtype=float)
+        for col in range(values.shape[1]):
+            count, total, average = 0, 0.0, np.nan
+            for row, value in enumerate(values.iloc[:, col].to_numpy()):
+                if not np.isfinite(value):
+                    count, total, average = 0, 0.0, np.nan
+                    continue
+                if count < period:
+                    count += 1
+                    total += value
+                    if count == period:
+                        average = total / period
+                else:
+                    average = ((period - 1) * average + value) / period
+                out[row, col] = average
+        return pd.DataFrame(out, index=values.index, columns=values.columns)
+    ag, al = wilder(gain), wilder(loss)
     out = 100.0 - 100.0 / (1.0 + ag / al)
-    return out.where(al > 0, 100.0).where(ag.notna() & al.notna())
+    out = out.where(al > 0, 100.0).where((ag != 0) | (al != 0), 50.0)
+    return out.where(ag.notna() & al.notna())
 
 
 def build_weights(px: pd.DataFrame, entry_th: float, exit_th: float,
                   max_hold: int, w_max: float) -> pd.DataFrame:
     """Per-ticker entry/exit state machine -> capped equal weights."""
+    if not (0 <= entry_th < exit_th <= 100) or not (0 < w_max <= 1):
+        raise ValueError("require 0 <= entry_th < exit_th <= 100 and 0 < w_max <= 1")
+    if isinstance(max_hold, bool) or not isinstance(max_hold, (int, np.integer)) or max_hold < 1:
+        raise ValueError("max_hold must be a positive integer")
     rsi2 = rsi(px, 2)
     sma200 = px.rolling(200, min_periods=200).mean()
     pos = pd.DataFrame(0.0, index=px.index, columns=px.columns)

@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "src" / "strategies"))
 
-from qcore.backtest import TRADING_DAYS, metrics, run_backtest  # noqa: E402
+from qcore.backtest import TRADING_DAYS, MAX_ABS_WEIGHT, _resolve_cash_rate, metrics, run_backtest  # noqa: E402
 from qcore.costs import IBKRHKCostModel  # noqa: E402
 from qcore.data import load_indices, load_prices  # noqa: E402
 from tsmom_trend import (  # noqa: E402
@@ -104,12 +104,12 @@ def charge_margin(result, w_daily):
     the 150bp spread; ^IRX floored at 0.
     """
     idx = result["returns"].index
-    lev = (w_daily.shift(1).clip(lower=0.0).sum(axis=1) - 1.0).clip(lower=0.0)
+    effective = w_daily.clip(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT)
+    lev = (effective.shift(1).clip(lower=0.0).sum(axis=1) - 1.0).clip(lower=0.0)
     lev = lev.reindex(idx).fillna(0.0)
     irx = load_indices()["^IRX"].dropna()
-    ann = (irx.reindex(irx.index.union(idx)).ffill().reindex(idx)
-           .clip(lower=0.0) + MARGIN_SPREAD_BPS / 100.0)
-    daily_rate = ((1.0 + ann / 100.0) ** (1.0 / TRADING_DAYS) - 1.0).shift(1).fillna(0.0)
+    ann = irx.clip(lower=0.0) + MARGIN_SPREAD_BPS / 100.0
+    daily_rate = _resolve_cash_rate(ann, idx)
     drag = (lev * daily_rate).fillna(0.0)
     for key in ("returns", "gross_returns"):
         result[key] = result[key] - drag

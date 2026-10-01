@@ -9,6 +9,7 @@ index membership. Market data is not distributed with this public copy.
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
@@ -34,18 +35,21 @@ STOCK_UNIVERSE = [  # liquid US mega/large caps - SURVIVORSHIP-BIASED, see cavea
     "WFC", "C", "T", "VZ", "PFE", "TMO", "ABT", "NKE", "MCD", "SBUX", "LOW",
 ]
 
+# Operational quotes for cash parking; excluded from strategy selection universes.
+OPERATIONAL_UNIVERSE = ["SGOV"]
+
 INDEX_UNIVERSE = ["^VIX", "^VIX3M", "^IRX", "^GSPC", "^TNX"]
 
 
 def load(name: str) -> pd.DataFrame:
     """name: one of adj_close | open | high | low | close | volume | indices"""
     df = pd.read_csv(DATA_DIR / f"{name}.csv", index_col=0, parse_dates=True)
-    return df.sort_index()
+    return df
 
 
 def load_prices() -> pd.DataFrame:
     """Adjusted closes for ETFs + stocks (gross total return)."""
-    return load("adj_close")
+    return load("adj_close").drop(columns=OPERATIONAL_UNIVERSE, errors="ignore")
 
 
 def load_indices() -> pd.DataFrame:
@@ -60,7 +64,16 @@ def dividend_yields() -> pd.DataFrame:
     This is an approximation inferred from adjusted return differences.
     Requires data/close.csv with matching split adjustment."""
     ac, c = load("adj_close"), load("close")
-    dy = (ac.pct_change(fill_method=None)
-          - c.reindex(columns=ac.columns).pct_change(fill_method=None))
+    for label, frame in (("adj_close", ac), ("close", c)):
+        if not frame.index.is_unique or not frame.index.is_monotonic_increasing or not frame.columns.is_unique:
+            raise ValueError(f"{label}: dividend inference requires unique, ordered data")
+        if np.isinf(frame.to_numpy(dtype=float)).any() or (frame <= 0).to_numpy().any():
+            raise ValueError(f"{label}: dividend inference requires finite positive prices")
+    if not ac.index.equals(c.index) or not ac.columns.isin(c.columns).all():
+        raise ValueError("raw and adjusted closes must align for dividend inference")
+    c = c.reindex(columns=ac.columns)
+    if (ac.notna() & c.isna()).to_numpy().any():
+        raise ValueError("missing raw close would silently omit dividend withholding")
+    dy = ac.pct_change(fill_method=None) - c.pct_change(fill_method=None)
     dy = dy.clip(lower=0.0)
     return dy.where(dy > 1e-6, 0.0).fillna(0.0)

@@ -15,6 +15,7 @@ uses Peter Acklam's rational approximation (see :func:`norm_ppf`).
 from __future__ import annotations
 
 import math
+import numbers
 from typing import Any
 
 import numpy as np
@@ -85,17 +86,19 @@ def norm_ppf(p: float) -> float:
 # internal helpers
 # --------------------------------------------------------------------------
 
+def _is_real(x: Any) -> bool:
+    """A real number, numpy scalars included (np.int64 is not an int)."""
+    return isinstance(x, numbers.Real) and not isinstance(x, bool)
+
+
 def _as_series(returns: Any) -> pd.Series:
     """Coerce input to a float Series; anything unusable becomes empty."""
-    if isinstance(returns, pd.Series):
-        try:
-            return returns.astype(float)
-        except (TypeError, ValueError):
-            return pd.Series(dtype=float)
     try:
-        return pd.Series(returns, dtype=float)
+        result = returns.astype(float) if isinstance(returns, pd.Series) else pd.Series(returns, dtype=float)
     except (TypeError, ValueError):
         return pd.Series(dtype=float)
+    # Infinity is invalid data, not a missing day to drop or a winning day.
+    return pd.Series(dtype=float) if np.isinf(result.to_numpy()).any() else result
 
 
 def _moments(returns: pd.Series) -> tuple[int, float, float, float] | None:
@@ -113,6 +116,9 @@ def _moments(returns: pd.Series) -> tuple[int, float, float, float] | None:
     # on a constant series, which would fake an astronomical Sharpe
     if (x == x[0]).all():
         return None
+    # Sharpe and standardized moments are invariant to positive scaling.
+    # Scaling first prevents large but finite inputs overflowing x**2/4.
+    x = x / np.max(np.abs(x))
     std = float(x.std(ddof=1))
     if not math.isfinite(std) or std <= 0.0:
         return None
@@ -133,12 +139,15 @@ def _moments(returns: pd.Series) -> tuple[int, float, float, float] | None:
 def ann_return(returns: pd.Series) -> float:
     """Geometric annualized return: (prod(1 + r)) ** (252 / T) - 1."""
     r = _as_series(returns).dropna()
-    if r.empty:
+    if r.empty or (r < -1.0).any():
         return _NAN
-    growth = float((1.0 + r).prod())
-    if growth <= 0.0:
-        return _NAN
-    return growth ** (_ANN / len(r)) - 1.0
+    if (r == -1.0).any():
+        return -1.0
+    # Compounding the complete path can overflow/underflow even though the
+    # annualized result is representable. Work with mean log growth instead.
+    with np.errstate(over="ignore", invalid="ignore"):
+        value = float(np.expm1(np.log1p(r.to_numpy()).mean() * _ANN))
+    return value if math.isfinite(value) else _NAN
 
 
 def ann_vol(returns: pd.Series) -> float:
@@ -240,11 +249,14 @@ def drawdown_series(returns: pd.Series) -> pd.Series:
     NaN returns are treated as flat days.
     """
     r = _as_series(returns)
-    if r.empty:
+    if r.empty or (r < -1.0).any():
         return pd.Series(dtype=float)
-    equity = (1.0 + r.fillna(0.0)).cumprod()
-    peak = equity.cummax().clip(lower=1.0)
-    return equity / peak - 1.0
+    # Relative log wealth avoids overflow in long, high-return series and
+    # retains a 100% drawdown after a total loss.
+    with np.errstate(divide="ignore"):
+        log_equity = np.log1p(r.fillna(0.0)).cumsum()
+    log_peak = log_equity.cummax().clip(lower=0.0)
+    return np.expm1(log_equity - log_peak)
 
 
 def max_drawdown(returns: pd.Series) -> dict:
@@ -274,6 +286,8 @@ def max_drawdown(returns: pd.Series) -> dict:
     if r.empty:
         return out
     dd = drawdown_series(r)
+    if dd.empty:
+        return out
     trough = dd.idxmin()
     depth = float(dd.loc[trough])
     if depth > -1e-15:  # curve never dipped below a prior peak
@@ -332,7 +346,7 @@ def psr(returns: pd.Series, sr_star: float = 0.0) -> float:
     noise from a T-observation track record.
     """
     mom = _moments(returns)
-    if mom is None or not (isinstance(sr_star, (int, float)) and math.isfinite(sr_star)):
+    if mom is None or not (_is_real(sr_star) and math.isfinite(sr_star)):
         return _NAN
     t, sr, skew, kurt = mom
     denom_sq = 1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr
@@ -355,9 +369,9 @@ def expected_max_sharpe(n_trials: int, var_sr: float) -> float:
     Returns 0.0 for n_trials == 1 (a single trial carries no selection
     bias), NaN for invalid inputs.
     """
-    if not isinstance(n_trials, (int, float)) or isinstance(n_trials, bool):
+    if not _is_real(n_trials):
         return _NAN
-    if not (isinstance(var_sr, (int, float)) and math.isfinite(var_sr)) or var_sr < 0.0:
+    if not (_is_real(var_sr) and math.isfinite(var_sr)) or var_sr < 0.0:
         return _NAN
     n = float(n_trials)
     if not math.isfinite(n) or n < 1.0:
@@ -455,8 +469,11 @@ def summary(result: BacktestResult, n_trials: int = 1) -> dict:
     """Flat, json-serializable metric dict for one BacktestResult.
 
     All values are plain floats/ints/str (dates as ISO strings). Sharpe-family
-    statistics (sharpe_se, psr, dsr, sortino, hit_rate, drawdown, calmar) are
-    computed on NET returns; ``n_trials`` feeds the DSR deflation.
+    statistics (sharpe_se_ann, psr, dsr, sortino, hit_rate, drawdown, calmar)
+    are computed on NET returns; ``n_trials`` feeds the DSR deflation.
+    ``sharpe_se_ann`` is the standard error of the annualized Sharpe
+    (daily ``sharpe_se`` x sqrt(252)), so it reads on the same scale as
+    ``sharpe_net``.
 
     Walk-forward results are trimmed to the ACTIVE period (first test-window
     date onward): the structurally flat train+purge prefix carries forced-zero
@@ -483,7 +500,7 @@ def summary(result: BacktestResult, n_trials: int = 1) -> dict:
         "ann_vol": float(ann_vol(net)),
         "sharpe_net": float(sharpe(net)),
         "sharpe_gross": float(sharpe(gross)),
-        "sharpe_se": float(sharpe_se(net)),
+        "sharpe_se_ann": float(sharpe_se(net) * math.sqrt(_ANN)),
         "sortino": float(sortino(net)),
         "max_drawdown": float(mdd["depth"]),
         "max_drawdown_peak": _iso(mdd["peak_date"]),
