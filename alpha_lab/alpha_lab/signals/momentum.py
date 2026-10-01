@@ -21,6 +21,11 @@ from alpha_lab.core.interfaces import FeatureSet, FeatureSpec, Signal
 from alpha_lab.core.types import MarketData
 from alpha_lab.signals.registry import SIGNALS
 
+#: a row whose std is below this fraction of its largest |value| has no
+#: dispersion: the std of equal values is rounding residue, not exactly 0
+#: (six cells of 0.1 give 1.5e-17), and must not be scaled up into scores
+_REL_STD_TOL = 1e-12
+
 
 def _check_int(value: Any, name: str, minimum: int) -> int:
     """Validate an integer parameter at construction time (ConfigError)."""
@@ -36,14 +41,15 @@ def cross_sectional_zscore(panel: pd.DataFrame, min_names: int) -> pd.DataFrame:
 
     Rows with fewer than ``min_names`` valid values are all-NaN (too thin a
     cross-section to standardize), as are rows with zero std (no dispersion
-    to rank). Uses each date's row only — a pure per-date map, never a
-    full-sample or time-series statistic (a CONVENTIONS.md forbidden
-    pattern).
+    to rank), where zero means at most ``_REL_STD_TOL`` (1e-12) times the
+    row's largest absolute value. Uses each date's row only — a pure
+    per-date map, never a full-sample or time-series statistic (a
+    CONVENTIONS.md forbidden pattern).
     """
     valid = panel.notna().sum(axis=1)
     mean = panel.mean(axis=1)
     std = panel.std(axis=1)  # ddof=1, so each scored row has std exactly 1
-    usable = (valid >= min_names) & (std > 0)
+    usable = (valid >= min_names) & (std > _REL_STD_TOL * panel.abs().max(axis=1))
     # std.where(usable) is NaN on unusable rows, so the division blanks them.
     return panel.sub(mean, axis=0).div(std.where(usable), axis=0)
 

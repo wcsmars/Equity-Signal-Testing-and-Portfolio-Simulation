@@ -66,8 +66,9 @@ def norm_ppf(p: float) -> float:
     (0, 1) return NaN rather than +/-inf, per this module's degenerate-input
     policy.
     """
-    if not (isinstance(p, (int, float)) and math.isfinite(p)) or p <= 0.0 or p >= 1.0:
+    if not (_is_real(p) and math.isfinite(p)) or p <= 0.0 or p >= 1.0:
         return _NAN
+    p = float(p)  # numpy scalars (float32 included) take the same path as floats
     if p < _P_LOW:
         q = math.sqrt(-2.0 * math.log(p))
         return (((((_C[0] * q + _C[1]) * q + _C[2]) * q + _C[3]) * q + _C[4]) * q + _C[5]) / \
@@ -465,12 +466,31 @@ def _iso(ts: Any) -> str:
         return ""
 
 
-def summary(result: BacktestResult, n_trials: int = 1) -> dict:
+def _trial_count(n_trials: Any) -> float | int:
+    """``n_trials`` as stored by :func:`summary`.
+
+    A real, finite count is kept as given: an int when it is integral, else
+    the float itself (an effective number of trials need not be whole, and
+    truncating it would misreport what the DSR was deflated by). Anything
+    else (None, a string, a bool, NaN, infinity) becomes NaN, matching the
+    NaN that :func:`dsr` returns for it.
+    """
+    if not _is_real(n_trials):
+        return _NAN
+    n = float(n_trials)
+    if not math.isfinite(n):
+        return _NAN
+    return int(n) if n == int(n) else n
+
+
+def summary(result: BacktestResult, n_trials: float = 1) -> dict:
     """Flat, json-serializable metric dict for one BacktestResult.
 
     All values are plain floats/ints/str (dates as ISO strings). Sharpe-family
     statistics (sharpe_se_ann, psr, dsr, sortino, hit_rate, drawdown, calmar)
-    are computed on NET returns; ``n_trials`` feeds the DSR deflation.
+    are computed on NET returns; ``n_trials`` feeds the DSR deflation and is
+    reported as given (see :func:`_trial_count`); an unusable value gives a
+    NaN ``dsr`` and a NaN ``n_trials`` instead of raising.
     ``sharpe_se_ann`` is the standard error of the annualized Sharpe
     (daily ``sharpe_se`` x sqrt(252)), so it reads on the same scale as
     ``sharpe_net``.
@@ -509,7 +529,7 @@ def summary(result: BacktestResult, n_trials: int = 1) -> dict:
         "hit_rate": float(hit_rate(net)),
         "psr": float(psr(net)),
         "dsr": float(dsr(net, n_trials)),
-        "n_trials": int(n_trials),
+        "n_trials": _trial_count(n_trials),
         "turnover_daily_mean": float(tstats["daily_mean"]),
         "turnover_ann": float(tstats["annualized"]),
         "cost_drag_ann": float(cost_drag(costs)),

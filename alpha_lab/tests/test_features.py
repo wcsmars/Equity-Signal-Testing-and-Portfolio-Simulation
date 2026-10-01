@@ -5,6 +5,8 @@ registered feature on the messy panel (split + universe churn), NaN
 discipline, RSI bounds, and store memoization / disk cache / fingerprint.
 """
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -23,7 +25,7 @@ from alpha_lab.features.library import (
     WindowReturn,
     ZScoreReturn,
 )
-from alpha_lab.features.store import FeatureStore, fingerprint
+from alpha_lab.features.store import _FINGERPRINT_FIELDS, FeatureStore, fingerprint
 
 ALL_FEATURE_NAMES = sorted(FEATURES.names())
 
@@ -333,7 +335,8 @@ def test_store_csv_fallback_keeps_integer_ticker_labels(tmp_path, market_simple,
         for f in fields
     })
     spec = FeatureSpec.make("returns", window=1)
-    computed = FeatureStore(cache_dir=tmp_path).get(spec, data)
+    registry1, _ = _counting_registry()
+    computed = FeatureStore(registry=registry1, cache_dir=tmp_path).get(spec, data)
     registry2, calls2 = _counting_registry()
     loaded = FeatureStore(registry=registry2, cache_dir=tmp_path).get(spec, data)
     assert calls2["n"] == 0
@@ -343,7 +346,8 @@ def test_store_csv_fallback_keeps_integer_ticker_labels(tmp_path, market_simple,
 
 def test_store_ignores_misaligned_disk_panel(tmp_path, market_simple):
     spec = FeatureSpec.make("returns", window=1)
-    store = FeatureStore(cache_dir=tmp_path)
+    registry1, _ = _counting_registry()
+    store = FeatureStore(registry=registry1, cache_dir=tmp_path)
     store.get(spec, market_simple)
     [path] = list(tmp_path.iterdir())
     frame = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path, index_col=0, parse_dates=True)
@@ -356,6 +360,163 @@ def test_store_ignores_misaligned_disk_panel(tmp_path, market_simple):
     loaded = FeatureStore(registry=registry2, cache_dir=tmp_path).get(spec, market_simple)
     assert calls2["n"] == 1  # recomputed, not served misaligned
     assert loaded.index.equals(market_simple.close.index)
+    assert list(tmp_path.iterdir()) == [path]  # same entry, replaced in place
+
+
+def test_disk_cache_misses_when_the_feature_source_changes(tmp_path, market_simple, monkeypatch):
+    # the disk key carries a hash of the feature's source text: an edited
+    # implementation must not be served the panel its old code wrote
+    import inspect
+
+    spec = FeatureSpec.make("returns", window=1)
+    registry1, _ = _counting_registry()
+    FeatureStore(registry=registry1, cache_dir=tmp_path).get(spec, market_simple)
+
+    real_getsource = inspect.getsource
+    monkeypatch.setattr(inspect, "getsource", lambda obj: real_getsource(obj) + "\n# edited\n")
+    registry2, calls2 = _counting_registry()
+    FeatureStore(registry=registry2, cache_dir=tmp_path).get(spec, market_simple)
+    assert calls2["n"] == 1
+    assert len(list(tmp_path.iterdir())) == 2
+
+    # source that cannot be read (a feature defined interactively) falls
+    # back to the qualified name alone: still cached, under its own entry
+    def no_source(obj):
+        raise OSError("source code not available")
+
+    monkeypatch.setattr(inspect, "getsource", no_source)
+    registry3, calls3 = _counting_registry()
+    FeatureStore(registry=registry3, cache_dir=tmp_path).get(spec, market_simple)
+    registry4, calls4 = _counting_registry()
+    FeatureStore(registry=registry4, cache_dir=tmp_path).get(spec, market_simple)
+    assert (calls3["n"], calls4["n"]) == (1, 0)
+    assert len(list(tmp_path.iterdir())) == 3
+
+    # ... and the name alone still keeps two implementations apart
+    class HundredFold(WindowReturn):
+        def compute(self, data):
+            return 100.0 * super().compute(data)
+
+    registry5 = Registry("feature")
+    registry5.register("returns")(HundredFold)
+    other = FeatureStore(registry=registry5, cache_dir=tmp_path).get(spec, market_simple)
+    pd.testing.assert_frame_equal(other, 100.0 * market_simple.returns())
+
+
+def _no_pyarrow(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise ImportError("pyarrow unavailable")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", unavailable)
+    monkeypatch.setattr(pd, "read_parquet", unavailable)
+
+
+def _disk_formats():
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError:
+        return ["csv"]
+    return ["parquet", "csv"]
+
+
+def test_disk_cache_separates_parameterisations_of_one_feature(tmp_path, market_simple):
+    # the disk key must carry the params, not only the feature name
+    one, five = FeatureSpec.make("returns", window=1), FeatureSpec.make("returns", window=5)
+    FeatureStore(cache_dir=tmp_path).get(one, market_simple)  # persist window=1 only
+    got = FeatureStore(cache_dir=tmp_path).get(five, market_simple)  # fresh memory
+    expected = market_simple.close / market_simple.close.shift(5) - 1.0
+    pd.testing.assert_frame_equal(got, expected, check_freq=False)
+    assert len(list(tmp_path.iterdir())) == 2
+    back = FeatureStore(cache_dir=tmp_path).get(one, market_simple)
+    pd.testing.assert_frame_equal(back, market_simple.returns(), check_freq=False)
+
+
+@pytest.mark.parametrize("fmt", _disk_formats())
+@pytest.mark.parametrize("damage", ["truncated", "empty"])
+def test_store_recomputes_and_replaces_unreadable_disk_panel(
+    tmp_path, market_simple, monkeypatch, fmt, damage
+):
+    # an interrupted write used to leave a file that crashed every later run
+    if fmt == "csv":
+        _no_pyarrow(monkeypatch)
+    spec = FeatureSpec.make("returns", window=1)
+    registry1, _ = _counting_registry()
+    computed = FeatureStore(registry=registry1, cache_dir=tmp_path).get(spec, market_simple)
+    [path] = list(tmp_path.iterdir())
+    assert path.suffix == f".{fmt}"
+    blob = path.read_bytes()
+    path.write_bytes(b"" if damage == "empty" else blob[: len(blob) // 2])
+
+    registry2, calls2 = _counting_registry()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        loaded = FeatureStore(registry=registry2, cache_dir=tmp_path).get(spec, market_simple)
+    assert calls2["n"] == 1  # a miss, not a crash
+    pd.testing.assert_frame_equal(loaded, computed)
+    # half a csv still parses (as a shorter, misaligned panel: a silent
+    # miss); the other three cases cannot be parsed at all and say so
+    if not (fmt == "csv" and damage == "truncated"):
+        assert any("unreadable" in str(w.message) for w in caught)
+    # ... and the bad file was replaced by a good one, served from then on
+    assert list(tmp_path.iterdir()) == [path]
+    registry3, calls3 = _counting_registry()
+    again = FeatureStore(registry=registry3, cache_dir=tmp_path).get(spec, market_simple)
+    assert calls3["n"] == 0
+    pd.testing.assert_frame_equal(again, computed, check_freq=False)
+
+
+@pytest.mark.parametrize("fmt", _disk_formats())
+def test_store_failed_disk_write_leaves_no_file(tmp_path, market_simple, monkeypatch, fmt):
+    # the panel is written to a temporary name and renamed: a write that dies
+    # half way must leave neither a partial panel nor the temporary behind
+    if fmt == "csv":
+        _no_pyarrow(monkeypatch)
+    method = "to_parquet" if fmt == "parquet" else "to_csv"
+
+    def dies_half_way(self, path, *args, **kwargs):
+        with open(path, "wb") as handle:
+            handle.write(b"partial")
+        raise OSError("disk full")
+
+    spec = FeatureSpec.make("returns", window=1)
+    with monkeypatch.context() as patch:
+        patch.setattr(pd.DataFrame, method, dies_half_way)
+        with pytest.raises(OSError, match="disk full"):
+            FeatureStore(cache_dir=tmp_path).get(spec, market_simple)
+    assert list(tmp_path.iterdir()) == []
+
+    # a normal write leaves exactly the final file, no temporary
+    FeatureStore(cache_dir=tmp_path).get(spec, market_simple)
+    [path] = list(tmp_path.iterdir())
+    assert path.suffix == f".{fmt}" and not path.name.startswith(".")
+
+
+def test_store_validates_spec_before_serving_from_disk(tmp_path, market_simple):
+    spec = FeatureSpec.make("momentum", window=20, skip=5)
+    FeatureStore(cache_dir=tmp_path).get(spec, market_simple)
+    # a cached panel must not answer for a name this store's registry lacks
+    with pytest.raises(ConfigError, match="unknown feature"):
+        FeatureStore(registry=Registry("feature"), cache_dir=tmp_path).get(spec, market_simple)
+
+
+def test_disk_cache_misses_when_the_implementation_differs(tmp_path, market_simple):
+    # another implementation registered under the same name and params must
+    # not be served the panel the first implementation persisted
+    spec = FeatureSpec.make("returns", window=1)
+    original = FeatureStore(cache_dir=tmp_path).get(spec, market_simple)
+
+    class HundredFold(WindowReturn):
+        def compute(self, data):
+            return 100.0 * super().compute(data)
+
+    registry = Registry("feature")
+    registry.register("returns")(HundredFold)
+    other = FeatureStore(registry=registry, cache_dir=tmp_path).get(spec, market_simple)
+    pd.testing.assert_frame_equal(other, 100.0 * original)
+    assert len(list(tmp_path.iterdir())) == 2
+    # each implementation still finds its own entry
+    back = FeatureStore(cache_dir=tmp_path).get(spec, market_simple)
+    pd.testing.assert_frame_equal(back, original, check_freq=False)
 
 
 def test_fingerprint_distinguishes_seeds():
@@ -381,12 +542,37 @@ def test_fingerprint_sees_historical_corrections_between_sampled_rows(market_sim
     assert fingerprint(corrected) != fingerprint(market_simple)
 
 
+def test_fingerprint_separates_missing_from_zero(market_simple):
+    # volume may legitimately be 0.0; a missing cell is a different dataset
+    import copy
+
+    zero, missing = copy.deepcopy(market_simple), copy.deepcopy(market_simple)
+    zero.volume.iloc[13, 0] = 0.0
+    missing.volume.iloc[13, 0] = np.nan
+    assert fingerprint(zero) != fingerprint(missing)
+
+
+def test_fingerprint_sees_ticker_labels(market_simple):
+    fields = [f for f in _FINGERPRINT_FIELDS if getattr(market_simple, f) is not None]
+    renamed = [f"X{i}" for i in range(market_simple.close.shape[1])]
+    relabelled = MarketData(**{f: getattr(market_simple, f).set_axis(renamed, axis=1) for f in fields})
+    assert fingerprint(relabelled) != fingerprint(market_simple)
+
+
+def test_fingerprint_covers_every_market_data_field():
+    # a field added to MarketData must be added to the fingerprint too
+    import dataclasses
+
+    assert sorted(_FINGERPRINT_FIELDS) == sorted(f.name for f in dataclasses.fields(MarketData))
+    assert len(set(_FINGERPRINT_FIELDS)) == len(_FINGERPRINT_FIELDS)
+
+
 def test_fingerprint_sees_interior_date_changes(market_simple):
     import copy
 
     revised = copy.deepcopy(market_simple)
     dates = list(revised.dates)
-    dates[13] += pd.Timedelta(hours=1)
+    dates[13] += pd.Timedelta(1, unit="h")
     for field in ("close", "open", "high", "low", "volume", "unadjusted_close", "universe"):
         getattr(revised, field).index = pd.DatetimeIndex(dates)
     assert fingerprint(revised) != fingerprint(market_simple)

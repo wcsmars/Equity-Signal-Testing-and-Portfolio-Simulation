@@ -29,13 +29,23 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Al
     if not p.is_file():
         raise ConfigError(f"config path is not a file: {p}")
     try:
-        raw = yaml.load(p.read_text(), Loader=_StrictLoader) or {}
+        raw = yaml.load(p.read_text(), Loader=_StrictLoader)
     except yaml.YAMLError as exc:
         raise ConfigError(f"{p}: invalid YAML ({exc})") from exc
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError(f"{p}: cannot read config file ({exc})") from exc
     except ConfigError as exc:
         raise ConfigError(f"{p}: {exc}") from exc
+    # Only an empty document stands for "all defaults". `raw or {}` would
+    # also turn [], false and 0 into an empty config.
+    if raw is None:
+        raw = {}
     if not isinstance(raw, dict):
         raise ConfigError(f"{p}: top level must be a mapping")
+    try:
+        raw = _unshared(raw)
+    except ConfigError as exc:
+        raise ConfigError(f"{p}: {exc}") from exc
     for key, value in (overrides or {}).items():
         _set_dotted(raw, key, value)
     cfg = build_dataclass(AlphaLabConfig, raw, path=str(p))
@@ -103,6 +113,23 @@ def _construct_unique_mapping(loader: _StrictLoader, node: yaml.MappingNode, dee
 
 
 _StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+
+
+def _unshared(node: Any, parents: tuple = ()) -> Any:
+    """Copy a parsed YAML tree so that no two places hold the same object.
+
+    The parser returns one dict or list for an anchor and all of its aliases,
+    so an override applied in place through one path would also change the
+    aliased sibling. ``copy.deepcopy`` preserves that sharing; this does not.
+    """
+    if not isinstance(node, (dict, list)):
+        return node
+    if id(node) in parents:
+        raise ConfigError("recursive YAML alias")
+    parents = parents + (id(node),)
+    if isinstance(node, dict):
+        return {key: _unshared(value, parents) for key, value in node.items()}
+    return [_unshared(value, parents) for value in node]
 
 
 def _set_dotted(raw: dict, dotted: str, value: Any) -> None:

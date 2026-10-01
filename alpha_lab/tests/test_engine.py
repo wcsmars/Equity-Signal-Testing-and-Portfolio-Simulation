@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from alpha_lab.backtest.costs import RealisticCost
 from alpha_lab.backtest.engine import BacktestEngine
 from alpha_lab.config.schema import BacktestConfig, WalkForwardConfig
 from alpha_lab.core.errors import DataError, LookaheadError
@@ -106,6 +107,9 @@ def test_impulse_gross_lands_exactly_at_lag(market_simple, lag):
     # holdings are the shifted target weights
     assert result.holdings.loc[dates[k + lag], asset] == 1.0
     assert result.holdings.loc[dates[k], asset] == 0.0
+    # the lag recorded for downstream checks is the lag that was applied
+    assert result.meta["execution_lag"] == lag
+    assert result.meta["mode"] == "insample"
 
 
 # -- hand-computed drift / turnover (clause 6) -----------------------------
@@ -259,6 +263,52 @@ def test_fit_sees_only_train_dates(market_simple):
     assert seen == [(w.train_start, w.train_end) for w in result.windows]
 
 
+@pytest.mark.parametrize("scheme", ["rolling", "expanding"])
+def test_fit_receives_only_train_rows_of_every_feature_panel(market_simple, scheme):
+    """Feature panels are computed on the full sample, so the slice the engine
+    hands to ``fit`` is the only thing keeping later rows out of the fit."""
+
+    full = {"x": market_simple.close.copy(), "y": market_simple.returns()}
+    seen = []
+
+    class FeatureSpy(Signal):
+        name = "feature_spy"
+
+        def fit(self, features, data, train_dates):
+            assert set(features) == set(full)
+            for key, panel in features.items():
+                assert panel.index.equals(train_dates), f"{key} leaks rows outside the train window"
+                pd.testing.assert_frame_equal(panel, full[key].loc[train_dates])
+            assert data.dates.equals(train_dates)
+            seen.append((features["x"].index[0], features["x"].index[-1], len(features["y"])))
+
+        def score(self, features, data):
+            # scoring is a per-date map of the full panels; the engine keeps
+            # only each window's test rows of the result
+            assert all(panel.index.equals(data.dates) for panel in features.values())
+            return features["x"]
+
+    cfg = BacktestConfig(
+        execution_lag=1,
+        walkforward=WalkForwardConfig(
+            scheme=scheme, train_days=100, test_days=50, purge_days=2, embargo_days=0,
+        ),
+    )
+    result = _engine(ScoreProportional(), cfg, signal=FeatureSpy()).run(
+        market_simple, features=full
+    )
+    assert len(result.windows) >= 3
+    pos = market_simple.dates.get_loc
+    assert seen == [
+        (w.train_start, w.train_end, pos(w.train_end) - pos(w.train_start) + 1)
+        for w in result.windows
+    ]
+    if scheme == "rolling":
+        assert {n for _, _, n in seen} == {100}
+    else:
+        assert [n for _, _, n in seen] == [100 + 50 * i for i in range(len(seen))]
+
+
 # -- cost wiring (clauses 6-7: trades priced by the cost model, same date) ---
 
 
@@ -268,9 +318,11 @@ class SpyCost(CostModel):
     def __init__(self, series=None):
         self.series = series
         self.trades = None
+        self.portfolio_values = []
 
     def cost(self, trades, data, portfolio_value):
         self.trades = trades.copy()
+        self.portfolio_values.append(portfolio_value)
         if self.series is not None:
             return self.series
         return pd.Series(0.001 * (1 + np.arange(len(trades))), index=trades.index)
@@ -290,6 +342,46 @@ def test_cost_model_receives_drifted_trades_and_is_charged_same_date():
     pd.testing.assert_series_equal(
         result.net_returns, result.gross_returns - expected_costs, check_names=False
     )
+
+
+def test_cost_model_is_priced_at_the_engine_portfolio_value():
+    """Share counts and participation scale with the book: the cost model must
+    be handed the configured reference NAV, not a default."""
+    data, dates = _tiny_market()
+    w = pd.DataFrame({"A": [0.6, 0.5, 0.2], "B": [0.4, 0.5, 0.8]}, index=dates)
+    for nav in (50_000_000.0, 250_000.0):
+        spy = SpyCost()
+        result = BacktestEngine(
+            ConstSignal(), FixedWeights(w), spy, _insample_cfg(lag=1), portfolio_value=nav
+        ).run(data, features={})
+        assert spy.portfolio_values == [nav]
+        assert result.meta["portfolio_value"] == nav
+    # the default reference book
+    spy = SpyCost()
+    BacktestEngine(ConstSignal(), FixedWeights(w), spy, _insample_cfg(lag=1)).run(data, features={})
+    assert spy.portfolio_values == [1_000_000.0]
+
+
+def test_realistic_cost_scales_with_the_engine_portfolio_value():
+    """End to end: with a real impact model a 100x larger book pays 10x the
+    impact per unit of NAV (square-root participation), through the engine."""
+    n = 80
+    dates = pd.bdate_range("2021-01-04", periods=n)
+    close = pd.DataFrame({"A": [100.0 if i % 2 == 0 else 104.0 for i in range(n)]}, index=dates)
+    volume = pd.DataFrame({"A": 1_000_000.0}, index=dates)
+    data = MarketData.from_frames(close, volume=volume, unadjusted_close=close.copy())
+    w = pd.DataFrame({"A": 0.0}, index=dates)
+    w.loc[dates[60]:, "A"] = 0.5
+    costs = {}
+    for nav in (1_000_000.0, 100_000_000.0):
+        model = RealisticCost(commission_per_share=0.0, half_spread_bps=0.0,
+                              adv_window=20, vol_window=10)
+        result = BacktestEngine(
+            ConstSignal(), FixedWeights(w), model, _insample_cfg(lag=1), portfolio_value=nav
+        ).run(data, features={})
+        costs[nav] = result.costs.loc[dates[61]]  # the entry trade
+    assert costs[1_000_000.0] > 0.0
+    assert costs[100_000_000.0] == pytest.approx(10.0 * costs[1_000_000.0], rel=1e-9)
 
 
 @pytest.mark.parametrize("bad", ["misaligned", "nan", "inf", "negative", "frame", "text"])

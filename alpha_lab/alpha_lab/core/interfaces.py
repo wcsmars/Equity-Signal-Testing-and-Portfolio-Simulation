@@ -11,17 +11,25 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+import numpy as np
 import pandas as pd
 
 from alpha_lab.core.types import MarketData
 
 
 def _freeze(value: Any) -> Any:
-    """Recursively convert lists/dicts to tuples so params are hashable."""
+    """Recursively convert lists/dicts to tuples so params are hashable.
+
+    NumPy scalars become the equal Python scalar: their ``repr`` differs
+    between NumPy 1 and 2 (``5`` against ``np.int64(5)``), and the spec key is
+    built from ``repr``.
+    """
     if isinstance(value, dict):
         return tuple(sorted((k, _freeze(v)) for k, v in value.items()))
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(v) for v in value)
+    if isinstance(value, np.generic):
+        return value.item()
     return value
 
 

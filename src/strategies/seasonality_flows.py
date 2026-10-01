@@ -5,12 +5,19 @@ of the next, with modeled cash otherwise. Weights anticipate the next
 session's calendar window and the engine shifts them by one row. Window dates use approximate NYSE holiday rules independently of the
 price sample; future unscheduled closures are not assumed known. Costs assume 2 bps per side.
 
-Default execution prints metrics. --sweep compares window/filter settings
-and writes a variants CSV; --overnight-note reports a descriptive gross
-close-to-open versus open-to-close decomposition. Neither the fixed
-parameters nor the calendar split establish an untouched evaluation sample.
+Default execution prints metrics. --sweep compares window/filter settings,
+prints the table and saves it to results/seasonality_flows_variants.csv; a
+saved table that differs from the new run is kept and the new one is written
+to results/recomputed/ unless --rebase is given. --overnight-note reports a
+descriptive gross close-to-open versus open-to-close decomposition. Unknown
+flags are rejected. Neither the fixed parameters nor the calendar split
+establish an untouched evaluation sample.
+
+Reported statistics begin at a variant's first position, so the 200-day
+filter variants are scored over a shorter window than the unfiltered ones.
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -25,6 +32,7 @@ from qcore.backtest import OOS_SPLIT, TRADING_DAYS, metrics, run_backtest
 from qcore.quality import SPECIAL_CLOSURES, nyse_bdays
 from qcore.costs import IBKRHKCostModel
 from qcore.data import load, load_prices
+from qcore.records import save_csv
 
 N_LAST = 4   # last N trading days of the month
 M_FIRST = 2  # first M trading days of the next month
@@ -52,19 +60,25 @@ def tom_weights(spy: pd.Series, n_last: int = N_LAST, m_first: int = M_FIRST,
     # remove only closures already observed by that date.
     start = idx[0].to_period("M").start_time
     end = (idx[-1].to_period("M") + 1).end_time.normalize()
+    closures = SPECIAL_CLOSURES.sort_values()
     regular = nyse_bdays(start, end).union(
-        SPECIAL_CLOSURES[(SPECIAL_CLOSURES >= start) & (SPECIAL_CLOSURES <= end)]
+        closures[(closures >= start) & (closures <= end)]
     ).sort_values()
-    hold = pd.Series(False, index=idx)
-    for date in idx:
-        calendar = regular.difference(SPECIAL_CLOSURES[SPECIAL_CLOSURES <= date])
-        future = calendar[calendar > date]
-        if future.empty:
-            continue
-        next_day = future[0]
-        month = calendar[calendar.to_period("M") == next_day.to_period("M")]
-        rank = int(month.get_loc(next_day))
-        hold.loc[date] = rank < m_first or len(month) - rank <= n_last
+    # The scheduled calendar changes only when a closure becomes known, so
+    # decision rows are grouped by the number of closures already observed.
+    known = closures.searchsorted(idx, side="right")
+    held = np.zeros(len(idx), dtype=bool)
+    for k in np.unique(known):
+        calendar = regular.difference(closures[:k])
+        sessions = pd.Series(1, index=calendar.to_period("M"))
+        rank = sessions.groupby(level=0).cumcount().to_numpy()   # 0 = first session of its month
+        size = sessions.groupby(level=0).transform("size").to_numpy()
+        in_window = (rank < m_first) | (size - rank <= n_last)
+        rows = np.flatnonzero(known == k)
+        nxt = calendar.searchsorted(idx[rows], side="right")     # next scheduled session
+        ok = nxt < len(calendar)
+        held[rows[ok]] = in_window[nxt[ok]]
+    hold = pd.Series(held, index=idx)
 
     if dma_filter:
         hold &= spy > spy.rolling(200).mean()
@@ -86,7 +100,7 @@ def _is_sharpe_unrounded(res: dict) -> float:
     is ordered on this, and rounding leaves ties (e.g. two rows at 0.55)."""
     r = res["returns"].dropna()
     ex = r - res["rf_daily"].reindex(r.index).fillna(0.0)
-    ex = ex.loc[: pd.Timestamp(OOS_SPLIT) - pd.Timedelta(days=1)]
+    ex = ex.loc[: pd.Timestamp(OOS_SPLIT) - pd.Timedelta(1, unit="D")]
     return float(ex.mean() / ex.std() * np.sqrt(TRADING_DAYS))
 
 
@@ -163,15 +177,28 @@ def overnight_note() -> dict:
     return out
 
 
-if __name__ == "__main__":
-    if "--sweep" in sys.argv:
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--sweep", action="store_true",
+                      help="re-run the 12 tested variants instead of the default one")
+    mode.add_argument("--overnight-note", action="store_true",
+                      help="print the overnight/intraday decomposition instead")
+    ap.add_argument("--rebase", action="store_true",
+                    help="with --sweep: replace the saved variants table if this run differs")
+    args = ap.parse_args()  # --rebase itself is read by qcore.records
+
+    if args.sweep:
         df = sweep()
-        out = ROOT / "results" / "seasonality_flows_variants.csv"
-        out.parent.mkdir(exist_ok=True)
-        df.to_csv(out, index=False)
-        print(f"\nsaved {out}")
+        print()
+        # saved table is kept if this run differs (see qcore.records)
+        save_csv(ROOT / "results" / "seasonality_flows_variants.csv", df, index=False)
         print("best by IS Sharpe:", df.iloc[0]["name"])
-    elif "--overnight-note" in sys.argv:
+    elif args.overnight_note:
         print(json.dumps(overnight_note(), indent=2))
     else:
         print(json.dumps(run_best(), indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -73,6 +73,13 @@ class RealisticCost(CostModel):
     adjusted prices misstate share counts across splits. Individual cells
     with a missing raw price but a valid adjusted close fall back the same
     way (one warning per instance), so they are never commission-free.
+
+    Two limits bound what the impact term can say about size, and each
+    warns once per instance when it applies to a traded cell: beyond
+    PARTICIPATION_CAP x ADV a trade is priced as if it were exactly at the
+    cap, and a panel without ``volume`` prices every trade at
+    PARTICIPATION_FALLBACK. In both cases the modelled cost stops growing
+    with ``portfolio_value``, so it cannot be read as a capacity estimate.
     """
 
     #: conservative defaults for traded cells with missing rolling history
@@ -109,6 +116,8 @@ class RealisticCost(CostModel):
         self.vol_window = int(vol_window)
         self._warned_no_unadjusted = False
         self._warned_partial_unadjusted = False
+        self._warned_no_volume = False
+        self._warned_participation_cap = False
 
     def cost(self, trades: pd.DataFrame, data, portfolio_value: float) -> pd.Series:
         """Total cost per date as a NAV fraction (index = trades.index)."""
@@ -184,7 +193,28 @@ class RealisticCost(CostModel):
                 .reindex(index=abs_tr.index, columns=abs_tr.columns)
             )
             participation = abs_tr * portfolio_value / adv_dollars
+            n_capped = int((traded & (participation > self.PARTICIPATION_CAP)).to_numpy().sum())
+            if n_capped and self.impact_coeff > 0 and not self._warned_participation_cap:
+                warnings.warn(
+                    f"participation exceeds the {self.PARTICIPATION_CAP:g}x ADV cap on "
+                    f"{n_capped} of {int(traded.to_numpy().sum())} traded cells; impact "
+                    "there is priced at the cap, so the modelled cost stops growing "
+                    "with portfolio_value — do not read capacity from it",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._warned_participation_cap = True
         else:
+            if traded.to_numpy().any() and self.impact_coeff > 0 and not self._warned_no_volume:
+                warnings.warn(
+                    "MarketData has no volume; impact uses the fixed fallback "
+                    f"participation {self.PARTICIPATION_FALLBACK:g} for every trade, so "
+                    "the modelled cost does not depend on portfolio_value — do not "
+                    "read capacity from it",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._warned_no_volume = True
             participation = pd.DataFrame(
                 np.nan, index=abs_tr.index, columns=abs_tr.columns
             )

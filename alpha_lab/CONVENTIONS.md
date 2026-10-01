@@ -37,13 +37,20 @@ For `r_t = close_t / close_{t-1} - 1`:
 3. The trade indexed by `t` executes at close `t-1`. Its size is
    `H_t - drift(H_{t-1})`, with drift computed using returns through `t-1`.
    Turnover is the sum of absolute traded weights. Drift adjustment is on
-   by default and can be disabled.
+   by default. `drift_adjust_turnover: false` is a comparison aid only:
+   `gross_t` still assumes the book is reset to `H_t` every day, so the
+   trades that undo each day's drift are then left out of turnover and
+   cost, which are typically understated relative to the gross series.
 4. Costs use raw prices and rolling liquidity/volatility estimates through
    `t-1`, and are charged to the return indexed by `t`:
    `net_t = gross_t - cost_t`. The spread, commission, and square-root impact
    parameters are assumptions, not calibrated execution estimates. The
   model uses a fixed reference portfolio value for participation and
   ignores financing, borrow availability, and borrow fees.
+  Participation is capped at 2x average daily dollar volume, and a panel
+  without `volume` is priced at a fixed 5% participation. Either way the
+  modelled cost stops growing with the reference portfolio value (the
+  model warns), so it is not a capacity estimate.
   Drift uses gross returns and costs are subtracted additively; fee-induced
   rescaling of holdings is not modeled. The engine rejects a loss of 100%
   or more, before or after costs, because insolvency is unsupported.
@@ -59,10 +66,13 @@ For `r_t = close_t / close_{t-1} - 1`:
 - Unavailable scores or ineligible assets receive zero target weights;
   holdings still follow the configured lag. Prices are not forward-filled.
   Missing returns contribute zero, and lagged positions can persist after
-  prices disappear. No delisting payout or forced liquidation is modeled;
-  turnover costs still follow the configured cost model. Results involving
-  missing prices require separate review. A run warns and records
-  `meta.missing_held_return_cells` whenever a held return is missing.
+  prices disappear. A price gap inside a holding period makes two returns
+  missing (the gap day and the day the price returns), so the move across
+  the gap is dropped, not booked when the price reappears. No delisting
+  payout or forced liquidation is modeled; turnover costs still follow the
+  configured cost model. Results involving missing prices require separate
+  review. A run warns and records `meta.missing_held_return_cells`
+  whenever a held return is missing.
 
 ## Paths and outputs
 
@@ -88,6 +98,19 @@ start at the first test-window date. The training and purge warm-up remains
 in the persisted result tables but is excluded from those summaries. The
 window table still shows the training dates for context. Full-sample
 diagnostic runs retain their complete date range.
+
+## Leakage checks
+
+`alpha_lab.testing.checks` compares a computation on the full panel with
+the same computation on the panel cut at a sampled date. Without explicit
+`dates` the sample is eight dates spread from one sixth of the index to the
+second-to-last date (cutting at the final date returns the whole panel and
+cannot fail), plus the warm-up: the first two dates, the middle of the
+first sixth, and the first date on which the full-panel output holds a
+value. The warm-up rows are where a backfill would place future values.
+The cost check samples dates that carry a trade and raises `DataError`
+when none of the checked dates does, because a date without a trade costs
+nothing whatever the model reads. These are sampled probes, not proofs.
 
 ## Numbered references in code and error messages
 

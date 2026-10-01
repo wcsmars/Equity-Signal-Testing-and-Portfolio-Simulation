@@ -45,9 +45,9 @@ def confirmed_month_ends(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     if not complete.iloc[-1]:
         return pd.DatetimeIndex(historical)
     final = last.iloc[-1]
-    rest = pd.bdate_range(final + pd.Timedelta(days=1), final + pd.offsets.MonthEnd(0))
-    if len(rest) and len(nyse_bdays(rest[0], rest[-1])):
-        return pd.DatetimeIndex(historical)
+    # `complete` already proves no NYSE session follows `final` in its month,
+    # so any weekday left in `rest` is a holiday under the registered rules.
+    rest = pd.bdate_range(final + pd.Timedelta(1, unit="D"), final + pd.offsets.MonthEnd(0))
     if len(rest):
         warnings.warn(
             f"treating final data date {final.date()} as a month-end: the "

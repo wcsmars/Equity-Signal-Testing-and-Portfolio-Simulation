@@ -1,9 +1,13 @@
-"""Point-in-time snapshot store: pin the exact MarketData a backtest used.
+"""Point-in-time snapshot store: save a MarketData panel under an immutable id.
 
 Layout: ``root/<name>/<snapshot>/`` with one CSV per non-None field
 (``close.csv``, ``volume.csv``, ...) plus a ``manifest.json`` recording shape,
-date range, tickers, save time, and the sha256 of every field's CSV bytes so a
-result can later be checked against the data it claims to have used.
+date range, tickers, save time, and the sha256 of every field's CSV bytes, so
+a loaded snapshot is verified to be the panel that was saved.
+
+The store is a standalone utility. No config key selects a snapshot and a run
+does not record a snapshot id or data checksum, so linking a result to the
+data it used is left to the caller.
 """
 
 from __future__ import annotations
@@ -40,6 +44,9 @@ class MarketDataStore:
         self._check_component(name)
         self._check_component(snap)
         data.validate()
+        if not len(data.dates) or not len(data.tickers):
+            # a header-only CSV has no dates to parse back, so load() would fail
+            raise DataError("cannot snapshot an empty panel")
         out = self.root / name / snap
         if out.exists():
             raise DataError(f"snapshot already exists: {out}; choose a new snapshot id")
@@ -73,6 +80,9 @@ class MarketDataStore:
                 (stage / "manifest.json").write_text(json.dumps(manifest, indent=2))
                 if out.exists():
                     raise DataError(f"snapshot already exists: {out}; choose a new snapshot id")
+                # The staging directory is created with mode 0700 whatever the
+                # umask; publish it with the dataset directory's permissions.
+                stage.chmod(out.parent.stat().st_mode & 0o777)
                 stage.rename(out)
         except OSError as exc:
             raise DataError(f"could not save snapshot {out}: {exc}") from exc

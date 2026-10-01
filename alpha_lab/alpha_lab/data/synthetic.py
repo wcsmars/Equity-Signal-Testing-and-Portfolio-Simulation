@@ -30,15 +30,22 @@ def make_market(
     phi=0.995) per-asset drift whose cross-sectional dispersion is
     ``drift_dispersion`` annualized — that persistence is what a momentum
     signal should be able to pick up.
+
+    Shifted and scaled draws are written as ``low + width * rng.random()`` and
+    ``loc + scale * rng.standard_normal()`` instead of ``rng.uniform(low,
+    high)`` and ``rng.normal(loc, scale)``. The generator evaluates the latter
+    in compiled code, where some NumPy builds fuse the multiply and the add and
+    return a different last bit; spelled out here the panel is the same on
+    every NumPy build that shares the platform's math library.
     """
     rng = np.random.default_rng(seed)
     dates = pd.bdate_range(start, periods=n_days)
     tickers = [f"SYM{i:02d}" for i in range(n_assets)]
     ann = np.sqrt(TRADING_DAYS_PER_YEAR)
 
-    vols = base_vol * np.exp(rng.uniform(-0.5, 0.5, n_assets)) / ann  # daily idio vol
-    betas = rng.uniform(0.5, 1.5, n_assets)
-    market = rng.normal(0.0002, 0.16 / ann, n_days)
+    vols = base_vol * np.exp(-0.5 + 1.0 * rng.random(n_assets)) / ann  # daily idio vol
+    betas = 0.5 + 1.0 * rng.random(n_assets)
+    market = 0.0002 + (0.16 / ann) * rng.standard_normal(n_days)
 
     phi = 0.995
     mu_scale = drift_dispersion / TRADING_DAYS_PER_YEAR
@@ -50,7 +57,7 @@ def make_market(
 
     rets = mus + betas * market[:, None] + rng.standard_normal((n_days, n_assets)) * vols
     rets = np.clip(rets, -0.4, 0.4)
-    p0 = rng.uniform(20.0, 200.0, n_assets)
+    p0 = 20.0 + 180.0 * rng.random(n_assets)
     close = pd.DataFrame(p0 * np.cumprod(1.0 + rets, axis=0), index=dates, columns=tickers)
 
     open_noise = rng.normal(0.0, 0.002, (n_days, n_assets))
@@ -59,7 +66,7 @@ def make_market(
     high = pd.DataFrame(np.maximum(open_.values, close.values) * (1.0 + span), index=dates, columns=tickers)
     low = pd.DataFrame(np.minimum(open_.values, close.values) * (1.0 - span), index=dates, columns=tickers)
 
-    adv_shares = 10.0 ** rng.uniform(5.5, 7.5, n_assets)
+    adv_shares = 10.0 ** (5.5 + 2.0 * rng.random(n_assets))
     volume = pd.DataFrame(
         np.round(adv_shares * rng.lognormal(0.0, 0.4, (n_days, n_assets))),
         index=dates,

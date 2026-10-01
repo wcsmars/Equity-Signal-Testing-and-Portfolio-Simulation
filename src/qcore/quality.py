@@ -31,7 +31,13 @@ MISSING_INTERNAL_FAIL_PCT = 0.01   # >1% of a ticker's life missing mid-series
 MISSING_GAP_FAIL_DAYS = 5          # one contiguous internal hole this long
 STALE_RUN_WARN = 5                 # identical raw closes in a row
 STALE_RUN_FAIL = 10
-FROZEN_ROW_WARN = 3                # identical full OHLCV rows in a row
+FROZEN_ROW_WARN = 2                # identical full OHLCV rows in a row (with
+                                   # nonzero volume even ONE exact repeat of
+                                   # all five fields is a re-served record)
+CARRIED_ROW_FAIL_FRAC = 0.25       # share of live tickers whose raw close is
+                                   # exactly the previous session's (2000-2026
+                                   # maximum on the default universe: 10.6%)
+CARRIED_ROW_MIN_TICKERS = 5        # ...and at least this many of them
 ZERO_RET_FRAC_INFO = 0.10          # share of exactly-unchanged closes (marks
                                    # are quantized/illiquid - count, don't gate)
 VOL_COLLAPSE_FRAC = 0.10           # 10d vol under 10% of 1y median = smoothed
@@ -39,7 +45,13 @@ VOL_COLLAPSE_MIN_SIGMA = 0.003     # ...only for instruments that usually move
 EXTREME_IDIO_WARN = 0.30           # |idiosyncratic daily return|
 EXTREME_SIGMA_K = 15               # vol-scaled companion gate (low-vol names)
 EXTREME_SIGMA_FLOOR = 0.01
+CRISIS_INDEX = "^GSPC"             # independent series that must confirm a
+CRISIS_INDEX_MOVE = 0.02           # market-wide extreme day: |index return|
+                                   # that day (smallest on a real such day,
+                                   # 2000-2026: 2.6%)
 SPLIT_RATIO_TOL = 0.025            # relative distance to a candidate ratio
+SPLIT_HINT_TOL = 0.08              # wider band used ONLY to name the nearest
+                                   # ratio in a WARN, never to FAIL
 SPLIT_RAW_JUMP = 0.40              # |raw return| that demands an explanation
 SPLIT_ADJ_QUIET = 0.10             # adj return small => adjustment worked
 FACTOR_NOISE_TOL = 1e-5            # adjustment-factor noise tolerance
@@ -50,13 +62,30 @@ TTM_DIV_YIELD_WARN = 0.20          # trailing-12m implied payout cap
 DIV_MAX_GAP_DAYS = 550             # expected payers: max days between events
 ZERO_VOL_MOVE_PCT = 0.001          # price moved despite zero volume
 ZERO_VOL_FAIL_DAYS = 10
-VOLUME_STEP_WARN = 30.0            # 20d median volume ratio across a break
+VOLUME_STEP_WARN = 30.0            # 20d median volume ratio across a break;
+                                   # above any real split (<= 20:1) on purpose
 VOLUME_STEP_FAIL = 100.0           # ...thousands-vs-shares style unit error
 DELIST_GRACE_DAYS = 5              # trailing rows a ticker may lag the file
+                                   # before it counts as delisted (a shorter
+                                   # lag still WARNs: no price on the latest
+                                   # bars)
+LIVE_EDGE_FAIL_FRAC = 0.25         # share of live tickers with no price on the
+                                   # final row that makes it a partial bar
 OHLC_REL_TOL = 1e-3                # rounding slack for low<=px<=high
 CAL_YEAR_DAYS = (249, 254)         # plausible trading days per full year
 LEADLAG_MARGIN = 0.10              # lagged |corr| beats contemporaneous by
 LEADLAG_MIN_CORR = 0.25            # ...and is material -> series is shifted
+RATE_ZIRP_LEVEL = 0.25             # yield (%) at/below which bills pin for weeks
+RATE_STALE_RUN_WARN = 10           # identical ^IRX prints above that level
+                                   # (2000-2026 maximum: 5)
+RATE_ZIRP_STALE_RUN_WARN = 30      # ...and at any level (maximum: 19, at
+                                   # 0.005% in Dec 2011)
+RATE_JUMP_WARN_PP = 1.5            # |change between prints|, percentage points
+                                   # (2000-2026 maxima: ^IRX 0.85, ^TNX 0.47)
+RATE_JUMP_FAIL_PP = 3.0            # ...percent-vs-decimal style unit break
+KNOWN_EVENT_ABS_TOL = 0.01         # an acknowledgement carrying an `expect`
+KNOWN_EVENT_REL_TOL = 0.05         # value holds while |value - expect| <=
+                                   # max(abs, rel x |expect|)
 
 # Tickers whose adj_close MUST show dividend events (bond ETFs and broad
 # index funds always distribute); a dividend-free stretch here means the
@@ -73,6 +102,11 @@ EXPECT_DIVIDENDS = {
 # 3:2 split raises its split-shaped WARN, and a missed 4:3 its trailing-year
 # yield WARN, but a missed 5:4 on a non-dividend payer passes as a 20%
 # dividend. Closing that gap needs the vendor's split events.
+# A split missed by BOTH series leaves the factor untouched. It is a
+# split_adjustment FAIL only when the raw move lands within SPLIT_RATIO_TOL
+# of a ratio (that day's own return inside about +/-2.5%); otherwise
+# check_extreme_returns reports a WARN that names the nearest ratio, and a
+# missed 4:3 or 5:4 cannot be told from a real -25% / -20% print at all.
 # reverse splits are INTEGER-only (1:8 GE, 1:10 C) - fractional reverse
 # splits do not exist, and admitting them (e.g. 2:3) would misread real
 # +50%/+33% earnings moves as splits (AMD +52.3% on 2016-04-22 is a real
@@ -147,9 +181,15 @@ class Finding:
     ticker: str              # "" for file-level findings
     date: str                # ISO date or range, "" if not date-specific
     detail: str
+    value: float | None = None   # the number the check measured (return, run
+                                 # length, yield, ratio) where there is one;
+                                 # lets an acknowledgement pin what it covers
 
     def as_dict(self) -> dict:
-        return self.__dict__.copy()
+        d = self.__dict__.copy()
+        if d["value"] is None:
+            del d["value"]
+        return d
 
 
 @dataclass
@@ -161,7 +201,12 @@ class PriceBundle:
     close.csv already has splits applied, so the adj/close factor may only
     move on dividends. Set False for vendors whose raw close is the actual
     tape price (then split-shaped factor jumps are the healthy signature
-    of a handled split)."""
+    of a handled split).
+
+    required_indices: index series that MUST be present. load() sets it to
+    the registered INDEX_UNIVERSE, so a cache whose indices.csv (or one of
+    its series) is missing fails; hand-built bundles default to no
+    requirement and may omit indices or pass a subset."""
     open: pd.DataFrame
     high: pd.DataFrame
     low: pd.DataFrame
@@ -170,18 +215,19 @@ class PriceBundle:
     volume: pd.DataFrame
     indices: pd.DataFrame | None = None
     raw_split_adjusted: bool = True
+    required_indices: tuple[str, ...] = ()
 
     FIELDS = ["open", "high", "low", "adj_close", "close", "volume"]
 
     @classmethod
     def load(cls) -> "PriceBundle":
-        from qcore.data import load
+        from qcore.data import INDEX_UNIVERSE, load
         kw = {f: load(f) for f in cls.FIELDS}
         try:
             kw["indices"] = load("indices")
         except FileNotFoundError:
-            pass
-        return cls(**kw)
+            pass  # check_indices reports it; the price checks still run
+        return cls(**kw, required_indices=tuple(INDEX_UNIVERSE))
 
     def frames(self) -> dict[str, pd.DataFrame]:
         return {f: getattr(self, f) for f in self.FIELDS}
@@ -235,10 +281,18 @@ def _match_split_ratio(x: float, tol: float = SPLIT_RATIO_TOL) -> float | None:
     or None if nothing is within tol."""
     if not np.isfinite(x) or x <= 0:
         return None
-    for cand in _SPLIT_CANDIDATES:
-        if abs(x - cand) / cand < tol:
-            return cand
-    return None
+    best = min(_SPLIT_CANDIDATES, key=lambda cand: abs(x - cand) / cand)
+    return best if abs(x - best) / best < tol else None
+
+
+def _ratio_label(ratio: float) -> str:
+    """'2:1', '3:2' or '1:8 reverse' for a split candidate."""
+    if ratio < 1.0:
+        return f"1:{1.0 / ratio:g} reverse"
+    for num, den in ((3, 2), (4, 3), (5, 4)):
+        if abs(ratio - num / den) < 1e-9:
+            return f"{num}:{den}"
+    return f"{ratio:g}:1"
 
 
 def _life(s: pd.Series) -> pd.Series:
@@ -253,15 +307,42 @@ def _fmt_d(ts) -> str:
     return str(pd.Timestamp(ts).date())
 
 
+def _bridged_returns(px: pd.DataFrame) -> pd.DataFrame:
+    """Bar-to-bar returns measured from each series' PREVIOUS VALID bar, so
+    the level change across a NaN hole lands on the first bar after it
+    instead of vanishing (pct_change leaves that bar NaN). Identical to
+    pct_change(fill_method=None) wherever there is no hole; hole bars stay
+    NaN."""
+    return px / px.ffill().shift() - 1.0
+
+
+def _gap_note(px: pd.Series, d) -> str:
+    """' (across an N-day data gap)' when the N bars before d are missing
+    inside the series' life, else ''."""
+    pos = px.index.get_loc(d)
+    n = 0
+    while pos - n - 1 >= 0 and pd.isna(px.iloc[pos - n - 1]):
+        n += 1
+    if n == 0 or pos - n - 1 < 0:
+        return ""  # leading NaNs are pre-inception, not a gap
+    return f" (across a {n}-day data gap)"
+
+
 # -------------------------------------------------------------------- checks
 def check_calendar_alignment(b: PriceBundle) -> list[Finding]:
     """All six files must share one index and one column set; the index must
     be unique, sorted, weekday-only. Misalignment silently breaks any code
-    that combines fields positionally."""
+    that combines fields positionally. The index file gets the same
+    uniqueness / order / weekday tests but not the cross-file equality (its
+    calendar legitimately differs: bond-market holidays, vendor rows on
+    closed days - check_indices reports those)."""
     out = []
     ref_name = "adj_close"
     ref = b.adj_close
-    for name, df in b.frames().items():
+    frames = b.frames()
+    if b.indices is not None:
+        frames["indices"] = b.indices
+    for name, df in frames.items():
         dup = df.index[df.index.duplicated()]
         for d in dup.unique()[:10]:
             out.append(Finding("calendar_alignment", "FAIL", "", _fmt_d(d),
@@ -273,7 +354,7 @@ def check_calendar_alignment(b: PriceBundle) -> list[Finding]:
         for d in wk[:10]:
             out.append(Finding("calendar_alignment", "FAIL", "", _fmt_d(d),
                                f"{name}.csv: weekend date in index"))
-        if name == ref_name:
+        if name in (ref_name, "indices"):
             continue
         if not df.index.equals(ref.index):
             miss = ref.index.difference(df.index)
@@ -299,6 +380,13 @@ def check_calendar_gaps(b: PriceBundle) -> list[Finding]:
     for d in missing:
         out.append(Finding("calendar_gaps", "FAIL", "", _fmt_d(d),
                            "expected trading day absent from cache"))
+    # a row that exists but holds no price for ANY ticker is the same defect
+    # as a dropped day: every lagged signal sees a hole there
+    if b.adj_close.shape[1]:
+        for d in idx[b.adj_close.isna().all(axis=1).to_numpy()]:
+            out.append(Finding("calendar_gaps", "FAIL", "", _fmt_d(d),
+                               "row present but no ticker has a price "
+                               "(empty trading day)"))
     hol = nyse_holidays(idx[0], idx[-1]).union(SPECIAL_CLOSURES)
     extra = idx.intersection(hol)
     for d in extra:
@@ -358,9 +446,11 @@ def check_missing_prices(b: PriceBundle) -> list[Finding]:
 
 def check_duplicate_rows(b: PriceBundle) -> list[Finding]:
     """Frozen full rows: identical (open, high, low, close, volume) on
-    consecutive days. One coincidence is possible; a run means the feed
-    re-served yesterday's record. Requires volume > 0 - an untraded holiday
-    carry-forward with zero volume is the zero_volume check's business."""
+    consecutive days. With nonzero volume even ONE exact repeat of all five
+    fields means the feed re-served yesterday's record (a coincidence would
+    need four prices AND the share count to match). Requires volume > 0 -
+    an untraded carry-forward with zero volume is left to check_zero_volume
+    and, when the whole board is carried, check_carried_rows."""
     out = []
     frames = b.frames()
     common = b.adj_close.columns
@@ -390,6 +480,35 @@ def check_duplicate_rows(b: PriceBundle) -> list[Finding]:
     return out
 
 
+def check_carried_rows(b: PriceBundle) -> list[Finding]:
+    """A whole session carried forward from the previous one: a large share
+    of the board closes at EXACTLY the previous session's raw close on the
+    same date. A stale feed or a forward-filling merge does this, and no
+    per-ticker check can see a single such day - whatever the volume field
+    says (a placeholder bar reports zero volume). On the latest bar it means
+    targets would be sized on yesterday's prices. Keyed on the raw close
+    only; universes under CARRIED_ROW_MIN_TICKERS names are left to
+    check_duplicate_rows."""
+    out = []
+    c = b.close
+    if len(c) < 2 or c.shape[1] < CARRIED_ROW_MIN_TICKERS:
+        return out
+    prev = c.shift()
+    live = c.notna() & prev.notna()
+    n_live = live.sum(axis=1)
+    n_same = (c.eq(prev) & live).sum(axis=1)
+    hit = (n_same >= CARRIED_ROW_MIN_TICKERS) \
+        & (n_same >= CARRIED_ROW_FAIL_FRAC * n_live)
+    for d in c.index[hit.to_numpy()]:
+        out.append(Finding(
+            "carried_rows", "FAIL", "", _fmt_d(d),
+            f"{int(n_same.loc[d])} of {int(n_live.loc[d])} live tickers "
+            f"({n_same.loc[d] / n_live.loc[d]:.0%}) have a raw close identical "
+            "to the previous session's: row carried forward"
+            + (" (this is the latest bar)" if d == c.index[-1] else "")))
+    return out
+
+
 def check_stale_prices(b: PriceBundle) -> list[Finding]:
     """Staleness in three flavors.
 
@@ -415,7 +534,8 @@ def check_stale_prices(b: PriceBundle) -> list[Finding]:
             out.append(Finding(
                 "stale_prices", sev, t,
                 f"{_fmt_d(r['start'])}..{_fmt_d(r['end'])}",
-                f"close pinned at {r['value']:.4g} for {int(r['length'])} days"))
+                f"close pinned at {r['value']:.4g} for {int(r['length'])} days",
+                value=float(r["length"])))
         if len(life) > 40:
             frac = float((life.diff() == 0).sum() / max(len(life) - 1, 1))
             if frac > ZERO_RET_FRAC_INFO:
@@ -438,7 +558,8 @@ def check_stale_prices(b: PriceBundle) -> list[Finding]:
                     f"{_fmt_d(rr['start'])}..{_fmt_d(rr['end'])}",
                     f"10d vol collapsed to <{VOL_COLLAPSE_FRAC:.0%} of the "
                     f"1y norm ({med1y:.2%}/d) for {int(rr['length'])} days: "
-                    "smoothed/interpolated segment?"))
+                    "smoothed/interpolated segment?",
+                    value=float(rr["length"])))
     return out
 
 
@@ -462,7 +583,8 @@ def check_zero_volume(b: PriceBundle) -> list[Finding]:
             d = moved[moved].index
             out.append(Finding(
                 "zero_volume", sev, t, f"{_fmt_d(d[0])}..{_fmt_d(d[-1])}",
-                f"{n_moved} days with zero volume but price moved"))
+                f"{n_moved} days with zero volume but price moved",
+                value=float(n_moved)))
         runs = _runs_of_equal((v == 0).astype(int))
         runs = runs[(runs["value"] == 1) & (runs["length"] >= 3)]
         for _, r in runs.iterrows():
@@ -474,10 +596,12 @@ def check_zero_volume(b: PriceBundle) -> list[Finding]:
 
 
 def check_extreme_returns(b: PriceBundle) -> list[Finding]:
-    """Implausible one-day ADJUSTED returns, after removing the market-wide
-    component (cross-sectional median return that day) so crash days don't
-    light up the whole board. Split-ratio-shaped moves are excluded here -
-    they belong to check_split_adjustment, which classifies them properly.
+    """Implausible bar-to-bar ADJUSTED returns (measured from the previous
+    valid bar, so a move across a missing bar is still seen), after removing
+    the market-wide component (cross-sectional median return that day) so
+    crash days don't light up the whole board. Split-ratio-shaped moves are
+    excluded here - they belong to check_split_adjustment, which classifies
+    them properly.
 
     Severity hinges on what happened NEXT: a bad print spikes and fully
     reverts the following day (FAIL - it is not a price, it is a glitch),
@@ -492,12 +616,29 @@ def check_extreme_returns(b: PriceBundle) -> list[Finding]:
     below the absolute threshold; its persistent hits log as INFO so
     genuine vol outliers never spam the WARN board.
 
+    A hit with NO later print (the latest bar) can be neither confirmed nor
+    reversed yet - a bad print looks exactly like this on the day it
+    arrives. It is WARN and says so, whichever gate fired, unless the whole
+    board moved with it (confirmed market-wide window).
+
+    The market-wide ("crisis") exemption must not be certified by the data
+    it excuses: a garbled or mis-scaled ROW synchronizes by construction.
+    When the bundle carries CRISIS_INDEX, a market-wide extreme day counts
+    as a crisis only if that index moved more than CRISIS_INDEX_MOVE the
+    same day; otherwise its V-reversals stay bad prints. Without the index
+    (or without its print that day) the panel-only rule applies. A corrupt
+    row inside a genuine, index-confirmed window is still excused.
+
     Split-ratio-shaped moves are skipped ONLY when check_split_adjustment
     will actually claim the day (raw close co-jumped past its gate);
-    otherwise a split-shaped bad print would fall between two checks."""
+    otherwise a split-shaped bad print would fall between two checks. A
+    persistent move that the raw close shared and that sits near a split
+    ratio (SPLIT_HINT_TOL) but outside the split check's tolerance keeps
+    its WARN and names the ratio: an unadjusted split that coincided with a
+    real move looks exactly like it."""
     out = []
-    ret = b.adj_close.pct_change(fill_method=None)
-    ret_raw = b.close.pct_change(fill_method=None)
+    ret = _bridged_returns(b.adj_close)
+    ret_raw = _bridged_returns(b.close)
     idio = ret.sub(ret.median(axis=1), axis=0)
     # pass 1: gates for every ticker, so classification can see how much
     # of the UNIVERSE was extreme on each day
@@ -517,12 +658,31 @@ def check_extreme_returns(b: PriceBundle) -> list[Finding]:
     # thin bond ETFs dislocated alone: LQD -9.1% on 2008-09-29's -8%
     # tape), a V-reversal is crisis whipsaw, not a glitch.
     day_hits = hit_df.sum(axis=1)
-    crisis = (day_hits >= max(5, int(0.05 * max(hit_df.shape[1], 1)))) \
+    broad = (day_hits >= max(5, int(0.05 * max(hit_df.shape[1], 1)))) \
         | (ret.median(axis=1).abs() > 0.03)
+    # ...but the panels must not certify their own exemption (see docstring)
+    unconfirmed = pd.Series(False, index=ret.index)
+    idx_ret = None
+    if b.indices is not None and CRISIS_INDEX in b.indices.columns:
+        idx_ret = pd.to_numeric(b.indices[CRISIS_INDEX], errors="coerce") \
+            .dropna().pct_change(fill_method=None).reindex(ret.index)
+        unconfirmed = broad & idx_ret.notna() \
+            & (idx_ret.abs() <= CRISIS_INDEX_MOVE)
+    crisis = broad & ~unconfirmed
     crisis = (crisis | crisis.shift(1, fill_value=False)
               | crisis.shift(-1, fill_value=False))
+
+    def row_note(day) -> str:
+        if not bool(unconfirmed.loc[day]):
+            return ""
+        return (f" [{int(day_hits.loc[day])} tickers extreme that day while "
+                f"{CRISIS_INDEX} moved {idx_ret.loc[day]:+.1%}: row-level "
+                "corruption?]")
+
     for t in ret.columns:
         r = ret[t]
+        rv = r.dropna()  # neighbours are the adjacent VALID bars
+        px = b.adj_close[t]
         for d in hit_df.index[hit_df[t]]:
             r_adj, r_i = r.at[d], idio.at[d, t]
             raw_r = ret_raw[t].get(d, np.nan) if t in ret_raw.columns else np.nan
@@ -533,9 +693,11 @@ def check_extreme_returns(b: PriceBundle) -> list[Finding]:
                 and abs(raw_r - r_adj) < 0.05)
             if claimed_by_split:
                 continue  # split check adjudicates (missed-split FAIL)
-            pos = ret.index.get_loc(d)
-            r_prev = r.iloc[pos - 1] if pos > 0 else np.nan
-            r_next = r.iloc[pos + 1] if pos + 1 < len(ret.index) else np.nan
+            pos = rv.index.get_loc(d)
+            r_prev = rv.iloc[pos - 1] if pos > 0 else np.nan
+            r_next = rv.iloc[pos + 1] if pos + 1 < len(rv) else np.nan
+            d_prev = rv.index[pos - 1] if pos > 0 else d
+            gap = _gap_note(px, d)
             rt_next = (1.0 + r_adj) * (1.0 + r_next) - 1.0 \
                 if np.isfinite(r_next) else np.nan
             rt_prev = (1.0 + r_prev) * (1.0 + r_adj) - 1.0 \
@@ -546,16 +708,18 @@ def check_extreme_returns(b: PriceBundle) -> list[Finding]:
                 if in_crisis:
                     out.append(Finding(
                         "extreme_returns", "INFO", t,
-                        _fmt_d(ret.index[pos - 1]),
+                        _fmt_d(d_prev),
                         f"{r_prev:+.1%} then {r_adj:+.1%} inside a "
                         f"market-wide extreme window ({int(day_hits.loc[d])} "
                         "tickers): crisis whipsaw, not a bad print"))
                 else:
                     out.append(Finding(
                         "extreme_returns", "FAIL", t,
-                        _fmt_d(ret.index[pos - 1]),
+                        _fmt_d(d_prev),
                         f"return {r_prev:+.1%} fully reversed by the next "
-                        f"day's {r_adj:+.1%}: bad print, not a price"))
+                        f"day's {r_adj:+.1%}: bad print, not a price"
+                        + (_gap_note(px, d_prev) or gap)
+                        + (row_note(d_prev) or row_note(d))))
             elif np.isfinite(rt_next) and abs(rt_next) < 0.25 * abs(r_adj):
                 if in_crisis:
                     out.append(Finding(
@@ -567,16 +731,40 @@ def check_extreme_returns(b: PriceBundle) -> list[Finding]:
                     out.append(Finding(
                         "extreme_returns", "FAIL", t, _fmt_d(d),
                         f"adjusted return {r_adj:+.1%} fully reversed next "
-                        f"day ({r_next:+.1%}): bad print, not a price"))
+                        f"day ({r_next:+.1%}): bad print, not a price"
+                        + (gap or _gap_note(px, rv.index[pos + 1]))
+                        + row_note(d)))
             else:
-                sev = "WARN" if abs(r_i) > EXTREME_IDIO_WARN else "INFO"
+                big = abs(r_i) > EXTREME_IDIO_WARN
                 what = (f"adjusted return {r_adj:+.1%} (idiosyncratic "
-                        f"{r_i:+.1%})" if abs(r_i) > EXTREME_IDIO_WARN else
+                        f"{r_i:+.1%})" if big else
                         f"return {r_adj:+.1%} is >{EXTREME_SIGMA_K}x this "
                         f"instrument's typical daily move")
+                if np.isfinite(r_next):
+                    sev = "WARN" if big else "INFO"
+                    tail = "persisted next day: verify against the tape"
+                else:
+                    # no later print: the reversal tests above could not run
+                    sev = "WARN" if (big or not in_crisis) else "INFO"
+                    where = ("the latest bar" if d == ret.index[-1]
+                             else "this series' final bar")
+                    tail = (f"on {where}: no later print has confirmed or "
+                            "reversed it yet - verify against the tape "
+                            "before trading on it" + row_note(d))
+                hint = ""
+                if (sev == "WARN" and np.isfinite(raw_r) and r_adj > -1.0
+                        and abs(raw_r - r_adj) < 0.05):
+                    near = _match_split_ratio(1.0 / (1.0 + r_adj),
+                                              SPLIT_HINT_TOL)
+                    if near is not None:
+                        resid = (1.0 + r_adj) * near - 1.0
+                        hint = (" (raw close moved with it: an unadjusted "
+                                f"{_ratio_label(near)} split plus a "
+                                f"{resid:+.1%} real move would look the same"
+                                " - check corporate actions)")
                 out.append(Finding(
                     "extreme_returns", sev, t, _fmt_d(d),
-                    f"{what}, persisted next day: verify against the tape"))
+                    f"{what}{gap}, {tail}{hint}", value=float(r_adj)))
     # one finding per (ticker, date): prev-day attribution can duplicate
     seen, dedup = set(), []
     for f in out:
@@ -599,16 +787,26 @@ def check_split_adjustment(b: PriceBundle) -> list[Finding]:
                                          split that never happened (FAIL)
     Only raw moves beyond SPLIT_RAW_JUMP (40%) are examined, so 3:2, 4:3
     and 5:4 splits are left to check_adjustment_factor (see
-    _SPLIT_CANDIDATES).
+    _SPLIT_CANDIDATES) - which sees them only when the two files disagree.
+
+    The co-move FAIL needs the raw move within SPLIT_RATIO_TOL of a
+    candidate ratio. A split missed by BOTH series on a day whose own return
+    pushes the jump outside that band is not provable from prices (a real
+    -52% print looks the same): check_extreme_returns reports it as a WARN
+    that names the nearest ratio. Read the WARN list, not just the exit code.
+
+    Returns are measured from each series' previous valid bar, so a split
+    right after a missing bar is still classified.
     """
     out = []
     common = b.close.columns.intersection(b.adj_close.columns)
-    r_raw = b.close[common].pct_change(fill_method=None)
-    r_adj = b.adj_close[common].pct_change(fill_method=None)
+    r_raw = _bridged_returns(b.close[common])
+    r_adj = _bridged_returns(b.adj_close[common])
     for t in common:
         raw_jump = r_raw.index[
             r_raw[t].notna() & (r_raw[t].abs() > SPLIT_RAW_JUMP)]
         for d in raw_jump:
+            gap = _gap_note(b.close[t], d)
             factor = 1.0 + r_raw.at[d, t]
             ratio = _match_split_ratio(1.0 / factor) if np.isfinite(factor) and factor > 0 else None
             adj_r = r_adj.at[d, t]
@@ -628,23 +826,24 @@ def check_split_adjustment(b: PriceBundle) -> list[Finding]:
                         "split_adjustment", "FAIL", t, _fmt_d(d),
                         f"raw close jumped {r_raw.at[d, t]:+.1%} "
                         f"({ratio:g}:1-shaped) while adjusted stayed quiet: "
-                        "close.csv missed a split adj_close applied"))
+                        "close.csv missed a split adj_close applied" + gap))
                 else:
                     out.append(Finding(
                         "split_adjustment", "INFO", t, _fmt_d(d),
                         f"{ratio:g}:1 split correctly adjusted "
-                        f"(raw {r_raw.at[d, t]:+.1%}, adj {adj_r:+.1%})"))
+                        f"(raw {r_raw.at[d, t]:+.1%}, adj {adj_r:+.1%})"
+                        + gap))
             elif abs(adj_r - r_raw.at[d, t]) < 0.05:
                 out.append(Finding(
                     "split_adjustment", "FAIL", t, _fmt_d(d),
                     f"{ratio:g}:1 split NOT adjusted: raw "
                     f"{r_raw.at[d, t]:+.1%} and adjusted {adj_r:+.1%} "
-                    "moved together"))
+                    "moved together" + gap))
             else:
                 out.append(Finding(
                     "split_adjustment", "WARN", t, _fmt_d(d),
                     f"raw {r_raw.at[d, t]:+.1%} vs adjusted {adj_r:+.1%}: "
-                    "partial/unclear adjustment"))
+                    "partial/unclear adjustment" + gap))
         phantom = r_adj.index[
             r_adj[t].notna() & (r_adj[t].abs() > SPLIT_RAW_JUMP)
             & (r_raw[t].abs() < SPLIT_ADJ_QUIET)]
@@ -652,7 +851,8 @@ def check_split_adjustment(b: PriceBundle) -> list[Finding]:
             out.append(Finding(
                 "split_adjustment", "FAIL", t, _fmt_d(d),
                 f"adjusted close jumped {r_adj.at[d, t]:+.1%} while raw "
-                f"moved {r_raw.at[d, t]:+.1%}: phantom adjustment"))
+                f"moved {r_raw.at[d, t]:+.1%}: phantom adjustment"
+                + _gap_note(b.adj_close[t], d)))
     return out
 
 
@@ -702,7 +902,7 @@ def check_adjustment_factor(b: PriceBundle) -> list[Finding]:
                         f"factor jump implies a {dy:.1%} one-day payout"
                         + (" (split-shaped, but close.csv is split-adjusted"
                            " at source - files disagree about a split)"
-                           if split_like else "")))
+                           if split_like else ""), value=float(dy)))
                 else:
                     dy_by_date[d] = dy
             else:
@@ -737,7 +937,7 @@ def check_adjustment_factor(b: PriceBundle) -> list[Finding]:
                     "adjustment_factor", "WARN", t, _fmt_d(d),
                     f"implied dividend yield {ttm.loc[d]:.1%} over the "
                     "trailing year: individually-plausible payouts summing "
-                    "to an implausible stream"))
+                    "to an implausible stream", value=float(ttm.loc[d])))
     return out
 
 
@@ -786,12 +986,18 @@ def check_dividend_presence(b: PriceBundle,
 
 
 def check_volume_scale(b: PriceBundle) -> list[Finding]:
-    """A step change in volume MAGNITUDE (share count vs thousands, or a
-    split whose volume was never re-based) wrecks liquidity filters and
-    cost models while every price check stays green. Compares the 20-day
-    median volume across each date; only breaks that persist (both
-    medians well-formed) are flagged, and consecutive flag-days collapse
-    into one finding."""
+    """A step change in volume MAGNITUDE (shares vs thousands or lots)
+    wrecks liquidity filters and cost models while every price check stays
+    green. Compares the 20-day median volume across each date; only breaks
+    that persist (both medians well-formed) are flagged, and consecutive
+    flag-days collapse into one finding.
+
+    Scope: unit errors of roughly VOLUME_STEP_WARN (30x) and above. A split
+    whose volume was never re-based is NOT covered: real splits are 2:1 to
+    20:1, and steps that size cannot be told apart from genuine liquidity
+    ramps (thin early ETF histories step 8x and more); with close and
+    volume both split-adjusted at source there are no split dates to test
+    against either."""
     out = []
     for t in b.volume.columns:
         v = _life(b.volume[t]).replace(0.0, np.nan)
@@ -810,7 +1016,8 @@ def check_volume_scale(b: PriceBundle) -> list[Finding]:
                 "volume_scale", sev, t,
                 f"{_fmt_d(r['start'])}..{_fmt_d(r['end'])}",
                 f"20d median volume stepped ~x{worst:.0f} across this "
-                "window: unit/scale break, not a liquidity regime"))
+                "window: unit/scale break, not a liquidity regime",
+                value=worst))
     return out
 
 
@@ -903,12 +1110,20 @@ def check_delisting(b: PriceBundle) -> list[Finding]:
     """A ticker whose data stops before the end of the file has either
     delisted (backtests must know: its 'flat forever' tail is survivorship
     poison if treated as tradeable) or silently fell out of the feed. Late
-    inceptions are expected (ABBV 2013, META 2012) and only counted."""
+    inceptions are expected (ABBV 2013, META 2012) and only counted.
+
+    The live edge: a ticker with no adjusted close on the latest 1 to
+    DELIST_GRACE_DAYS rows is not delisted yet, but its newest bars are
+    missing - check_missing_prices only looks inside the listed life, so
+    this is the check that must say so (WARN). When LIVE_EDGE_FAIL_FRAC of
+    the live tickers (and more than one) lack the final row, the row is a
+    partial bar and FAILs: signals would rank a broken cross-section."""
     out = []
     idx = b.adj_close.index
     if len(idx) == 0:
         return out
     last_day = idx[-1]
+    live, lagging = 0, []
     for t in b.adj_close.columns:
         s = b.adj_close[t]
         first, last = s.first_valid_index(), s.last_valid_index()
@@ -921,11 +1136,27 @@ def check_delisting(b: PriceBundle) -> list[Finding]:
                     "delisting", "FAIL", t, _fmt_d(last),
                     f"data stops {lag} trading days before file end "
                     f"({_fmt_d(last_day)}): delisted or feed broke"))
+            else:
+                live += 1
+                if lag > 0:
+                    lagging.append(t)
+                    out.append(Finding(
+                        "delisting", "WARN", t, _fmt_d(last),
+                        f"no price on the latest {lag} row(s) (file ends "
+                        f"{_fmt_d(last_day)}): late print, halt or partial "
+                        "download - this ticker's signals are stale on the "
+                        "decision bar", value=float(lag)))
         if first != idx[0]:
             out.append(Finding(
                 "delisting", "INFO", t, _fmt_d(first),
                 f"first data {len(idx[idx < first])} days after file start "
                 "(later inception/IPO)"))
+    if len(lagging) > 1 and len(lagging) >= LIVE_EDGE_FAIL_FRAC * live:
+        out.append(Finding(
+            "delisting", "FAIL", "", _fmt_d(last_day),
+            f"final row has no price for {len(lagging)} of {live} live "
+            f"tickers (e.g. {', '.join(lagging[:5])}): partial or "
+            "in-progress bar"))
     return out
 
 
@@ -973,15 +1204,28 @@ def check_symbol_mapping(b: PriceBundle,
 
 def check_indices(b: PriceBundle) -> list[Finding]:
     """Sanity ranges and staleness for the auxiliary index series - a
-    frozen VIX silently disables every vol-regime gate in the program."""
+    frozen VIX silently disables every vol-regime gate in the program, and
+    a frozen or mis-scaled ^IRX feeds straight into the cash credit and the
+    risk-free rate. Series named in b.required_indices must exist."""
     out = []
     if b.indices is None:
+        if b.required_indices:
+            out.append(Finding(
+                "indices", "FAIL", "", "",
+                "indices.csv missing: required series "
+                f"{', '.join(b.required_indices)} unavailable (no cash "
+                "rate: idle cash would be credited 0%)"))
         return out
+    for t in b.required_indices:
+        if t not in b.indices.columns:
+            out.append(Finding("indices", "FAIL", t, "",
+                               "required series missing from indices.csv"))
     ranges = {"^VIX": (5, 150), "^VIX3M": (5, 150), "^IRX": (-2, 25),
               "^GSPC": (500, 50_000), "^TNX": (-1, 20)}
-    # rates legitimately pin for weeks under ZIRP (^IRX at 0.00, 2011-15);
-    # only diffusive series get the staleness treatment
-    stale_applies = {"^VIX", "^VIX3M", "^GSPC"}
+    # ^IRX legitimately pins for weeks under ZIRP (0.005% for 19 sessions in
+    # Dec 2011), so it gets level-aware run limits instead of STALE_RUN_WARN;
+    # the 10-year yield never repeats for long and takes the plain test
+    stale_applies = {"^VIX", "^VIX3M", "^GSPC", "^TNX"}
     for t in b.indices.columns:
         s = _life(b.indices[t])
         if len(s) == 0:
@@ -1001,11 +1245,43 @@ def check_indices(b: PriceBundle) -> list[Finding]:
                     "indices", "WARN", t,
                     f"{_fmt_d(r['start'])}..{_fmt_d(r['end'])}",
                     f"value pinned at {r['value']:.4g} for "
-                    f"{int(r['length'])} days"))
-        lag = len(b.adj_close.index[b.adj_close.index > s.index[-1]])
-        if lag > DELIST_GRACE_DAYS:
+                    f"{int(r['length'])} days", value=float(r["length"])))
+        if t == "^IRX":
+            runs = _runs_of_equal(s)
+            limit = np.where(runs["value"] > RATE_ZIRP_LEVEL,
+                             RATE_STALE_RUN_WARN, RATE_ZIRP_STALE_RUN_WARN)
+            for _, r in runs[runs["length"] >= limit].iterrows():
+                out.append(Finding(
+                    "indices", "WARN", t,
+                    f"{_fmt_d(r['start'])}..{_fmt_d(r['end'])}",
+                    f"value pinned at {r['value']:.4g} for "
+                    f"{int(r['length'])} days (frozen feed? the cash credit "
+                    "and risk-free rate read this series)",
+                    value=float(r["length"])))
+        if t in BOND_ONLY_SERIES:
+            # a yield does not move several points between prints; a switch
+            # between percent and decimal units does exactly that. (A switch
+            # while the level is under RATE_JUMP_WARN_PP stays invisible.)
+            step = s.dropna().diff()
+            big = step[step.abs() > RATE_JUMP_WARN_PP]
+            for d in big.index[:5]:
+                sev = "FAIL" if abs(big.at[d]) > RATE_JUMP_FAIL_PP else "WARN"
+                out.append(Finding(
+                    "indices", sev, t, _fmt_d(d),
+                    f"yield moved {big.at[d]:+.3g} pp in one print to "
+                    f"{s.at[d]:.4g}: unit change or bad print?",
+                    value=float(big.at[d])))
+        # the newest prints matter most: a series that stops even one row
+        # before the price cache is forward-filled on the decision bar
+        after = b.adj_close.index[b.adj_close.index > s.index[-1]]
+        if t in BOND_ONLY_SERIES and len(after):
+            after = after.difference(
+                _BondOnlyHolidays().holidays(after[0], after[-1]))
+        lag = len(after)
+        if lag > 0:
             out.append(Finding("indices", "WARN", t, _fmt_d(s.index[-1]),
-                               f"series ends {lag} days before price cache"))
+                               f"series ends {lag} days before price cache",
+                               value=float(lag)))
         # holes inside the series' life on days the NYSE traded (a missing
         # ^IRX/^VIX3M print is silently forward-filled downstream)
         expected = nyse_bdays(s.index[0], s.index[-1]).intersection(b.adj_close.index)
@@ -1039,6 +1315,7 @@ NONNEG_METRICS = {"revenue", "total_assets", "shares_out", "total_equity_abs",
 UNIT_BREAK_RATIO = 100.0    # 100x between periods => thousands vs millions
 UNIT_WARN_RATIO = 10.0
 REPORT_LAG_WARN_D = 180
+REPORT_LAG_MIN_D = 7        # nothing is published within a week of period end
 PERIOD_GAP_FACTOR = 1.6     # gap > 1.6x the ticker's median period spacing
 
 
@@ -1054,10 +1331,13 @@ def check_fundamentals(fund: pd.DataFrame,
                     may use a row only after report_date.
       <metrics...>  numeric columns (revenue, eps, total_assets, ...)
 
-    Checks: duplicate (ticker, period_end); report_date before period_end
-    (impossible - guarantees look-ahead); missing report_date; implausible
-    filing lag; skipped fiscal quarters; unit breaks (a 100x jump between
-    consecutive periods is a thousands-vs-millions switch, not growth);
+    Checks: missing period_end; duplicate (ticker, period_end); report_date
+    on or before period_end (impossible - guarantees look-ahead; a vendor
+    that defaults report_date to the period end is the commonest case);
+    missing report_date; implausible filing lag (under REPORT_LAG_MIN_D or
+    over REPORT_LAG_WARN_D days); skipped fiscal quarters; unit breaks (a
+    100x jump from the last REPORTED period - missing values are bridged -
+    is a thousands-vs-millions switch, not growth);
     negative values in nonneg metrics; identical metric vectors repeated
     across periods (vendor copy-forward); periods ending after the snapshot
     date (rows from the future)."""
@@ -1071,6 +1351,15 @@ def check_fundamentals(fund: pd.DataFrame,
                    if c not in ("ticker", "period_end", "report_date")
                    and pd.api.types.is_numeric_dtype(fund[c])]
 
+    # a row with no period_end cannot be placed in time: report it, then
+    # keep it out of the per-period checks (NaT sorts last and would be
+    # compared against the real latest period)
+    no_pe = fund["period_end"].isna()
+    for t, grp in fund[no_pe].groupby("ticker"):
+        out.append(Finding("fund_gaps", "WARN", t, "",
+                           f"{len(grp)} row(s) missing period_end"))
+    fund = fund[~no_pe]
+
     dup = fund.duplicated(["ticker", "period_end"], keep=False)
     for (t, p), _ in fund[dup].groupby(["ticker", "period_end"]):
         out.append(Finding("fund_duplicates", "FAIL", t, _fmt_d(p),
@@ -1081,22 +1370,31 @@ def check_fundamentals(fund: pd.DataFrame,
                            "no report_date column: backtests cannot know "
                            "when numbers became public"))
     else:
-        bad = fund[fund["report_date"] < fund["period_end"]]
-        for _, r in bad.iterrows():
+        # whole days: a same-day timestamp (16:00 on the period-end date)
+        # is as impossible as an earlier one
+        lag = (fund["report_date"] - fund["period_end"]).dt.days
+        for (_, r), n_days in zip(fund[lag <= 0].iterrows(), lag[lag <= 0]):
+            how = "precedes" if n_days < 0 else "equals"
             out.append(Finding(
                 "fund_lookahead", "FAIL", r["ticker"], _fmt_d(r["period_end"]),
-                f"report_date {_fmt_d(r['report_date'])} precedes period end: "
+                f"report_date {_fmt_d(r['report_date'])} {how} period end: "
                 "look-ahead guaranteed"))
         nan_rep = fund[fund["report_date"].isna()]
         for t, grp in nan_rep.groupby("ticker"):
             out.append(Finding("fund_lookahead", "WARN", t, "",
                                f"{len(grp)} rows missing report_date"))
-        lag = (fund["report_date"] - fund["period_end"]).dt.days
         late = fund[lag > REPORT_LAG_WARN_D]
         for _, r in late.iterrows():
             out.append(Finding(
                 "fund_lookahead", "WARN", r["ticker"], _fmt_d(r["period_end"]),
                 f"{(r['report_date'] - r['period_end']).days}d filing lag"))
+        early = fund[(lag > 0) & (lag < REPORT_LAG_MIN_D)]
+        for _, r in early.iterrows():
+            out.append(Finding(
+                "fund_lookahead", "WARN", r["ticker"], _fmt_d(r["period_end"]),
+                f"{(r['report_date'] - r['period_end']).days}d filing lag "
+                f"(under {REPORT_LAG_MIN_D}d): report_date is probably not "
+                "the publication date"))
 
     if snapshot_date is not None:
         snap = pd.Timestamp(snapshot_date)
@@ -1136,7 +1434,7 @@ def check_fundamentals(fund: pd.DataFrame,
                 # signed per-share flows (eps, net income) legitimately
                 # swing 10-100x across a zero crossing
                 continue
-            prev = v.shift()
+            prev = v.ffill().shift()  # the last REPORTED value
             with np.errstate(divide="ignore", invalid="ignore"):
                 ratio = (v.abs() / prev.abs()).replace([np.inf], np.nan)
             for i in ratio.index[(ratio > UNIT_BREAK_RATIO)
@@ -1179,6 +1477,26 @@ def check_fundamentals(fund: pd.DataFrame,
 
 
 # -------------------------------------------------------------- known events
+def _known_event_changed(value, expect: str) -> str:
+    """'' while a finding's measured value still matches the adjudicated
+    `expect` (or no value was pinned); otherwise the reason it does not.
+    Anything unreadable fails closed: no downgrade."""
+    if expect == "":
+        return ""
+    try:
+        want = float(expect)
+    except ValueError:
+        want = np.nan
+    if not np.isfinite(want):
+        return f"unreadable expect {expect!r}"
+    if value is None or not np.isfinite(value):
+        return f"adjudicated {want:g}, but this finding measures no value"
+    if abs(value - want) > max(KNOWN_EVENT_ABS_TOL,
+                               KNOWN_EVENT_REL_TOL * abs(want)):
+        return f"adjudicated {want:g}, now {value:.4g}"
+    return ""
+
+
 def apply_known_events(report: DQReport,
                        known: pd.DataFrame) -> tuple[int, list[tuple]]:
     """Downgrade findings a human has already adjudicated as real market
@@ -1191,25 +1509,47 @@ def apply_known_events(report: DQReport,
     FAILs: a FAIL is a data defect by construction and must be fixed in
     the data, not acknowledged away.
 
+    Optional column `expect`: the value that was adjudicated (Finding.value
+    - the return, yield, run length or ratio the check measured; it is in
+    the JSON report). A row with `expect` acknowledges the finding only
+    while its value stays within max(KNOWN_EVENT_ABS_TOL,
+    KNOWN_EVENT_REL_TOL x |expect|) of it; otherwise the finding stays WARN
+    and says the acknowledged event CHANGED - a revised bar or a re-scaled
+    series on an acknowledged date is a new anomaly, not the old one. A
+    blank `expect` (or no such column) matches on the key alone.
+
     Keys are normalized to strings (read_csv turns empty cells into NaN
-    and bare years into ints; either would silently dead-letter the row).
+    and bare years into ints - or into floats such as 2001.0 when the same
+    column also has an empty cell; any of these would dead-letter the row).
     Returns (n_downgraded, unmatched_rows) - surface unmatched rows to the
     operator: a dead acknowledgment means the finding key drifted and the
     allowlist is silently not protecting what they think it protects."""
     def norm(x) -> str:
-        return "" if pd.isna(x) else str(x).strip()
+        if pd.isna(x):
+            return ""
+        if isinstance(x, (float, np.floating)) and float(x).is_integer():
+            x = int(x)  # 2001.0 -> "2001", the finding's year key
+        return str(x).strip()
 
-    notes = {(norm(c), norm(t), norm(d)): norm(n)
-             for c, t, d, n in zip(known["check"], known["ticker"],
-                                   known["date"], known["note"])}
+    expects = (known["expect"] if "expect" in known.columns
+               else [""] * len(known))
+    notes = {(norm(c), norm(t), norm(d)): (norm(n), norm(e))
+             for c, t, d, n, e in zip(known["check"], known["ticker"],
+                                      known["date"], known["note"], expects)}
     n, matched = 0, set()
     for f in report.findings:
         k = (f.check, f.ticker, f.date)
         if k in notes:
-            matched.add(k)
+            matched.add(k)  # a changed event is not a dead acknowledgment
             if f.severity == "WARN":
+                note, expect = notes[k]
+                changed = _known_event_changed(f.value, expect)
+                if changed:
+                    f.detail += (f" [acknowledged event CHANGED: {changed} - "
+                                 f"re-verify before trusting: {note}]")
+                    continue
                 f.severity = "INFO"
-                f.detail += f" [acknowledged: {notes[k]}]"
+                f.detail += f" [acknowledged: {note}]"
                 n += 1
     unmatched = [k for k in notes if k not in matched]
     return n, unmatched
@@ -1223,6 +1563,7 @@ PRICE_CHECKS: list[Callable[[PriceBundle], list[Finding]]] = [
     check_numeric_values,
     check_missing_prices,
     check_duplicate_rows,
+    check_carried_rows,
     check_stale_prices,
     check_zero_volume,
     check_volume_scale,
@@ -1240,8 +1581,9 @@ PRICE_CHECKS: list[Callable[[PriceBundle], list[Finding]]] = [
 def _sanitized(b: PriceBundle) -> PriceBundle:
     """Best-effort view for content checks when the index itself is broken:
     duplicate dates dropped (keep first), index sorted. The structural
-    damage is still reported from the RAW bundle by the calendar checks -
-    this only keeps one bad row from crashing every other check."""
+    damage is still reported from the RAW bundle by the calendar checks
+    (the index file included) - this only keeps one bad row from crashing
+    every other check."""
     def fix(df):
         if df is None:
             return None
@@ -1250,7 +1592,8 @@ def _sanitized(b: PriceBundle) -> PriceBundle:
         return df
     return PriceBundle(**{f: fix(getattr(b, f)) for f in PriceBundle.FIELDS},
                        indices=fix(b.indices),
-                       raw_split_adjusted=b.raw_split_adjusted)
+                       raw_split_adjusted=b.raw_split_adjusted,
+                       required_indices=b.required_indices)
 
 
 def run_all(bundle: PriceBundle,

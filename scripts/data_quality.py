@@ -33,8 +33,9 @@ def main() -> None:
                     help="max WARN lines printed in total (FAILs always print)")
     ap.add_argument("--known", type=Path,
                     default=ROOT / "data" / "dq_known_events.csv",
-                    help="adjudicated real-event allowlist (WARN -> INFO); "
-                         "optional, skipped when the file is absent")
+                    help="adjudicated real-event allowlist (WARN -> INFO; an "
+                         "optional `expect` column pins the adjudicated "
+                         "value); optional, skipped when the file is absent")
     ap.add_argument("--strict", action="store_true",
                     help="ignore the known-events allowlist")
     args = ap.parse_args()

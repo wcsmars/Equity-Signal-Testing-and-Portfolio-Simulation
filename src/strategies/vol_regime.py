@@ -5,14 +5,23 @@ publication timing, assigns QQQ weight 1 below 0.95, 0.5 between 0.95 and
 1.05, and 0 above 1.05; IEF receives the remainder. Costs assume 2 bps
 per-side slippage. The engine credits returns after the decision close.
 
-Default execution prints metrics. --sweep also includes older VIX-spike
-experiments using same-day index closes without the extra publication lag;
-those rows do not satisfy the same equity-close information constraint and
-must not be treated as an executable comparison. Results are exploratory.
+Default execution prints metrics. --sweep adds eight further term-structure
+variants and three VIX-spike variants (long SPY for five sessions after VIX
+closes above k times its 20-day mean) and saves the table to
+results/vol_regime_variants.csv; a saved table that differs is kept and the
+new one goes to results/recomputed/ unless --rebase is passed. The spike
+rows use the same one-session index lag as the term-structure rows.
+
+A session without a VIX or VIX3M print invalidates the averages containing
+it; the last decided weights are held over those sessions with a warning,
+and more than MAX_MISSING_PRINTS consecutive missing prints raise an error.
+Results are exploratory.
 """
 
+import argparse
 import json
 import sys
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -23,6 +32,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from qcore.backtest import metrics, run_backtest
 from qcore.costs import IBKRHKCostModel
 from qcore.data import load_indices, load_prices
+from qcore.records import save_csv
 
 # --- retained example parameters ---
 RISK_ASSET = "QQQ"
@@ -51,6 +61,11 @@ SPIKE_KS = (1.25, 1.3, 1.4)  # trigger: VIX close > k * its 20d rolling mean
 SPIKE_MA_DAYS = 20
 SPIKE_HOLD_DAYS = 5
 
+# A session without a VIX/VIX3M print has no ratio, which invalidates every
+# SMOOTH_DAYS average containing it; the last decided weights are held over
+# those sessions. More consecutive missing prints than this is refused.
+MAX_MISSING_PRINTS = 5
+
 
 def build_weights(prices: pd.DataFrame, indices: pd.DataFrame) -> pd.DataFrame:
     ratio = (indices["^VIX"] / indices["^VIX3M"]).reindex(prices.index)
@@ -65,13 +80,34 @@ def build_weights(prices: pd.DataFrame, indices: pd.DataFrame) -> pd.DataFrame:
     weights = pd.DataFrame(
         {RISK_ASSET: w_risk, DEFENSIVE_ASSET: 1.0 - w_risk}
     )
-    # align signal dates to the price calendar without lookahead
+    # The signal dates are already on the price calendar. This fill only
+    # covers sessions whose average is invalid because an index print inside
+    # the window is missing: the last decided weights are held (past
+    # information only, no lookahead). The hold is reported, and a run of
+    # missing prints longer than MAX_MISSING_PRINTS (a holed or stale index
+    # file) is refused instead of passing off an old regime as current.
     weights = (
         weights.reindex(prices.index.union(weights.index))
         .ffill()
         .reindex(prices.index)
         .dropna()
     )
+    held = ~weights.index.isin(smoothed.index)
+    if held.any():
+        missing = ratio.loc[ratio.first_valid_index():].isna()
+        longest = int(missing.groupby((~missing).cumsum()).sum().max())
+        latest = weights.index[held][-1].date()
+        if longest > MAX_MISSING_PRINTS:
+            raise ValueError(
+                f"VIX/VIX3M ratio missing for {longest} consecutive sessions "
+                f"(limit {MAX_MISSING_PRINTS}; signal last unavailable on {latest}): "
+                "refresh or repair the index data"
+            )
+        warnings.warn(
+            f"VIX/VIX3M signal unavailable on {int(held.sum())} session(s), latest "
+            f"{latest}: the previous regime is held",
+            stacklevel=2,
+        )
     return weights
 
 
@@ -174,12 +210,20 @@ def main() -> dict:
     return metrics(result)
 
 
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--sweep", action="store_true",
+                        help="run all 12 variants and save results/vol_regime_variants.csv")
+    parser.add_argument("--rebase", action="store_true",
+                        help="with --sweep: replace the saved variants file when this run differs from it")
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    if "--sweep" in sys.argv:
+    args = _parse_args()
+    if args.sweep:
         df = sweep()
-        out = ROOT / "results" / "vol_regime_variants.csv"
-        out.parent.mkdir(exist_ok=True)
-        df.to_csv(out, index=False)
-        print(f"\nsaved {out}")
+        print()
+        save_csv(ROOT / "results" / "vol_regime_variants.csv", df, index=False)
     else:
         print(json.dumps(main(), indent=2))

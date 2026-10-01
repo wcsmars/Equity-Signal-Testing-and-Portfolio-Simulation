@@ -3,10 +3,13 @@ and the detector itself must catch a planted leak.
 
 Uses the ``market`` fixture (12x756 with a 4:1 split and universe churn) so
 truncation invariance is tested on a panel with NaN lifecycles, not just a
-clean rectangle. Dates are sampled (~8 per check) to keep runtime sane.
+clean rectangle. Dates are sampled (~8 across the sample plus the warm-up
+rows per check) to keep runtime sane.
 """
 
 import copy
+import re
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -14,7 +17,8 @@ import pytest
 
 from alpha_lab.backtest.costs import RealisticCost
 from alpha_lab.core.errors import DataError, LookaheadError
-from alpha_lab.core.interfaces import CostModel, PortfolioConstructor, Signal
+from alpha_lab.core.interfaces import CostModel, Feature, PortfolioConstructor, Signal
+from alpha_lab.core.types import MarketData
 from alpha_lab.features import FEATURES
 from alpha_lab.portfolio import QuantileLongShort
 from alpha_lab.signals import CrossSectionalMomentum, ShortTermReversal
@@ -25,6 +29,8 @@ from alpha_lab.testing.checks import (
     assert_feature_pit,
     assert_signal_pit,
     assert_truncation_invariant,
+    _resolve_dates,
+    _resolve_trade_dates,
 )
 
 #: one non-default parameterization per registered feature. The coverage
@@ -193,16 +199,25 @@ def test_full_sample_statistic_is_caught(market_simple):
         close = data.close
         return (close - close.mean()) / close.std()
 
+    # A mid-sample date: on the first date the one-row slice has no standard
+    # deviation at all, which the NaN-pattern branch reports instead.
     with pytest.raises(LookaheadError, match="deviation"):
+        assert_truncation_invariant(
+            full_sample_zscore, market_simple, dates=[market_simple.dates[200]]
+        )
+    # the default sample catches it too
+    with pytest.raises(LookaheadError):
         assert_truncation_invariant(full_sample_zscore, market_simple)
 
 
 def test_planted_leak_message_names_the_date(market_simple):
+    t = market_simple.dates[200]
     with pytest.raises(LookaheadError) as excinfo:
-        assert_feature_pit(PlantedLeakFeature(), market_simple)
-    # the message must carry an actionable date (ISO yyyy-mm-dd)
-    assert any(ch.isdigit() for ch in str(excinfo.value))
-    assert "-" in str(excinfo.value)
+        assert_feature_pit(PlantedLeakFeature(), market_simple, dates=[t])
+    # the message must carry the offending date as ISO yyyy-mm-dd (ticker
+    # names and "clause 1" contain digits and hyphens too, so match the shape)
+    found = re.findall(r"\d{4}-\d{2}-\d{2}", str(excinfo.value))
+    assert found and set(found) == {t.date().isoformat()}
 
 
 def test_unknown_truncation_date_is_a_data_error(market_simple):
@@ -292,3 +307,189 @@ def test_infinite_value_change_is_caught(market_simple):
 
     with pytest.raises(LookaheadError, match="infinite"):
         assert_truncation_invariant(inf_if_future, market_simple, dates=[market_simple.dates[-2]])
+
+
+# -- the default sample must reach the rows where a leak can hide -------------
+
+
+def test_default_sample_covers_the_warm_up_and_skips_the_final_date(market_simple):
+    dates = market_simple.dates
+    n = len(dates)
+    pos = [dates.get_loc(t) for t in _resolve_dates(market_simple, None)]
+    assert pos == sorted(set(pos))
+    # warm-up rows: the first two dates and the middle of the first sixth
+    assert {0, 1, (n // 6) // 2} <= set(pos)
+    # slicing at the final date returns the whole panel: that comparison
+    # could never fail, so the sample ends one row earlier
+    assert n - 1 not in pos and n - 2 in pos
+    assert len([p for p in pos if p >= n // 6]) == 8
+
+    # with the full-panel output, the first row holding a value is added
+    full = market_simple.close.rolling(30).mean()
+    with_full = [dates.get_loc(t) for t in _resolve_dates(market_simple, None, full)]
+    assert set(with_full) == set(pos) | {29}
+    # an all-missing output adds nothing and does not fail
+    empty = pd.DataFrame(np.nan, index=dates, columns=market_simple.tickers)
+    assert list(_resolve_dates(market_simple, None, empty)) == list(_resolve_dates(market_simple, None))
+
+
+class _BackfilledMomentum(Feature):
+    """21-day momentum whose warm-up is filled from LATER rows."""
+
+    name = "backfilled_momentum"
+    lookback = 21
+
+    def __init__(self, fill):
+        self.fill = fill
+
+    def compute(self, data):
+        mom = data.close / data.close.shift(21) - 1.0
+        if self.fill == "bfill":
+            return mom.bfill()
+        if self.fill == "bfill_limit":
+            return mom.bfill(limit=3)  # only rows 18-20 are filled
+        if self.fill == "interpolate":
+            return mom.interpolate(limit_direction="both")
+        return mom.fillna(mom.iloc[21:42].mean())  # a later statistic
+
+
+@pytest.mark.parametrize("fill", ["bfill", "bfill_limit", "interpolate", "later_mean"])
+def test_backfilled_warm_up_is_caught_by_the_default_sample(fill, market_simple):
+    # Every row from ~1/6 of the index onwards is clean: the future values
+    # sit only in the warm-up, which the default sample used to skip.
+    feature = _BackfilledMomentum(fill)
+    clean_from = market_simple.dates[len(market_simple.dates) // 6:]
+    assert_feature_pit(feature, market_simple, dates=clean_from[::40])
+    with pytest.raises(LookaheadError, match="backfilled_momentum"):
+        assert_feature_pit(feature, market_simple)
+
+
+class _BackfilledSignal(Signal):
+    """Scores the warm-up with the first available later score."""
+
+    name = "backfilled_signal"
+
+    def score(self, features, data):
+        return (data.close / data.close.shift(21) - 1.0).bfill()
+
+
+def test_signal_pit_catches_backfilled_warm_up(market_simple):
+    clean_from = market_simple.dates[len(market_simple.dates) // 6:]
+    assert_signal_pit(_BackfilledSignal(), market_simple, dates=clean_from[::40])
+    with pytest.raises(LookaheadError, match="backfilled_signal"):
+        assert_signal_pit(_BackfilledSignal(), market_simple)
+
+
+class _BackfilledConstructor(PortfolioConstructor):
+    """Takes its first positions from scores that do not exist yet."""
+
+    def weights(self, scores, data):
+        centred = scores.sub(scores.mean(axis=1), axis=0)
+        return centred.bfill().fillna(0.0)
+
+
+def test_constructor_pit_catches_backfilled_warm_up(market_simple):
+    # clean panel: scores are missing only in the 21-row warm-up
+    scores = market_simple.close / market_simple.close.shift(21) - 1.0
+    ctor = _BackfilledConstructor()
+    clean_from = market_simple.dates[len(market_simple.dates) // 6:]
+    assert_constructor_pit(ctor, scores, market_simple, dates=clean_from[::40])
+    with pytest.raises(LookaheadError, match="_BackfilledConstructor"):
+        assert_constructor_pit(ctor, scores, market_simple)
+
+
+# -- the cost check must look at dates that carry a trade --------------------
+
+
+class _SameDayVolumeCost(CostModel):
+    """Prices with the trade date's own volume (forbidden by Timing item 4)."""
+
+    def cost(self, trades, data, portfolio_value):
+        relative = data.volume / data.volume.rolling(5).mean()
+        return (trades.abs() * relative).sum(axis=1) * 1e-4
+
+
+def _sparse_trades(data, rows):
+    trades = pd.DataFrame(0.0, index=data.dates, columns=data.tickers)
+    trades.iloc[rows, 0] = 0.05
+    return trades
+
+
+def test_cost_pit_default_sample_is_drawn_from_traded_dates(market_simple):
+    dates = market_simple.dates
+    rows = list(range(5, len(dates), 20))  # a periodic rebalance
+    trades = _sparse_trades(market_simple, rows)
+    # none of the evenly spread truncation dates carries a trade ...
+    assert trades.loc[_resolve_dates(market_simple, None)].abs().to_numpy().sum() == 0.0
+    # ... so the cost check samples the traded dates instead
+    sampled = _resolve_trade_dates(market_simple, trades, None, "cost model")
+    assert len(sampled) == 8
+    assert sampled[0] == dates[rows[0]] and sampled[-1] == dates[rows[-1]]
+    assert (trades.loc[sampled].abs().sum(axis=1) > 0).all()
+    # fewer traded dates than samples: every one of them is checked
+    few = _sparse_trades(market_simple, [40, 90, 300])
+    assert list(_resolve_trade_dates(market_simple, few, None, "cost model")) == list(dates[[40, 90, 300]])
+
+
+def test_cost_pit_catches_same_day_input_with_sparse_trades(market_simple):
+    trades = _sparse_trades(market_simple, list(range(5, len(market_simple.dates), 20)))
+    with pytest.raises(LookaheadError, match="same-day volume"):
+        assert_cost_pit(_SameDayVolumeCost(), trades, market_simple, 1_000_000.0)
+    # the shipped model passes on the same sparse trades
+    assert_cost_pit(RealisticCost(), trades, market_simple, 1_000_000.0)
+
+
+def test_cost_pit_refuses_to_pass_without_a_trade(market_simple):
+    no_trades = pd.DataFrame(0.0, index=market_simple.dates, columns=market_simple.tickers)
+    with pytest.raises(DataError, match="vacuously"):
+        assert_cost_pit(_SameDayVolumeCost(), no_trades, market_simple, 1_000_000.0)
+    nan_trades = no_trades * np.nan  # NaN trade == no trade
+    with pytest.raises(DataError, match="vacuously"):
+        assert_cost_pit(_SameDayVolumeCost(), nan_trades, market_simple, 1_000_000.0)
+    # explicit dates: at least one of them must carry a trade
+    trades = _sparse_trades(market_simple, [25])
+    idle = market_simple.dates[[24, 26, 200]]
+    with pytest.raises(DataError, match="vacuously"):
+        assert_cost_pit(_SameDayVolumeCost(), trades, market_simple, 1_000_000.0, dates=idle)
+    with pytest.raises(LookaheadError, match="same-day volume"):
+        assert_cost_pit(
+            _SameDayVolumeCost(), trades, market_simple, 1_000_000.0,
+            dates=market_simple.dates[[24, 25]],
+        )
+
+
+def test_cost_pit_handles_whole_number_panels(market_simple):
+    # A volume file of whole shares loads as int64; the probe values are not
+    # integers, so the perturbation must not be written into an integer panel.
+    base = market_simple.slice_until(market_simple.dates[119])
+    data = MarketData.from_frames(
+        base.close, volume=base.volume.astype("int64"), unadjusted_close=base.unadjusted_close
+    )
+    assert (data.volume.dtypes == "int64").all()
+    trades = _sparse_trades(data, [30, 60, 90])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        assert_cost_pit(RealisticCost(), trades, data, 1_000_000.0)
+        # and the probe still bites on the integer panel
+        with pytest.raises(LookaheadError, match="same-day volume"):
+            assert_cost_pit(_SameDayVolumeCost(), trades, data, 1_000_000.0)
+    assert (data.volume.dtypes == "int64").all()  # the caller's panel is untouched
+
+
+class _SameDayAvailabilityCost(CostModel):
+    """Charges only names whose close has printed on the trade date."""
+
+    def cost(self, trades, data, portfolio_value):
+        return (trades.abs() * data.close.notna()).sum(axis=1) * 1e-4
+
+
+def test_cost_pit_probes_same_day_missingness(market):
+    # The delisted name has no close on t. A model keyed on whether the close
+    # exists is caught only because the probe also fills missing cells.
+    delisted = market.tickers[-2]
+    t = market.dates[-10]
+    assert np.isnan(market.close.loc[t, delisted])
+    trades = pd.DataFrame(0.0, index=market.dates, columns=market.tickers)
+    trades.loc[t, delisted] = 0.05
+    with pytest.raises(LookaheadError, match="same-day close"):
+        assert_cost_pit(_SameDayAvailabilityCost(), trades, market, 1_000_000.0, dates=[t])

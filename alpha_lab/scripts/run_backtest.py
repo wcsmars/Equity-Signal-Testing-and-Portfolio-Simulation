@@ -6,11 +6,17 @@ Usage:
     python scripts/run_backtest.py --config configs/base.yaml
     python scripts/run_backtest.py --config configs/base.yaml \
         --override costs.model=zero
+    python scripts/run_backtest.py --config configs/base.yaml \
+        --override signal.params.window=126 --n-trials 12
+
+Exit status: 0 on success, 1 on a configuration or data error, 2 when
+market-data validation reports errors and --force was not given.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -46,6 +52,8 @@ _TABLE_KEYS = (
     "calmar",
     "hit_rate",
     "psr",
+    "dsr",
+    "n_trials",
     "turnover_ann",
     "cost_drag_ann",
     "n_days",
@@ -89,6 +97,26 @@ def format_metrics_table(metrics: dict) -> str:
     return "\n".join(f"  {k:<{width}}  {v}" for k, v in rows)
 
 
+def trial_count(text: str) -> float:
+    """--n-trials value: a finite number >= 1, an int when it is whole."""
+    try:
+        value = float(text)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 1.0:
+        raise argparse.ArgumentTypeError(f"expected a number >= 1, got {text!r}")
+    return int(value) if value == int(value) else value
+
+
+def never_traded(result) -> bool:
+    """True when no position is held on any date of the evaluation period
+    (from the first test date on for a walk-forward run)."""
+    holdings = result.holdings
+    if result.meta.get("mode") == "walkforward" and result.windows:
+        holdings = holdings.loc[result.windows[0].test_start:]
+    return not holdings.fillna(0.0).ne(0.0).to_numpy().any()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True, help="path to a YAML run config")
@@ -102,6 +130,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--runs-dir", default=None,
         help="override experiment.runs_dir (relative to the current directory)",
+    )
+    parser.add_argument(
+        "--n-trials",
+        type=trial_count,
+        default=1,
+        metavar="N",
+        help="configurations tried in the search this run belongs to, itself "
+        "included; the deflated Sharpe ratio (dsr) is deflated by it. "
+        "Default 1: no deflation, dsr equals psr",
     )
     parser.add_argument("--no-report", action="store_true", help="skip tearsheet generation")
     parser.add_argument(
@@ -148,8 +185,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     result = engine.run(data, features)
     result.config = cfg.to_dict()
+    # Kept with the result so a forced run stays distinguishable from a clean
+    # one in meta.json and in every report built from it.
+    result.meta["validation"] = {
+        "errors": len(report.errors()),
+        "warnings": len(report.warnings()),
+        "forced": not report.ok,
+    }
+    if never_traded(result):
+        result.meta["never_traded"] = True
+        print(
+            "warning: no position is held on any date of the evaluation period; "
+            "the metrics describe a flat series (check the signal's history "
+            "requirement against the length of the data)",
+            file=sys.stderr,
+        )
 
-    metrics = summary(result)
+    metrics = summary(result, n_trials=args.n_trials)
 
     tracker = ExperimentTracker(cfg.experiment.runs_dir)
     record = tracker.log_run(cfg, result, metrics)

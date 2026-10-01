@@ -6,12 +6,22 @@ weights remain fixed until |z| < 0.5 or a 20-day holding limit. Re-entry
 requires the spread to return inside the entry band. Included pairs are
 screened by standalone pre-2018 net Sharpe and share a 1.5 gross budget.
 
+The fixed quantity is the portfolio weight, not the share count, so the
+engine trades both legs back to target on every holding day. A desk holding
+shares would order only at entry and exit; the reported cost drag is
+therefore on the high side (qcore.backtest.drift_weights is the
+share-holding expansion used by the monthly strategies).
+
 Costs include 3 bps per-side slippage and a fixed annual stock-borrow proxy.
 Borrow availability, variable lending fees and margin calls are not modeled.
 Signals assume same-close execution. This is an exploratory example; run
 the module to calculate metrics on the locally obtained cache and save them
-to results/pairs_statarb.json.
+to results/pairs_statarb.json. A saved file that differs from the new run
+is kept and the new output goes to results/recomputed/ instead; pass
+--rebase to replace the saved file.
 """
+import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -25,6 +35,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from qcore.backtest import MAX_ABS_WEIGHT, metrics, run_backtest
 from qcore.costs import IBKRHKCostModel
 from qcore.data import load_prices
+from qcore.records import save_json
 
 PAIRS = [
     ("GLD", "GDX"), ("XLE", "XOP"), ("EWA", "EWC"), ("SPY", "MDY"),
@@ -35,8 +46,15 @@ ENTRY, EXIT_Z, TIMEOUT = 2.0, 0.5, 20
 GROSS_CAP, BORROW_RATE, SLIPPAGE_BPS = 1.5, 0.01, 3.0
 
 
-def pair_weights(px: pd.DataFrame, a: str, b: str, gross: float = 1.0) -> pd.DataFrame:
-    """Daily target weights for one pair, unit gross while in a trade."""
+def pair_weights(px: pd.DataFrame, a: str, b: str, H: int = H, Z: int = Z,
+                 gross: float = 1.0) -> pd.DataFrame:
+    """Daily target weights for one pair, unit gross while in a trade.
+
+    H and Z are the hedge-ratio and z-score windows; they default to the
+    module's retained example lengths."""
+    for window in (H, Z):
+        if isinstance(window, bool) or not isinstance(window, (int, np.integer)) or window < 2:
+            raise ValueError("H and Z must be integer windows of at least 2 sessions")
     if not np.isfinite(gross) or gross < 0:
         raise ValueError("gross must be finite and nonnegative")
     sub = px[[a, b]]
@@ -84,13 +102,13 @@ def pair_weights(px: pd.DataFrame, a: str, b: str, gross: float = 1.0) -> pd.Dat
     return pd.DataFrame({a: w_a, b: w_b}, index=sub.index).reindex(px.index, fill_value=0.0)
 
 
-def apply_borrow(result: dict, weights: pd.DataFrame) -> dict:
+def apply_borrow(result: dict, weights: pd.DataFrame, rate: float = BORROW_RATE) -> dict:
     """1%/yr borrow on short notional (lagged weights = in force)."""
     # Align before lagging, matching run_backtest's zero-target convention
     # for omitted price-calendar rows.
     aligned = weights.reindex(result["returns"].index).fillna(0.0).clip(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT)
     short = aligned.clip(upper=0).abs().sum(axis=1).shift(1).fillna(0.0)
-    drag = (BORROW_RATE / 252.0) * short.reindex(result["returns"].index).fillna(0.0)
+    drag = (rate / 252.0) * short.reindex(result["returns"].index).fillna(0.0)
     result = dict(result)
     result["returns"] = result["returns"] - drag
     result["equity"] = (1.0 + result["returns"]).cumprod()
@@ -136,11 +154,19 @@ def main():
     print(per_pair.to_string(index=False), file=sys.stderr)
     print(json.dumps(m, indent=2))
 
-    output = ROOT / "results" / "pairs_statarb.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w") as f:
-        json.dump(m, f, indent=2)
+    # A saved file that differs is kept (see qcore.records). The notice
+    # goes to stderr so stdout stays the metrics JSON alone.
+    with contextlib.redirect_stdout(sys.stderr):
+        save_json(ROOT / "results" / "pairs_statarb.json", m)
+
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--rebase", action="store_true",
+                        help="replace results/pairs_statarb.json when this run differs from it")
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
+    _parse_args()
     main()
