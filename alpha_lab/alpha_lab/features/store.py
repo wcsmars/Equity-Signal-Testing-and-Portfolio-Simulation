@@ -7,21 +7,38 @@ parquet (csv fallback when pyarrow is unavailable).
 
 The fingerprint covers every date, ticker and value in every input field.
 Corrections to historical prices, membership or liquidity must invalidate
-both memory and disk entries. The cache is not a code-version provenance
-system: clear it when changing a feature's implementation.
+both memory and disk entries.
+
+A disk entry is also keyed by the implementation that produced it: the
+qualified name of the feature's type and the source text of that type and
+its bases. Editing a feature's implementation, or registering a different
+one under the same name, is therefore a cache miss. Code a feature merely
+calls (module-level helpers, pandas itself) is not tracked — the cache is
+not a full code-version provenance system: clear it after changing such
+code.
+
+Disk entries are written to a temporary file and renamed into place, so an
+interrupted or concurrent run never leaves a half-written panel under the
+final name. A file that cannot be read back is reported with a warning and
+treated as a miss: the panel is recomputed and the file replaced.
 """
 
 from __future__ import annotations
 
 import hashlib
+import inspect
+import os
+import uuid
+import warnings
+from abc import ABC
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import pandas as pd
 
 from alpha_lab.core.errors import DataError
-from alpha_lab.core.interfaces import FeatureSpec
+from alpha_lab.core.interfaces import Feature, FeatureSpec
 from alpha_lab.core.registry import Registry
 from alpha_lab.core.types import MarketData
 from alpha_lab.features.library import FEATURES
@@ -59,6 +76,26 @@ def fingerprint(data: MarketData) -> str:
     return sha.hexdigest()
 
 
+def _code_token(feature: Feature) -> str:
+    """Identity of the code behind ``feature``, for the disk cache key.
+
+    The qualified name of the feature's type plus a hash of the source text
+    of that type and of every base it inherits ``compute`` or parameters
+    from. Source that cannot be retrieved (a type defined interactively)
+    contributes nothing, leaving the qualified name as the only identity.
+    """
+    cls = type(feature)
+    sha = hashlib.sha256()
+    for klass in cls.__mro__:
+        if klass in (Feature, ABC, object):
+            continue
+        try:
+            sha.update(inspect.getsource(klass).encode())
+        except (OSError, TypeError):
+            pass
+    return f"{cls.__module__}.{cls.__qualname__}:{sha.hexdigest()[:16]}"
+
+
 class FeatureStore:
     """Computes feature panels with in-memory memoization and optional disk cache.
 
@@ -86,12 +123,17 @@ class FeatureStore:
         frame = self._memory.get(key)
         if frame is not None:
             return frame
+        # Resolve the feature BEFORE looking at the disk: an unknown name or
+        # bad params must raise even when a panel is cached under that spec,
+        # and the disk key includes the identity of the feature's code.
+        feature = self.registry.create(spec.name, **spec.as_dict)
         if self.cache_dir is not None:
-            frame = self._load_disk(spec, key[1], data)
+            token = _code_token(feature)
+            frame = self._load_disk(spec, token, key[1], data)
         if frame is None:
-            frame = self._compute(spec, data)
+            frame = self._compute(spec, feature, data)
             if self.cache_dir is not None:
-                self._save_disk(spec, key[1], frame)
+                self._save_disk(spec, token, key[1], frame)
         self._memory[key] = frame
         return frame
 
@@ -104,30 +146,47 @@ class FeatureStore:
 
     # -- internals ---------------------------------------------------------
 
-    def _compute(self, spec: FeatureSpec, data: MarketData) -> pd.DataFrame:
-        feature = self.registry.create(spec.name, **spec.as_dict)
+    def _compute(self, spec: FeatureSpec, feature: Feature, data: MarketData) -> pd.DataFrame:
         frame = feature.compute(data)
         if not frame.index.equals(data.close.index) or not frame.columns.equals(data.close.columns):
             raise DataError(f"feature '{spec.key}' output is not aligned to close")
         return frame
 
-    def _path(self, spec: FeatureSpec, data_fp: str, ext: str) -> Path:
+    def _path(self, spec: FeatureSpec, token: str, data_fp: str, ext: str) -> Path:
         # spec keys contain characters unfriendly to filesystems; hash them
-        digest = hashlib.sha256(f"{spec.key}|{data_fp}".encode()).hexdigest()[:20]
+        digest = hashlib.sha256(f"{spec.key}|{token}|{data_fp}".encode()).hexdigest()[:20]
         return self.cache_dir / f"{spec.name}-{digest}.{ext}"
 
-    def _load_disk(self, spec: FeatureSpec, data_fp: str, data: MarketData) -> pd.DataFrame | None:
-        frame = None
-        parquet = self._path(spec, data_fp, "parquet")
-        if parquet.exists():
-            try:
-                frame = pd.read_parquet(parquet)
-            except ImportError:
-                pass  # file written by an env that had pyarrow; try csv
-        csv = self._path(spec, data_fp, "csv")
-        if frame is None and csv.exists():
-            frame = pd.read_csv(csv, index_col=0, parse_dates=True, float_precision="round_trip")
+    def _load_disk(
+        self, spec: FeatureSpec, token: str, data_fp: str, data: MarketData
+    ) -> pd.DataFrame | None:
+        frame = self._read(self._path(spec, token, data_fp, "parquet"), pd.read_parquet)
+        if frame is None:
+            frame = self._read(
+                self._path(spec, token, data_fp, "csv"),
+                lambda path: pd.read_csv(
+                    path, index_col=0, parse_dates=True, float_precision="round_trip"
+                ),
+            )
         return None if frame is None else self._aligned(frame, data)
+
+    @staticmethod
+    def _read(path: Path, reader: Callable[[Path], pd.DataFrame]) -> pd.DataFrame | None:
+        """The panel stored at ``path``, or None if absent or unreadable."""
+        if not path.exists():
+            return None
+        try:
+            return reader(path)
+        except ImportError:
+            return None  # file written by an env that had pyarrow; try csv
+        except Exception as exc:  # truncated, empty or otherwise corrupt
+            warnings.warn(
+                f"feature cache file {path.name} is unreadable "
+                f"({type(exc).__name__}: {exc}); recomputing the panel",
+                UserWarning,
+                stacklevel=4,
+            )
+            return None
 
     @staticmethod
     def _aligned(frame: pd.DataFrame, data: MarketData) -> pd.DataFrame | None:
@@ -146,8 +205,23 @@ class FeatureStore:
             frame = frame.set_axis(close.columns, axis=1)
         return frame
 
-    def _save_disk(self, spec: FeatureSpec, data_fp: str, frame: pd.DataFrame) -> None:
+    def _save_disk(self, spec: FeatureSpec, token: str, data_fp: str, frame: pd.DataFrame) -> None:
         try:
-            frame.to_parquet(self._path(spec, data_fp, "parquet"))
+            self._write(self._path(spec, token, data_fp, "parquet"), frame.to_parquet)
         except ImportError:
-            frame.to_csv(self._path(spec, data_fp, "csv"))
+            self._write(self._path(spec, token, data_fp, "csv"), frame.to_csv)
+
+    @staticmethod
+    def _write(path: Path, writer: Callable[[Path], None]) -> None:
+        """Write to a temporary sibling, then rename it over ``path``.
+
+        The rename is atomic, so a reader sees the old file or the complete
+        new one, never a partial panel; a failed write leaves ``path`` as it
+        was and removes the temporary.
+        """
+        tmp = path.with_name(f".{path.name}.{os.getpid()}-{uuid.uuid4().hex[:8]}.tmp")
+        try:
+            writer(tmp)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)

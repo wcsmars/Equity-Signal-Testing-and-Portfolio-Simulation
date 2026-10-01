@@ -42,20 +42,36 @@ DEFAULT_SAMPLES = 8
 # internals
 # --------------------------------------------------------------------------
 
-def _resolve_dates(data: MarketData, dates: Iterable | None) -> pd.DatetimeIndex:
+def _resolve_dates(
+    data: MarketData, dates: Iterable | None, full: pd.DataFrame | None = None
+) -> pd.DatetimeIndex:
     """Normalize ``dates`` to timestamps present in ``data.dates``.
 
-    When ``dates`` is None, sample ``DEFAULT_SAMPLES`` positions spread from
-    ~1/6 into the index (skipping the mostly-degenerate warm-up range where
-    long-lookback features are all-NaN anyway) through the final date.
+    When ``dates`` is None the default sample has two parts:
+
+    - ``DEFAULT_SAMPLES`` positions spread from ~1/6 into the index through
+      the second-to-last date. The final date is left out: slicing there
+      returns the whole panel, so that comparison could never fail.
+    - The warm-up: the first two dates, the middle of the first sixth and,
+      when the full-panel output ``full`` is supplied, the first date on
+      which it holds any value. Long-lookback outputs are legitimately
+      missing there, which is exactly where a backfill (``bfill``, two-sided
+      interpolation, filling the warm-up with a later statistic) writes
+      future values, so these rows must be compared too.
     """
     idx = data.dates
     if dates is None:
-        if len(idx) < 2:
+        n = len(idx)
+        if n < 2:
             raise DataError("need at least 2 dates to test truncation invariance")
-        lo = len(idx) // 6
-        pos = np.unique(np.linspace(lo, len(idx) - 1, DEFAULT_SAMPLES).round().astype(int))
-        return idx[pos]
+        lo = n // 6
+        pos = list(np.linspace(lo, n - 2, DEFAULT_SAMPLES).round().astype(int))
+        pos += [0, 1, lo // 2]
+        if full is not None:
+            valued = np.flatnonzero(idx.isin(full.index[full.notna().any(axis=1).to_numpy()]))
+            if len(valued):
+                pos.append(int(valued[0]))
+        return idx[np.unique(pos)]
     out = []
     for t in dates:
         ts = pd.Timestamp(t)
@@ -144,6 +160,37 @@ def _compare_scalars(
         )
 
 
+def _resolve_trade_dates(
+    data: MarketData, trades: pd.DataFrame, dates: Iterable | None, label: str
+) -> pd.DatetimeIndex:
+    """Dates for the cost check: at least one of them must carry a trade.
+
+    A date without a trade costs nothing before and after any perturbation,
+    so it cannot expose a model that prices with forbidden data. When
+    ``dates`` is None the sample is therefore drawn from the dates with a
+    non-zero trade (up to ``DEFAULT_SAMPLES`` of them, spread from the first
+    to the last). Explicit ``dates`` are kept as given, but a selection in
+    which no date carries a trade is rejected instead of passing vacuously.
+    """
+    activity = trades.abs().sum(axis=1)  # NaN trade == no trade
+    traded = data.dates[data.dates.isin(activity.index[(activity > 0).to_numpy()])]
+    if dates is None:
+        if not len(traded):
+            raise DataError(
+                f"{label}: the trades panel has no non-zero trade on any data "
+                "date, so the cost check would pass vacuously"
+            )
+        pos = np.unique(np.linspace(0, len(traded) - 1, DEFAULT_SAMPLES).round().astype(int))
+        return traded[pos]
+    resolved = _resolve_dates(data, dates)
+    if not resolved.isin(traded).any():
+        raise DataError(
+            f"{label}: none of the supplied dates carries a non-zero trade, "
+            "so the cost check would pass vacuously"
+        )
+    return resolved
+
+
 def _compute_feature_panels(
     specs: Sequence, data: MarketData, registry: Registry
 ) -> dict[str, pd.DataFrame]:
@@ -169,15 +216,16 @@ def assert_truncation_invariant(
     """Assert ``compute(data.slice_until(t)).loc[t] == compute(data).loc[t]``.
 
     ``compute`` is any callable MarketData -> wide DataFrame. For each
-    sampled t (default: ~``DEFAULT_SAMPLES`` dates across the valid range)
-    the truncated row t must match the full-panel row t exactly — identical
-    NaN pattern, values equal within ``rtol``/``atol``. Raises LookaheadError
-    with the offending date, tickers, and max deviation.
+    sampled t (default: ~``DEFAULT_SAMPLES`` dates across the valid range
+    plus the warm-up rows, see :func:`_resolve_dates`) the truncated row t
+    must match the full-panel row t exactly — identical NaN pattern, values
+    equal within ``rtol``/``atol``. Raises LookaheadError with the offending
+    date, tickers, and max deviation.
     """
     full = compute(data)
     if not isinstance(full, pd.DataFrame):
         raise DataError(f"{label} must return a DataFrame, got {type(full).__name__}")
-    for t in _resolve_dates(data, dates):
+    for t in _resolve_dates(data, dates, full):
         sliced = compute(data.slice_until(t))
         if t not in sliced.index:
             raise LookaheadError(
@@ -224,7 +272,7 @@ def assert_signal_pit(
     full_scores = copy.deepcopy(signal).score(
         _compute_feature_panels(specs, data, registry), data
     )
-    for t in _resolve_dates(data, dates):
+    for t in _resolve_dates(data, dates, full_scores):
         sliced = data.slice_until(t)
         trunc_scores = copy.deepcopy(signal).score(
             _compute_feature_panels(specs, sliced, registry), sliced
@@ -250,7 +298,7 @@ def assert_constructor_pit(
     """
     label = f"constructor '{type(constructor).__name__}'"
     full = constructor.weights(scores, data)
-    for t in _resolve_dates(data, dates):
+    for t in _resolve_dates(data, dates, full):
         if t not in scores.index:
             raise DataError(f"{label}: date {t.date()} not in the scores index")
         trunc = constructor.weights(scores.loc[:t], data.slice_until(t))
@@ -277,13 +325,17 @@ def assert_cost_pit(
     stay unchanged in both checks. The supplied trades at t remain intact:
     they are known when the cost is priced.
 
+    A date without a trade cannot fail, so the default sample is drawn from
+    the dates on which ``trades`` is non-zero, and DataError is raised when
+    no checked date (sampled or supplied) carries a trade.
+
     Perturbations use copied panels and preserve missing optional fields.
     These sampled probes detect specific dependencies; they do not prove
     that an arbitrary custom cost model is free of every possible leak.
     """
     label = f"cost model '{type(cost_model).__name__}'"
     full = cost_model.cost(trades, data, portfolio_value)
-    for t in _resolve_dates(data, dates):
+    for t in _resolve_trade_dates(data, trades, dates, label):
         if t not in trades.index:
             raise DataError(f"{label}: date {t.date()} not in the trades index")
         sliced = data.slice_until(t)
@@ -305,7 +357,11 @@ def assert_cost_pit(
             if field == "universe":
                 changed_panel.loc[t] = ~panel.loc[t]
             else:
+                # Cast first: a whole-number panel (integer share volume read
+                # from a CSV) cannot hold the non-integer probe values.
+                changed_panel = changed_panel.astype(float)
                 changed_panel.loc[t] = (panel.loc[t] * 1.5 + 1.0).fillna(1.0)
+                setattr(changed, field, changed_panel)
             perturbed = cost_model.cost(known_trades, changed, portfolio_value)
             if t not in perturbed.index:
                 raise LookaheadError(

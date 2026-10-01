@@ -73,6 +73,10 @@ class BacktestResult:
         self.target_weights.to_csv(out / "target_weights.csv", index_label="date")
         if self.scores is not None:
             self.scores.to_csv(out / "scores.csv", index_label="date")
+        else:
+            # a scores file left by an earlier save into this directory would
+            # be loaded back as if it belonged to this result
+            (out / "scores.csv").unlink(missing_ok=True)
         meta = {
             "windows": [w.to_dict() for w in self.windows] if self.windows else None,
             "config": self.config,
@@ -91,7 +95,11 @@ class BacktestResult:
             f = src / name
             if not f.exists():
                 return None
-            return pd.read_csv(f, index_col="date", parse_dates=["date"])
+            # round_trip: the default float parser can be one unit in the
+            # last place off, so a reloaded run would not equal the saved one
+            return pd.read_csv(
+                f, index_col="date", parse_dates=["date"], float_precision="round_trip"
+            )
 
         series = read_panel("series.csv")
         meta = json.loads((src / "meta.json").read_text()) if (src / "meta.json").exists() else {}

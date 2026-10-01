@@ -174,9 +174,11 @@ def run_backtest(
     targets inside that band to preserve its zero-turnover property.
 
     Returns dict with 'returns' (net daily), 'equity', 'gross_returns',
-    'turnover' (daily one-side), 'costs' (daily, as return drag),
-    'cash_returns' (daily credit), 'rf_daily' (cash rate in force),
-    'withholding' (daily dividend-tax drag).
+    'turnover' (daily sum of absolute weight changes: every buy leg and
+    every sell leg counted once, so a full switch from one asset to another
+    is 2.0 and a move between cash and one asset is 1.0), 'costs' (daily,
+    as return drag), 'cash_returns' (daily credit), 'rf_daily' (cash rate
+    in force), 'withholding' (daily dividend-tax drag).
     """
     _validate_inputs(weights, prices)
     cm = cost_model or IBKRHKCostModel()
@@ -222,7 +224,7 @@ def run_backtest(
         raise ValueError("portfolio equity is exhausted; leveraged bankruptcy is unsupported")
     denom = 1.0 + gross
     w_drift = (w_lag * (1.0 + rets)).div(denom, axis=0).fillna(0.0)
-    trade = (w - w_drift).abs()  # per-asset one-side turnover at close t
+    trade = (w - w_drift).abs()  # per-asset traded weight at close t (a buy or a sell leg)
 
     # per-asset cost in bps, converted to portfolio return drag; share
     # share-count estimates use the dividend-unadjusted close instead of the
@@ -349,15 +351,23 @@ def _stats(r: pd.Series, rf: pd.Series) -> dict:
 def metrics(result: dict, oos_split: str = OOS_SPLIT) -> dict:
     """Full + in-sample (< split) + out-of-sample (>= split) statistics.
     Sharpe is excess over the cash rate credited in the backtest (result's
-    'rf_daily' when present, else the default ^IRX series)."""
+    'rf_daily' when present, else the default ^IRX series).
+
+    'ann_turnover_oneside' is the annualized sum of absolute weight changes:
+    buys PLUS sells, each leg counted once at its own size ("one side" is
+    the per-leg basis the cost model charges). For a fully invested rotation
+    that is about twice the conventional one-way turnover (the smaller of
+    buys and sells); the key name is kept because saved records use it."""
     r = result["returns"].dropna()
     g = result["gross_returns"].dropna()
     if r.empty:
         raise ValueError("metrics requires at least one return observation")
     rf = result.get("rf_daily")
     rf = rf.reindex(r.index).fillna(0.0) if rf is not None else cash_daily_return(r.index)
-    split = pd.Timestamp(oos_split) - pd.Timedelta(days=1)
-    monthly = (1 + r).resample("ME").prod() - 1
+    split = pd.Timestamp(oos_split) - pd.Timedelta(1, unit="D")
+    # calendar-month compounding; an empty month counts as 0%, as resample("ME") did
+    monthly = (1 + r).groupby(r.index.to_period("M")).prod() - 1
+    monthly = monthly.reindex(pd.period_range(monthly.index[0], monthly.index[-1], freq="M"), fill_value=0.0)
     out = {
         "name": result["name"],
         "start": str(r.index[0].date()),

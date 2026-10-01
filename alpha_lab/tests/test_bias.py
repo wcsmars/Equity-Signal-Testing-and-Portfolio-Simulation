@@ -46,7 +46,14 @@ def wf_result(market):
         cost_model=RealisticCost(),
         config=cfg,
     )
-    return engine.run(market)
+    # With lag 1 the delisted name is still held on its first priceless day
+    # (H_t = W_{t-1}): one held return is missing by construction. The engine
+    # must say so, count it, and say nothing else.
+    with pytest.warns(UserWarning, match="1 held asset-return cells are missing") as caught:
+        result = engine.run(market)
+    assert len(caught) == 1
+    assert result.meta["missing_held_return_cells"] == 1
+    return result
 
 
 def _membership_bounds(data: MarketData, ticker: str) -> tuple[int, int]:

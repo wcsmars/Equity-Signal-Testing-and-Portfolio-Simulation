@@ -3,15 +3,13 @@
 Produces a single self-contained ``report.html`` (inline CSS, every figure
 embedded as a base64 data URI — zero external assets) and/or a ``report.md``
 with the figures written alongside as PNG files and referenced relatively.
+
+Figures are built on ``matplotlib.figure.Figure`` directly. PNG output needs
+no display server and no pyplot, so importing this module leaves the caller's
+matplotlib backend (an inline notebook backend, for example) untouched.
 """
 
 from __future__ import annotations
-
-# Headless backend: reports are generated in tests/CI/cron with no display
-# server, and matplotlib's backend must be selected BEFORE pyplot is imported.
-import matplotlib
-
-matplotlib.use("Agg")
 
 import base64
 import calendar
@@ -20,8 +18,16 @@ import io
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-import matplotlib.pyplot as plt
-from matplotlib.ticker import PercentFormatter
+from matplotlib.figure import Figure
+from matplotlib.ticker import (
+    FixedLocator,
+    FuncFormatter,
+    LogLocator,
+    MaxNLocator,
+    NullFormatter,
+    NullLocator,
+    PercentFormatter,
+)
 import numpy as np
 import pandas as pd
 
@@ -43,20 +49,39 @@ _PERCENT_TOKENS = ("return", "drawdown", "vol", "drag")
 # formatting helpers
 # --------------------------------------------------------------------------
 
+def _four_sig(v: float) -> str:
+    """Four significant digits, never in exponent form for a large value.
+
+    ``.4g`` switches to scientific notation from 10,000 up ('1.26e+04'); a
+    count or a turnover of that size is printed as a rounded whole number
+    instead. Values below 1e-4 keep the exponent form.
+    """
+    text = f"{v:.4g}"
+    return f"{v:.0f}" if "e+" in text else text
+
+
 def format_metric(key: str, value: Any) -> str:
     """Format one metric value: 4 significant digits, percent for rate-like keys.
 
     A key is rate-like when it contains 'return', 'drawdown', 'vol' or 'drag'
-    (case-insensitive). Non-numeric values pass through as ``str(value)``.
+    (case-insensitive). Integer values of other keys (day, window and trial
+    counts) are printed exactly. ``None`` — how a non-finite value reads back
+    from a stored ``metrics.json`` — prints as 'nan'. Other non-numeric values
+    pass through as ``str(value)``.
     """
+    if value is None:
+        return "nan"
     if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
         return str(value)
+    percent = any(tok in key.lower() for tok in _PERCENT_TOKENS)
+    if isinstance(value, (int, np.integer)) and not percent:
+        return str(int(value))
     v = float(value)
     if not np.isfinite(v):
         return str(v)
-    if any(tok in key.lower() for tok in _PERCENT_TOKENS):
-        return f"{v * 100.0:.4g}%"
-    return f"{v:.4g}"
+    if percent:
+        return f"{_four_sig(v * 100.0)}%"
+    return _four_sig(v)
 
 
 def _metric_rows(metrics: dict) -> list[tuple[str, str]]:
@@ -81,13 +106,41 @@ def _window_rows(windows: Sequence[WalkForwardWindow]) -> list[tuple]:
 # --------------------------------------------------------------------------
 
 def _render_png(fig) -> bytes:
-    """Serialize a figure to PNG bytes, always closing it (no leaks)."""
+    """Serialize a figure to PNG bytes.
+
+    The figure was never registered with pyplot, so there is nothing to close:
+    it is released with its last reference.
+    """
     buf = io.BytesIO()
-    try:
-        fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
-    finally:
-        plt.close(fig)
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
     return buf.getvalue()
+
+
+def _plain_log_axis(ax, values: np.ndarray) -> None:
+    """Log y-axis whose tick labels are plain decimals (0.8, 1, 1.2).
+
+    The default log formatter prints '9 x 10^-1' and, when the data span less
+    than one decade, places no labelled tick between 1 and 2, so the upper
+    half of a typical equity curve has no scale. Under one decade the ticks
+    are therefore set at round decimal values; over a wider range they sit at
+    1, 2 and 5 times each power of ten (powers of ten alone from three decades).
+    """
+    ax.set_yscale("log")
+    positive = values[np.isfinite(values) & (values > 0.0)]
+    if positive.size == 0:
+        return
+    lo, hi = float(positive.min()), float(positive.max())
+    if hi / lo < 10.0:
+        locator = MaxNLocator(nbins=8, steps=[1, 2, 2.5, 5, 10])
+        # a constant curve has no range to divide: one tick at its level
+        ticks = [t for t in locator.tick_values(lo, hi) if t > 0.0] if hi > lo else [lo]
+        ax.yaxis.set_major_locator(FixedLocator(ticks))
+        ax.yaxis.set_minor_locator(NullLocator())
+    else:
+        subs = (1.0, 2.0, 5.0) if hi / lo < 1000.0 else (1.0,)
+        ax.yaxis.set_major_locator(LogLocator(base=10.0, subs=subs))
+        ax.yaxis.set_minor_formatter(NullFormatter())
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:g}"))
 
 
 def _fig_equity(net: pd.Series, gross: pd.Series) -> bytes | None:
@@ -96,12 +149,11 @@ def _fig_equity(net: pd.Series, gross: pd.Series) -> bytes | None:
     if len(net_eq) < 2:
         return None
     gross_eq = (1.0 + gross.fillna(0.0)).cumprod()
-    fig, (ax_eq, ax_dd) = plt.subplots(
-        2, 1, sharex=True, figsize=(9.0, 6.0), gridspec_kw={"height_ratios": [3, 1]}
-    )
+    fig = Figure(figsize=(9.0, 6.0))
+    ax_eq, ax_dd = fig.subplots(2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 1]})
     ax_eq.plot(net_eq.index, net_eq.values, color="#1f77b4", lw=1.4, label="net (after costs)")
     ax_eq.plot(gross_eq.index, gross_eq.values, color="#666666", lw=1.0, ls="--", label="gross (before costs)")
-    ax_eq.set_yscale("log")
+    _plain_log_axis(ax_eq, np.concatenate([net_eq.to_numpy(dtype=float), gross_eq.to_numpy(dtype=float)]))
     ax_eq.set_ylabel("equity (log)")
     ax_eq.set_title("Equity curve — net vs gross")
     ax_eq.legend(loc="best")
@@ -124,7 +176,8 @@ def _fig_rolling_sharpe(net: pd.Series) -> bytes | None:
     sharpe = (mean / std * np.sqrt(TRADING_DAYS_PER_YEAR)).replace([np.inf, -np.inf], np.nan)
     if sharpe.dropna().empty:
         return None
-    fig, ax = plt.subplots(figsize=(9.0, 3.2))
+    fig = Figure(figsize=(9.0, 3.2))
+    ax = fig.subplots()
     ax.plot(sharpe.index, sharpe.values, color="#2ca02c", lw=1.3)
     ax.axhline(0.0, color="#666666", lw=0.8, ls="--")
     ax.set_ylabel("Sharpe (ann.)")
@@ -141,7 +194,8 @@ def _fig_turnover_costs(turnover: pd.Series, costs: pd.Series) -> bytes | None:
     rolled = turnover.rolling(TURNOVER_WINDOW).mean()
     if rolled.dropna().empty:
         return None
-    fig, ax = plt.subplots(figsize=(9.0, 3.2))
+    fig = Figure(figsize=(9.0, 3.2))
+    ax = fig.subplots()
     line_to, = ax.plot(
         rolled.index, rolled.values, color="#1f77b4", lw=1.3,
         label=f"{TURNOVER_WINDOW}d mean turnover",
@@ -154,7 +208,12 @@ def _fig_turnover_costs(turnover: pd.Series, costs: pd.Series) -> bytes | None:
         cum_costs.index, cum_costs.values, color="#d62728", lw=1.3, label="cumulative costs"
     )
     ax_cost.set_ylabel("cumulative cost (NAV frac)")
-    ax.legend(handles=[line_to, line_c], loc="best")
+    # Below the axes: a legend inside them is placed against the primary
+    # axis only and can sit on top of the twin-axis cost line.
+    ax.legend(
+        handles=[line_to, line_c], loc="upper center", bbox_to_anchor=(0.5, -0.14),
+        ncol=2, frameon=False,
+    )
     ax.set_title("Turnover and cumulative costs")
     fig.tight_layout()
     return _render_png(fig)
@@ -202,13 +261,26 @@ def _html_table(headers: Iterable, rows: list[tuple], styles: list[list[str]] | 
     return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
 
 
+def _md_escape(value: Any) -> str:
+    """One value as inline Markdown text for a heading or a table cell.
+
+    '|' would start a new cell and a line break would end the row, so the
+    first is backslash-escaped and the second becomes a space; '&', '<' and
+    '>' become entities so the text cannot be read as raw HTML (the HTML
+    report escapes the same values with ``html.escape``).
+    """
+    text = _htmlmod.escape(str(value), quote=False)
+    text = text.replace("\\", "\\\\").replace("|", "\\|")
+    return " ".join(text.splitlines())
+
+
 def _md_table(headers: Iterable, rows: list[tuple]) -> str:
-    headers = [str(h) for h in headers]
+    headers = [_md_escape(h) for h in headers]
     lines = [
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
     ]
-    lines += ["| " + " | ".join(str(c) for c in row) + " |" for row in rows]
+    lines += ["| " + " | ".join(_md_escape(c) for c in row) + " |" for row in rows]
     return "\n".join(lines)
 
 
@@ -224,6 +296,17 @@ def _monthly_headers_rows(table: pd.DataFrame) -> tuple[list, list[tuple], list[
 
 
 _WINDOW_HEADERS = ("#", "train_start", "train_end", "test_start", "test_end")
+
+
+def _leading_flat_days(holdings: pd.DataFrame | None, index: pd.Index) -> int:
+    """Rows of ``index`` before the first date with a non-zero holding.
+
+    0 when holdings are unavailable; ``len(index)`` when nothing is ever held.
+    """
+    if holdings is None or holdings.empty:
+        return 0
+    held = holdings.reindex(index).fillna(0.0).ne(0.0).any(axis=1).to_numpy()
+    return int(held.argmax()) if held.any() else len(index)
 
 
 # --------------------------------------------------------------------------
@@ -248,6 +331,10 @@ _FIGURE_TITLES = {
     "rolling_sharpe": f"Rolling {ROLLING_SHARPE_WINDOW}d Sharpe",
     "turnover_costs": "Turnover and costs",
 }
+
+#: every file generate_report can write into a report directory
+_REPORT_FILES = {"html": "report.html", "md": "report.md"}
+_FIGURE_FILES = tuple(f"{name}.png" for name in _FIGURE_TITLES)
 
 
 def _build_html(
@@ -300,7 +387,7 @@ def _build_md(
     windows: Sequence[WalkForwardWindow] | None,
     period_note: str,
 ) -> str:
-    parts = [f"# {title}", "", period_note, "", "## Key metrics", ""]
+    parts = [f"# {_md_escape(title)}", "", period_note, "", "## Key metrics", ""]
     if metrics:
         parts.append(_md_table(("metric", "value"), _metric_rows(metrics)))
     else:
@@ -339,6 +426,11 @@ def generate_report(
     mapping of format -> written report path. Walk-forward charts and tables
     start at the first test date, matching ``risk.metrics.summary``; the
     training prefix remains available in the original result and saved files.
+
+    A report directory holds one build: a report or figure file left by an
+    earlier call that this call does not rewrite (the other format, or a
+    figure the current series is too short for) is removed, so the directory
+    never mixes two results.
     """
     fmts = (formats,) if isinstance(formats, str) else tuple(formats)
     if not fmts:
@@ -368,15 +460,29 @@ def generate_report(
         f"Charts and monthly returns cover {net.index[0].date().isoformat()} "
         f"through {net.index[-1].date().isoformat()}. "
     )
+    flat_days = _leading_flat_days(result.holdings, net.index)
     if is_walkforward:
         period_note += "The training prefix before the first walk-forward test date is excluded. "
     elif result.meta.get("mode") == "insample":
         period_note += "This is a full-sample, in-sample diagnostic. "
+        if 0 < flat_days < len(net):
+            period_note += (
+                f"Its first {flat_days} of {len(net)} days precede the first position "
+                "(signal warm-up and execution lag) and count as flat days in every metric. "
+            )
+    if flat_days == len(net):
+        period_note += "No position is held on any date in this period. "
     period_note += "Partial months include only dates within this period."
     if (result.config or {}).get("data", {}).get("source") == "synthetic":
         period_note = (
             "Synthetic data demonstrate the research pipeline; these results are not "
             "evidence of investment performance. " + period_note
+        )
+    validation = result.meta.get("validation")
+    if isinstance(validation, dict) and validation.get("forced"):
+        period_note = (
+            f"Market-data validation reported {validation.get('errors', 0)} error(s) and the "
+            "run was forced; treat these results as unverified. " + period_note
         )
 
     metrics = metrics or {}
@@ -399,17 +505,24 @@ def generate_report(
     windows = result.windows
 
     outputs: dict[str, Path] = {}
+    written: set[str] = set()
     if "html" in fmts:
-        path = out / "report.html"
+        path = out / _REPORT_FILES["html"]
         path.write_text(_build_html(title, metrics, figures, monthly, windows, period_note), encoding="utf-8")
         outputs["html"] = path
+        written.add(path.name)
     if "md" in fmts:
         figure_files: dict[str, str] = {}
         for name, png in figures.items():
             filename = f"{name}.png"
             (out / filename).write_bytes(png)
             figure_files[name] = filename
-        path = out / "report.md"
+            written.add(filename)
+        path = out / _REPORT_FILES["md"]
         path.write_text(_build_md(title, metrics, figure_files, monthly, windows, period_note), encoding="utf-8")
         outputs["md"] = path
+        written.add(path.name)
+    for stale in (*_REPORT_FILES.values(), *_FIGURE_FILES):
+        if stale not in written:
+            (out / stale).unlink(missing_ok=True)
     return outputs

@@ -10,7 +10,11 @@ The law, restated (clauses 4-8):
   the trade dated t executes at close t-1 (clause 7), when the prior book
   has drifted with returns realized through THAT close — never with day-t
   returns, which print after the trade is fixed (rule 8). (Drift adjustment
-  configurable via ``drift_adjust_turnover``; on by default.)
+  configurable via ``drift_adjust_turnover``; on by default. Off is a
+  comparison aid only: ``gross_t`` still assumes the book is reset to
+  ``H_t`` every day, so ``trades_t = H_t - H_{t-1}`` leaves the trades that
+  undo each day's drift out of turnover and cost, which are then typically
+  understated relative to the gross series.)
   ``turnover_t = sum_i |trades_{t,i}|``.
 - Costs are NAV-fraction per date, charged the same date as the trade:
   ``net_t = gross_t - cost_t``.
@@ -45,9 +49,15 @@ class BacktestEngine:
       score panel. Dates before the first test window keep NaN scores.
     - ``walkforward`` None: IN-SAMPLE DIAGNOSTIC. ``fit`` sees every date and
       the score panel is produced in one pass. THIS IS NOT OUT-OF-SAMPLE —
-      use it only for debugging and capacity checks, never as evidence a
-      strategy works. ``meta['mode']`` is set to ``'insample'`` so downstream
-      reports can flag it.
+      use it only for debugging and rough capacity checks, never as evidence
+      a strategy works. ``meta['mode']`` is set to ``'insample'`` so
+      downstream reports can flag it.
+
+    Capacity read from a sweep over ``portfolio_value`` is bounded by the
+    cost model: RealisticCost prices any trade beyond its participation cap
+    at the cap, and without a volume panel its cost does not depend on
+    ``portfolio_value`` at all. It warns in both cases; past that point a
+    flat cost curve is the model saturating, not spare capacity.
     """
 
     def __init__(

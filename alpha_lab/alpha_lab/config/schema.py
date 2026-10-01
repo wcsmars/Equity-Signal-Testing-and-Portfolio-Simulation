@@ -9,12 +9,16 @@ import dataclasses
 import datetime
 import math
 import numbers
+import re
 import types
 import typing
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
+
 from alpha_lab.core.errors import ConfigError
+from alpha_lab.core.types import ISO_DATE_PATTERN
 
 
 def finite_number(value, name: str) -> None:
@@ -26,6 +30,27 @@ def finite_number(value, name: str) -> None:
 def integer_at_least(value, name: str, minimum: int) -> None:
     if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value < minimum:
         raise ConfigError(f"{name} must be an integer >= {minimum}")
+
+
+def iso_date(value, name: str) -> pd.Timestamp:
+    """Validate a date setting at load time and return it as a timestamp.
+
+    The data sources hand these strings to pandas mid-run; an unparseable
+    one would otherwise surface there as a raw traceback, and an ambiguous
+    one (``10/01/2024``) would be read month-first without any notice.
+    """
+    is_text = isinstance(value, str)
+    try:
+        if is_text and not re.fullmatch(ISO_DATE_PATTERN, value):
+            raise ValueError("not an ISO date")
+        if not is_text and not isinstance(value, datetime.date):
+            raise TypeError("not a date")
+        stamp = pd.Timestamp(value)
+    except (ValueError, TypeError) as exc:
+        raise ConfigError(f"{name} must be an ISO date (YYYY-MM-DD), got {value!r}") from exc
+    if pd.isna(stamp) or stamp.tzinfo is not None:
+        raise ConfigError(f"{name} must be a timezone-naive ISO date (YYYY-MM-DD), got {value!r}")
+    return stamp
 
 
 # --------------------------------------------------------------------------
@@ -40,8 +65,9 @@ def build_dataclass(cls: type, raw: Any, path: str = "config"):
     fmap = {f.name: f for f in dataclasses.fields(cls)}
     unknown = set(raw) - set(fmap)
     if unknown:
+        # key=str: YAML keys can mix types (1 and "foo"), which do not sort
         raise ConfigError(
-            f"{path}: unknown keys {sorted(unknown)}; allowed: {sorted(fmap)}"
+            f"{path}: unknown keys {sorted(unknown, key=str)}; allowed: {sorted(fmap)}"
         )
     kwargs = {name: _coerce(hints[name], raw[name], f"{path}.{name}") for name in fmap if name in raw}
     try:
@@ -117,6 +143,7 @@ class SyntheticConfig:
         integer_at_least(self.n_assets, "n_assets", 2)
         integer_at_least(self.n_days, "n_days", 10)
         integer_at_least(self.seed, "seed", 0)
+        iso_date(self.start, "data.synthetic.start")
         for name in ("drift_dispersion", "base_vol"):
             finite_number(getattr(self, name), name)
             if getattr(self, name) < 0:
@@ -143,6 +170,23 @@ class DataConfig:
         if self.format not in ("wide", "long"):
             raise ValueError(f"unknown csv format '{self.format}'")
         if self.source == "synthetic":
+            # path/format are consumed only by the csv source. source defaults
+            # to "synthetic", so a config that sets data.path but omits
+            # `source: csv` would otherwise backtest the synthetic panel while
+            # the user believes the run used their files.
+            csv_keys = [
+                name
+                for name, is_set in (
+                    ("path", self.path is not None),
+                    ("format", self.format != "wide"),
+                )
+                if is_set
+            ]
+            if csv_keys:
+                raise ValueError(
+                    f"data.{'/'.join(csv_keys)} not supported for the synthetic "
+                    "source (the default); set data.source: csv to read your own files"
+                )
             # These subset keys are consumed only by the csv source; silently
             # ignoring them would hand back the full synthetic panel while
             # the user believes they subset it.
@@ -155,6 +199,13 @@ class DataConfig:
                     f"data.{'/'.join(set_keys)} not supported for the synthetic "
                     "source; configure data.synthetic (n_assets, n_days, start) instead"
                 )
+        bounds = {
+            name: iso_date(getattr(self, name), f"data.{name}")
+            for name in ("start", "end")
+            if getattr(self, name) is not None
+        }
+        if len(bounds) == 2 and bounds["start"] > bounds["end"]:
+            raise ValueError(f"data.start {self.start} is after data.end {self.end}")
 
 
 @dataclass

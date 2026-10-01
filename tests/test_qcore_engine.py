@@ -3,6 +3,8 @@
 Synthetic tickers and a stubbed raw-close loader keep every test independent
 of the downloaded cache; cash_rate=0.0 and withholding=0.0 switch off the
 ^IRX credit and inferred-dividend withholding, which need that cache.
+Hand-computed cost, withholding and metric values are in
+test_qcore_accounting.py; statistics reference values in test_qcore_stats.py.
 """
 
 import warnings
@@ -12,7 +14,7 @@ import pandas as pd
 import pytest
 
 from qcore import backtest as bt
-from qcore.calendar import confirmed_month_ends
+from qcore.calendar import confirmed_month_ends, in_complete_month
 from qcore.costs import IBKRHKCostModel
 from qcore.quality import nyse_bdays
 
@@ -124,13 +126,20 @@ def test_month_end_before_good_friday_is_kept_with_warning():
 
 def test_ordinary_month_end_is_kept_silently_and_partial_month_dropped():
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error", UserWarning)
         assert confirmed_month_ends(_nyse_index("2024-04-30"))[-1] == pd.Timestamp("2024-04-30")
         assert confirmed_month_ends(_nyse_index("2024-04-15"))[-1] == pd.Timestamp("2024-03-28")
 
 
-@pytest.mark.parametrize("corruption", ["missing_held", "missing_entry", "zero", "infinite", "unsorted", "duplicate"])
-def test_invalid_market_inputs_do_not_manufacture_returns(corruption):
+@pytest.mark.parametrize("corruption,message", [
+    ("missing_held", "missing price for a held asset"),
+    ("missing_entry", "missing price for a held asset"),  # held into the next row
+    ("zero", "must be positive"),
+    ("infinite", "must not contain infinite"),
+    ("unsorted", "dates must be unique and sorted"),
+    ("duplicate", "dates must be unique and sorted"),
+])
+def test_invalid_market_inputs_do_not_manufacture_returns(corruption, message):
     px = _prices()
     w = pd.DataFrame(0.0, index=px.index, columns=px.columns)
     w.iloc[5:15, 0] = 1.0
@@ -146,7 +155,7 @@ def test_invalid_market_inputs_do_not_manufacture_returns(corruption):
         px = px.iloc[::-1]
     else:
         px = pd.concat([px, px.iloc[[-1]]])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=message):
         _run(w, px)
 
 
@@ -337,6 +346,28 @@ def test_strategy_weights_do_not_change_when_future_prices_are_removed(monkeypat
         for cutoff in ("2021-08-17", "2022-11-30"):
             truncated = build(px.loc[:cutoff])
             pd.testing.assert_frame_equal(truncated, full.loc[:cutoff])
+
+
+def test_trailing_row_is_a_month_end_only_on_the_last_session_of_its_month():
+    # every possible final data date across a Good Friday month-end (March
+    # 2024), a weekend month-end (June 2024) and ordinary ones
+    sessions = nyse_bdays("2024-01-02", "2024-07-31")
+    last_of_month = sessions.to_series().groupby(sessions.to_period("M")).max()
+    kept = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # the holiday notice is tested above
+        for end in sessions[(sessions >= "2024-03-01") & (sessions <= "2024-07-03")]:
+            ends = confirmed_month_ends(sessions[sessions <= end])
+            assert list(ends) == list(last_of_month[last_of_month <= end])
+            kept += ends[-1] == end
+    assert kept == 4  # 2024-03-28, 04-30, 05-31 and 06-28
+
+
+def test_rows_of_a_trailing_partial_month_are_not_in_a_complete_month():
+    partial = in_complete_month(_nyse_index("2024-04-15"))
+    assert partial.loc[:"2024-03-31"].all() and not partial.loc["2024-04-01":].any()
+    assert len(partial.loc["2024-04-01":]) == 11
+    assert in_complete_month(_nyse_index("2024-04-30")).all()
 
 
 @pytest.mark.parametrize("bad_final", ["2024-03-29", "2024-03-30", "2024-03-31"])

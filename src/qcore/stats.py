@@ -18,6 +18,7 @@ import pandas as pd
 TRADING_DAYS = 252
 _PHI = NormalDist()
 EULER_GAMMA = 0.5772156649015329
+_ZERO_TOL = 1e-15  # float-noise floor for zero excess returns, as in backtest._stats
 
 
 def _clean(excess: pd.Series) -> np.ndarray:
@@ -31,10 +32,10 @@ def _clean(excess: pd.Series) -> np.ndarray:
 
 def sharpe_daily(excess: pd.Series) -> float:
     r = _clean(excess)
+    if np.allclose(r, 0.0, rtol=0.0, atol=_ZERO_TOL):
+        return 0.0
     sd = r.std(ddof=1)
-    if np.ptp(r) == 0:
-        if r[0] == 0:
-            return 0.0
+    if sd < _ZERO_TOL:
         raise ValueError("Sharpe is undefined for constant nonzero excess returns")
     return float(r.mean() / sd)
 
@@ -125,7 +126,7 @@ def block_bootstrap_sharpe_ci(excess: pd.Series, n_boot: int = 2000,
     samples = r[idx]
     mu = samples.mean(axis=1)
     sd = samples.std(axis=1, ddof=1)
-    sr = np.divide(mu, sd, out=np.zeros_like(mu), where=sd > 0) * math.sqrt(TRADING_DAYS)
+    sr = np.divide(mu, sd, out=np.zeros_like(mu), where=sd > _ZERO_TOL) * math.sqrt(TRADING_DAYS)
     lo, hi = np.quantile(sr, [alpha / 2, 1 - alpha / 2])
     return {
         "sharpe_ann": round(observed * math.sqrt(TRADING_DAYS), 3),

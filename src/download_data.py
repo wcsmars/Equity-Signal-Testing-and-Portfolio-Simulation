@@ -1,12 +1,20 @@
 """Download a local daily market-data cache using yfinance.
 
-Run: python src/download_data.py. Re-running refreshes the cache from 2000
-onward and may change previously observed history after vendor revisions.
+Run: python src/download_data.py [--allow-shrink]. Re-running refreshes the
+cache from 2000 onward and may change previously observed history after
+vendor revisions. The cache is data/ beside src/, or the directory named by
+the QCORE_DATA_DIR environment variable, which keeps a new download apart
+from a cache that earlier results were computed from. A refresh is refused,
+and the cache left untouched, when the response lacks observations the
+existing cache holds (a ticker that starts later, stops earlier or has a new
+hole); --allow-shrink accepts such a response when the loss is a genuine
+vendor correction.
 The public project includes no downloaded prices; users must obtain data
 under terms permitting their intended use. Run the data-quality check after
 refreshing and before using the cache in research.
 """
 
+import argparse
 import os
 import shutil
 import sys
@@ -21,6 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qcore.data import DATA_DIR, ETF_UNIVERSE, INDEX_UNIVERSE, OPERATIONAL_UNIVERSE, STOCK_UNIVERSE
 
 START = "2000-01-01"
+# Price sessions the newest index row may trail the newest price row. A
+# longer lag is a partial index response and must not replace the cache.
+INDEX_MAX_LAG_SESSIONS = 5
 
 
 def download_batch(tickers: list[str]) -> dict[str, pd.DataFrame]:
@@ -65,6 +76,10 @@ def _validate_download(frame: pd.DataFrame, tickers: list[str], label: str,
         raise ValueError(f"{label}: incomplete or empty ticker response")
     if not isinstance(frame.index, pd.DatetimeIndex) or frame.index.hasnans or not frame.index.is_unique:
         raise ValueError(f"{label}: invalid/duplicate dates")
+    # A timezone-aware or intraday index is written as text the loader
+    # cannot read back as dates, so it must never reach the cache.
+    if frame.index.tz is not None or (frame.index != frame.index.normalize()).any():
+        raise ValueError(f"{label}: dates must be timezone-naive calendar days")
     if not frame.index.is_monotonic_increasing:
         raise ValueError(f"{label}: unsorted dates")
     values = frame.to_numpy(dtype=float)
@@ -76,15 +91,58 @@ def _validate_download(frame: pd.DataFrame, tickers: list[str], label: str,
         raise ValueError("volume: negative values")
 
 
+def _lost_history(frames: dict[str, pd.DataFrame]) -> list[str]:
+    """Observations the existing cache holds that the refreshed frames lack.
+
+    Each file about to be replaced is compared cell by cell with its
+    replacement, so a ticker that starts later, stops earlier or gains a hole
+    is reported even when its row count grows. Changed values on dates both
+    generations hold are vendor revisions, not losses, and are not reported.
+    An existing file whose dates cannot be read is reported as well: a
+    refresh that cannot be compared is not known to be safe. coverage.csv is
+    derived from adj_close and is not compared.
+    """
+    problems = []
+    for name, new in frames.items():
+        path = DATA_DIR / f"{name}.csv"
+        if name == "coverage" or not path.exists():
+            continue
+        try:
+            old = pd.read_csv(path, index_col=0, parse_dates=True)
+            if len(old.index) and (not isinstance(old.index, pd.DatetimeIndex)
+                                   or old.index.tz is not None):
+                raise ValueError("first column is not timezone-naive dates")
+        except Exception as error:  # noqa: BLE001 - unreadable is not "nothing lost"
+            problems.append(f"{name}.csv: existing file cannot be compared ({error})")
+            continue
+        common = old.columns.intersection(new.columns)
+        held = old[common].notna()
+        gone = held & new.reindex(index=old.index, columns=common).isna()
+        for ticker in common[gone.any(axis=0).to_numpy()]:
+            dates = gone.index[gone[ticker].to_numpy()]
+            problems.append(f"{name}.csv {ticker}: {len(dates)} of {int(held[ticker].sum())} "
+                            f"cached observations missing "
+                            f"({dates.min().date()} .. {dates.max().date()})")
+    return problems
+
+
 def _write_cache(frames: dict[str, pd.DataFrame]) -> None:
     """Stage all CSVs before replacement; restore old files if a write fails.
 
     Each rename is atomic, but concurrent readers must still avoid refreshes:
-    a multi-file CSV cache is not a transactional database.
+    a multi-file CSV cache is not a transactional database. If a restore
+    itself fails, the staging folder with the untouched <name>.backup copies
+    is kept and named in the error instead of being deleted.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".refresh-", dir=DATA_DIR) as temp:
-        stage = Path(temp)
+    leftover = sorted(p.name for p in DATA_DIR.glob(".refresh-*"))
+    if leftover:
+        print(f"WARNING: {DATA_DIR} holds staging folders from an interrupted refresh "
+              f"({', '.join(leftover)}); their <name>.backup files are the pre-refresh "
+              "originals. Delete the folders once this refresh has completed.")
+    stage = Path(tempfile.mkdtemp(prefix=".refresh-", dir=DATA_DIR))
+    keep_stage = False
+    try:
         existing = set()
         for name, frame in frames.items():
             frame.to_csv(stage / f"{name}.csv")
@@ -95,21 +153,38 @@ def _write_cache(frames: dict[str, pd.DataFrame]) -> None:
         replaced = []
         try:
             for name in frames:
-                os.replace(stage / f"{name}.csv", DATA_DIR / f"{name}.csv")
+                # recorded before the rename: restoring a file that was not
+                # replaced after all is harmless, missing one is not
                 replaced.append(name)
-        except BaseException:
+                os.replace(stage / f"{name}.csv", DATA_DIR / f"{name}.csv")
+        except BaseException as error:
+            unrestored = []
             for name in replaced:
                 destination = DATA_DIR / f"{name}.csv"
-                if name in existing:
-                    os.replace(stage / f"{name}.backup", destination)
-                else:
-                    destination.unlink()
+                try:
+                    if name in existing:
+                        os.replace(stage / f"{name}.backup", destination)
+                    else:
+                        destination.unlink(missing_ok=True)
+                except BaseException:  # noqa: BLE001 - keep restoring the rest
+                    unrestored.append(name)
+            if unrestored:
+                keep_stage = True
+                raise RuntimeError(
+                    f"cache refresh failed ({error!r}) and the rollback could not "
+                    f"restore {unrestored}: {DATA_DIR} now mixes old and new files. "
+                    f"The originals are kept in {stage} as <name>.backup (a listed "
+                    "name with no backup is a new file and should be deleted); copy "
+                    "them back before using the cache.") from error
             raise
+    finally:
+        if not keep_stage:
+            shutil.rmtree(stage, ignore_errors=True)
 
 
-def main() -> None:
+def main(allow_shrink: bool = False) -> None:
     tickers = list(dict.fromkeys(ETF_UNIVERSE + STOCK_UNIVERSE + OPERATIONAL_UNIVERSE))
-    print(f"downloading {len(tickers)} tickers from {START} ...")
+    print(f"downloading {len(tickers)} tickers from {START} into {DATA_DIR} ...")
     data = download_batch(tickers)
     # Preserve one calendar across all six fields. All-NaN rows cannot
     # identify an in-progress bar; a live pull can still include today's bar.
@@ -124,15 +199,30 @@ def main() -> None:
                       auto_adjust=True, group_by="column")["Close"]
     idx = idx.dropna(how="all")
     _validate_download(idx, INDEX_UNIVERSE, "indices")
+    lag = int((valid > idx.index[-1]).sum())
+    if lag > INDEX_MAX_LAG_SESSIONS:
+        raise ValueError(f"indices: panel ends {idx.index[-1].date()}, {lag} sessions "
+                         f"before prices ({valid[-1].date()})")
     frames["indices"] = idx
 
-    # report coverage so strategies know each ticker's live range
+    # coverage.csv: each ticker's first/last valid date and row count. A
+    # reference for people choosing sample starts; no code reads it.
     cov = pd.DataFrame({
         "first": data["close"].apply(lambda s: s.first_valid_index()),
         "last": data["close"].apply(lambda s: s.last_valid_index()),
         "rows": data["close"].count(),
     })
     frames["coverage"] = cov
+
+    lost = _lost_history(frames)
+    if lost:
+        shown = "\n  ".join(lost[:20] + ([f"... and {len(lost) - 20} more"] if len(lost) > 20 else []))
+        if not allow_shrink:
+            raise ValueError(
+                f"refresh refused; the cache in {DATA_DIR} is unchanged. The response "
+                f"lacks history the cache holds:\n  {shown}\n"
+                "Retry later, or pass --allow-shrink if the loss is a genuine vendor correction.")
+        print(f"WARNING: --allow-shrink: replacing the cache although history was lost:\n  {shown}")
     _write_cache(frames)
     for name, frame in frames.items():
         print(f"  {name}.csv  {frame.shape}")
@@ -143,4 +233,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Refresh the local market-data cache.")
+    parser.add_argument("--allow-shrink", action="store_true",
+                        help="replace the cache even though the response lacks "
+                             "observations the existing cache holds")
+    main(allow_shrink=parser.parse_args().allow_shrink)

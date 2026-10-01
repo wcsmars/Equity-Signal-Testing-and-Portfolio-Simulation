@@ -1,14 +1,22 @@
 """Tests for portfolio construction (QuantileLongShort) and cap_weights."""
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from alpha_lab.config.schema import PortfolioConfig
 from alpha_lab.core.errors import ConfigError
+from alpha_lab.core.types import MarketData
 from alpha_lab.data.synthetic import make_market
 from alpha_lab.portfolio.constraints import cap_weights
-from alpha_lab.portfolio.construction import CONSTRUCTORS, QuantileLongShort, from_config
+from alpha_lab.portfolio.construction import (
+    CONSTRUCTORS,
+    VOL_TARGET_MAX_SCALE,
+    QuantileLongShort,
+    from_config,
+)
 
 
 def _scores(data, seed=0):
@@ -102,7 +110,7 @@ def test_infeasible_cap_warns_once(market_simple):
     np.testing.assert_allclose(active.abs(), 0.1, atol=1e-12)
     # warns once per instance
     with _warnings.catch_warnings():
-        _warnings.simplefilter("error")
+        _warnings.simplefilter("error", UserWarning)
         ctor.weights(_scores(market_simple), market_simple)
 
 
@@ -111,7 +119,7 @@ def test_feasible_cap_does_not_warn(market_simple):
 
     ctor = QuantileLongShort(quantile=0.5, gross_leverage=2.0, max_weight=0.5, min_names=2)
     with _warnings.catch_warnings():
-        _warnings.simplefilter("error")
+        _warnings.simplefilter("error", UserWarning)
         ctor.weights(_scores(market_simple), market_simple)
 
 
@@ -229,6 +237,151 @@ def test_universe_entrant_and_delisted_get_zero_weight(market):
     assert w[delisted].abs().sum() > 0
 
 
+def test_single_valid_name_is_a_zero_row_even_with_min_names_zero(market_simple):
+    # one name cannot be ranked against anything: min_names below 2 is
+    # floored at 2, in both modes
+    scores = _scores(market_simple).copy()
+    t = market_simple.dates[50]
+    scores.loc[t, market_simple.tickers[1:]] = np.nan
+    for dollar_neutral in (True, False):
+        ctor = QuantileLongShort(
+            quantile=0.5, dollar_neutral=dollar_neutral, max_weight=1.0, min_names=0
+        )
+        w = ctor.weights(scores, market_simple)
+        assert (w.loc[t] == 0.0).all()
+        assert w.abs().sum(axis=1).gt(0).drop(t).all()
+
+
+def test_bucket_size_survives_float_product_just_below_an_integer():
+    # 100 * 0.29 == 28.999999999999996 in floating point; the bucket is 29
+    assert 100 * 0.29 < 29
+    dates = pd.bdate_range("2020-01-02", periods=2)
+    tickers = [f"T{i:03d}" for i in range(100)]
+    data = MarketData.from_frames(pd.DataFrame(50.0, index=dates, columns=tickers))
+    rng = np.random.default_rng(1)
+    scores = pd.DataFrame(rng.standard_normal((2, 100)), index=dates, columns=tickers)
+    w = QuantileLongShort(quantile=0.29, max_weight=1.0).weights(scores, data)
+    assert ((w > 0).sum(axis=1) == 29).all()
+    assert ((w < 0).sum(axis=1) == 29).all()
+
+
+def test_scores_wider_than_the_data_get_zero_weight_without_warnings(market_simple):
+    # a date or ticker the data does not carry is outside the universe; the
+    # alignment used to go through an object frame and a pandas FutureWarning
+    scores = _scores(market_simple)
+    wide = scores.copy()
+    wide["EXTRA"] = 5.0
+    wide.loc[market_simple.dates[-1] + pd.Timedelta(1, unit="D")] = 1.0
+    ctor = QuantileLongShort(quantile=0.34, max_weight=1.0, min_names=2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got = ctor.weights(wide, market_simple)
+    assert got.index.equals(wide.index) and got.columns.equals(wide.columns)
+    assert (got["EXTRA"] == 0.0).all()
+    assert (got.iloc[-1] == 0.0).all()
+    pd.testing.assert_frame_equal(
+        got.loc[scores.index, scores.columns], ctor.weights(scores, market_simple), check_freq=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# ties
+# ---------------------------------------------------------------------------
+
+
+def _flat_market(tickers, n_days=3):
+    dates = pd.bdate_range("2020-01-02", periods=n_days)
+    return MarketData.from_frames(pd.DataFrame(100.0, index=dates, columns=list(tickers)))
+
+
+def _one_row(ctor, row, data):
+    scores = pd.DataFrame([row] * len(data.dates), index=data.dates, columns=data.tickers)
+    return ctor.weights(scores.astype(float), data).iloc[0]
+
+
+@pytest.mark.parametrize("weighting", ["equal", "score"])
+@pytest.mark.parametrize("dollar_neutral", [True, False])
+def test_fully_tied_row_is_a_zero_row(weighting, dollar_neutral):
+    # no cross-sectional dispersion is no opinion; the stable sort used to
+    # short the first tickers and buy the last at full gross
+    data = _flat_market("ABCDEF")
+    ctor = QuantileLongShort(
+        quantile=0.34, weighting=weighting, dollar_neutral=dollar_neutral,
+        max_weight=1.0, min_names=2,
+    )
+    assert (_one_row(ctor, [1.0] * 6, data) == 0.0).all()
+    assert (_one_row(ctor, [0.0] * 6, data) == 0.0).all()
+
+
+def test_binary_scores_never_short_a_top_scored_name():
+    data = _flat_market("ABCDEF")
+    ctor = QuantileLongShort(quantile=0.34, max_weight=1.0, min_names=2)  # k = 2 per side
+    row = _one_row(ctor, [1, 1, 1, 1, 1, 0], data)
+    # five names tie for the 2 long slots (0.4 slot each -> +0.2) and for
+    # the 1 short slot left beside F (0.2 slot each -> -0.1): net +0.1 each
+    np.testing.assert_allclose(row[list("ABCDE")], 0.1, atol=1e-12)
+    assert row["F"] == pytest.approx(-0.5)
+    assert abs(row.sum()) < 1e-12  # still dollar-neutral
+    flags = pd.DataFrame(
+        [[True, True, True, True, True, False]] * 3, index=data.dates, columns=data.tickers
+    ).astype(object)
+    pd.testing.assert_series_equal(ctor.weights(flags, data).iloc[0], row)
+
+
+@pytest.mark.parametrize("weighting", ["equal", "score"])
+@pytest.mark.parametrize("dollar_neutral", [True, False])
+def test_tied_scores_do_not_depend_on_column_order(weighting, dollar_neutral):
+    tickers = list("ABCDEFGH")
+    by_ticker = dict(zip(tickers, [3.0, 2.0, 2.0, 2.0, 1.0, 0.0, 0.0, -1.0]))
+    ctor = QuantileLongShort(
+        quantile=0.25, weighting=weighting, dollar_neutral=dollar_neutral,
+        max_weight=1.0, min_names=2,
+    )
+    base = _one_row(ctor, [by_ticker[c] for c in tickers], _flat_market(tickers))
+    for seed in range(5):
+        order = list(np.random.default_rng(seed).permutation(tickers))
+        got = _one_row(ctor, [by_ticker[c] for c in order], _flat_market(order))
+        pd.testing.assert_series_equal(got[tickers], base, check_exact=False, atol=1e-12)
+    # equal scores -> equal weights
+    assert base["B"] == base["C"] == base["D"]
+    assert base["F"] == base["G"]
+    assert base.abs().sum() == pytest.approx(2.0)  # no group straddles both edges
+
+
+def test_tie_at_the_bucket_edge_splits_the_straddled_slot():
+    data = _flat_market("ABCDEFGH")
+    ctor = QuantileLongShort(quantile=0.25, gross_leverage=2.0, max_weight=1.0, min_names=2)
+    # k = 2: A is inside the long bucket; B, C, D tie for the one slot left
+    row = _one_row(ctor, [3, 2, 2, 2, 1, 0, 0, -1], data)
+    assert row["A"] == pytest.approx(0.5)
+    np.testing.assert_allclose(row[list("BCD")], 0.5 / 3.0, atol=1e-12)
+    assert row["E"] == 0.0
+    # H is inside the short bucket; F and G tie for the other slot
+    assert row["H"] == pytest.approx(-0.5)
+    np.testing.assert_allclose(row[list("FG")], -0.25, atol=1e-12)
+    # a tie that lies wholly inside a bucket changes nothing
+    inside = _one_row(ctor, [3, 3, 2, 1, 0.5, 0, -1, -1], data)
+    np.testing.assert_allclose(inside, [0.5, 0.5, 0, 0, 0, 0, -0.5, -0.5], atol=1e-12)
+
+
+def test_score_weighting_matches_hand_formula():
+    # weight ~ distance from the bucket's own worst score, so the least
+    # extreme of the k names carries (almost) nothing: documented behaviour
+    data = _flat_market("ABCDEFGHIJ")
+    ctor = QuantileLongShort(quantile=0.3, weighting="score", max_weight=1.0, min_names=2)
+    row = _one_row(ctor, [3, 2, 1, 0, -1, -2, -3, -4, -5, -6], data)  # k = 3
+    np.testing.assert_allclose(row[list("ABC")], [2 / 3, 1 / 3, 0.0], atol=1e-8)
+    np.testing.assert_allclose(row[list("HIJ")], [0.0, -1 / 3, -2 / 3], atol=1e-8)
+    assert (row[list("DEFG")] == 0.0).all()
+    assert row["C"] > 0.0 > row["H"]  # in the bucket, at weight ~1e-9
+    # with k = 2 each side is in effect a single name
+    pair = _one_row(
+        QuantileLongShort(quantile=0.2, weighting="score", max_weight=1.0, min_names=2),
+        [3, 2, 1, 0, -1, -2, -3, -4, -5, -6], data,
+    )
+    np.testing.assert_allclose(pair[["A", "B", "I", "J"]], [1.0, 0.0, 0.0, -1.0], atol=1e-8)
+
+
 def test_score_weighting_monotone_within_buckets(market_simple):
     ctor = QuantileLongShort(
         quantile=0.5, weighting="score", gross_leverage=2.0, max_weight=1.0, min_names=2
@@ -299,6 +452,114 @@ def test_vol_target_scale_matches_hand_formula():
         expected = cap_weights((w * scale).to_frame().T, 1.0).iloc[0]
         np.testing.assert_allclose(scaled.loc[t], expected, rtol=1e-12, atol=1e-15)
         assert scaled.loc[t].abs().max() <= 1.0 + 1e-12
+
+
+def _calm_market(**kwargs):
+    return make_market(
+        n_assets=6, n_days=300, seed=5, base_vol=0.02, split_asset=False, **kwargs
+    )
+
+
+def test_vol_target_scale_is_clipped_at_the_max_scale_and_recapped():
+    assert VOL_TARGET_MAX_SCALE == 3.0  # documented bound: gross <= 3x gross_leverage
+    calm = _calm_market(universe_churn=False)
+    scores = _scores(calm)
+    kwargs = dict(quantile=0.5, gross_leverage=2.0, min_names=2, vol_lookback=63)
+    raw = QuantileLongShort(vol_target=None, max_weight=10.0, **kwargs).weights(scores, calm)
+    # an unreachable target on a calm panel pins the scale at the clamp
+    levered = QuantileLongShort(vol_target=5.0, max_weight=10.0, **kwargs).weights(scores, calm)
+    np.testing.assert_allclose(levered.iloc[100:], 3.0 * raw.iloc[100:], rtol=1e-12, atol=1e-15)
+    np.testing.assert_allclose(levered.iloc[100:].abs().sum(axis=1), 6.0, rtol=1e-12)
+    # the per-name cap is re-applied AFTER scaling: 3 names a side x 0.5
+    capped = QuantileLongShort(vol_target=5.0, max_weight=0.5, **kwargs).weights(scores, calm)
+    assert capped.abs().to_numpy().max() <= 0.5 + 1e-12
+    np.testing.assert_allclose(capped.iloc[100:].abs().sum(axis=1), 3.0, atol=1e-9)
+    pd.testing.assert_frame_equal(capped.iloc[100:], cap_weights(3.0 * raw.iloc[100:], 0.5))
+    # with a cap that binds only for some names, the excess is redistributed
+    partly = QuantileLongShort(
+        vol_target=5.0, weighting="score", max_weight=1.5, **kwargs
+    ).weights(scores, calm)
+    raw_score = QuantileLongShort(
+        vol_target=None, weighting="score", max_weight=10.0, **kwargs
+    ).weights(scores, calm)
+    assert (3.0 * raw_score.iloc[100:]).abs().to_numpy().max() > 1.5  # the cap does bind
+    pd.testing.assert_frame_equal(partly.iloc[100:], cap_weights(3.0 * raw_score.iloc[100:], 1.5))
+
+
+def test_vol_target_warm_up_rows_keep_unscaled_weights():
+    # no name has vol_lookback // 2 = 20 returns before row 20: there is no
+    # estimate at all, and the documented choice is the unscaled book
+    calm = _calm_market(universe_churn=False)
+    scores = _scores(calm)
+    kwargs = dict(quantile=0.5, gross_leverage=2.0, max_weight=10.0, min_names=2, vol_lookback=40)
+    raw = QuantileLongShort(vol_target=None, **kwargs).weights(scores, calm)
+    scaled = QuantileLongShort(vol_target=5.0, **kwargs).weights(scores, calm)
+    np.testing.assert_allclose(raw.iloc[:20].abs().sum(axis=1), 2.0, rtol=1e-12)
+    pd.testing.assert_frame_equal(scaled.iloc[:20], raw.iloc[:20])
+    # the estimate exists from exactly row 20 (returns 1..20) on
+    np.testing.assert_allclose(scaled.iloc[20:30], 3.0 * raw.iloc[20:30], rtol=1e-12, atol=1e-15)
+
+
+def test_vol_target_stays_on_when_a_held_name_lacks_vol_history():
+    """One held name without a vol estimate (a new entrant under a fast
+    signal) used to drop the whole row back to scale 1.0, so the gross
+    jumped from the vol-scaled level to the full gross_leverage."""
+    data = make_market(
+        n_assets=12, n_days=400, seed=7, base_vol=0.40, split_asset=False, universe_churn=True
+    )
+    entrant = data.tickers[-1]
+    entry = int(np.flatnonzero(data.universe[entrant].to_numpy())[0])
+    scores = _scores(data)
+    scores[entrant] = 10.0  # top score from its first tradable day
+    kwargs = dict(quantile=0.25, gross_leverage=2.0, max_weight=0.5, min_names=4, vol_lookback=63)
+    raw = QuantileLongShort(vol_target=None, **kwargs).weights(scores, data)
+    scaled = QuantileLongShort(vol_target=0.05, **kwargs).weights(scores, data)
+
+    young = slice(entry, entry + 31)  # held, but fewer than 31 returns of its own
+    sigma = data.returns().rolling(63, min_periods=31).std()
+    assert (raw[entrant].iloc[young] > 0).all()
+    assert sigma[entrant].iloc[young].isna().all() and sigma[entrant].iloc[entry + 31] > 0
+
+    gross = scaled.abs().sum(axis=1)
+    # a 40%-vol market against a 5% target: far below the unscaled 2.0 ...
+    assert gross.iloc[entry - 40 : entry].max() < 0.5
+    # ... and it stays vol-scaled through the entrant's first month
+    assert gross.iloc[young].max() < 0.5
+
+    # hand formula: the entrant carries the largest trailing vol known that day
+    for pos in (entry, entry + 15, entry + 30):
+        t = data.dates[pos]
+        w = raw.loc[t]
+        s = sigma.loc[t].copy()
+        s[entrant] = sigma.loc[t].max()
+        est = np.sqrt((w.pow(2) * s.pow(2)).sum())
+        scale = np.clip(0.05 / np.sqrt(252) / est, 0.0, 3.0)
+        expected = cap_weights((w * scale).to_frame().T, 0.5).iloc[0]
+        np.testing.assert_allclose(scaled.loc[t], expected, rtol=1e-12, atol=1e-15)
+    # once it has its own estimate the proxy is gone
+    t = data.dates[entry + 31]
+    est = np.sqrt((raw.loc[t].pow(2) * sigma.loc[t].pow(2)).sum())
+    np.testing.assert_allclose(
+        scaled.loc[t], raw.loc[t] * (0.05 / np.sqrt(252) / est), rtol=1e-12, atol=1e-15
+    )
+
+
+def test_vol_target_with_entrant_is_point_in_time():
+    # the proxy is a same-date cross-sectional maximum: truncating the panel
+    # at t must not change row t
+    data = make_market(
+        n_assets=12, n_days=400, seed=7, base_vol=0.40, split_asset=False, universe_churn=True
+    )
+    entrant = data.tickers[-1]
+    entry = int(np.flatnonzero(data.universe[entrant].to_numpy())[0])
+    scores = _scores(data)
+    scores[entrant] = 10.0
+    ctor = QuantileLongShort(quantile=0.25, max_weight=0.5, vol_target=0.05, min_names=4)
+    full = ctor.weights(scores, data)
+    for pos in (entry, entry + 10, entry + 30):
+        t = data.dates[pos]
+        sub = ctor.weights(scores.loc[:t], data.slice_until(t))
+        np.testing.assert_allclose(sub.loc[t].to_numpy(), full.loc[t].to_numpy(), atol=1e-12)
 
 
 # ---------------------------------------------------------------------------

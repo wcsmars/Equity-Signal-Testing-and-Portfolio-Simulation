@@ -97,9 +97,15 @@ def test_from_config_dispatch():
 
 def test_from_config_unknown_model():
     with pytest.raises(ConfigError):
-        from_config(CostConfig(model="bogus"))
+        from_config(CostConfig(model="bogus"))  # rejected by the schema itself
     with pytest.raises(ConfigError):
         from_config({"model": "zero"})  # not a CostConfig
+    # A config object can be mutated after validation: from_config must
+    # still refuse a model it does not know instead of picking a default.
+    cfg = CostConfig(model="zero")
+    object.__setattr__(cfg, "model", "bogus")
+    with pytest.raises(ConfigError, match="unknown cost model 'bogus'"):
+        from_config(cfg)
 
 
 def test_bad_params_raise_config_error():
@@ -325,7 +331,8 @@ def test_participation_cap_engages():
         commission_per_share=0.0, half_spread_bps=0.0, impact_coeff=0.1,
         adv_window=20, vol_window=10,
     )
-    cost = model.cost(trades, data, nav)
+    with pytest.warns(UserWarning, match=r"2x ADV cap on 1 of 1 traded cells"):
+        cost = model.cost(trades, data, nav)
 
     vol = _alt_vol(lo, hi, window=10)
     adv = 50.0 * (lo + hi) / 2.0
@@ -336,6 +343,75 @@ def test_participation_cap_engages():
     uncapped = 1.0 * 0.1 * vol * math.sqrt(raw_participation)
     assert cost.loc[t] == pytest.approx(capped, rel=1e-9)
     assert cost.loc[t] < uncapped
+
+    # warns ONCE per model instance, and what it warns about is real: past
+    # the cap the modelled cost no longer grows with the book
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        bigger = model.cost(trades, data, nav * 1e3)
+    assert bigger.loc[t] == pytest.approx(cost.loc[t], rel=1e-12)
+
+
+def test_no_cap_warning_when_the_cap_does_not_bind_or_impact_is_off():
+    data = _alternating_market(volume=50.0)
+    trades = _zero_trades(data)
+    trades.loc[data.dates[60], "AAA"] = 1.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        # 1% of ADV: nothing is capped
+        RealisticCost(adv_window=20, vol_window=10).cost(trades, data, 50.0)
+        # far beyond the cap, but there is no impact term to mis-state
+        RealisticCost(impact_coeff=0.0, adv_window=20, vol_window=10).cost(trades, data, 1e8)
+
+
+def test_zero_volume_ticker_is_priced_at_the_cap():
+    # A zero-ADV name has infinite participation: it must be charged the
+    # capped impact, not the (much cheaper) missing-history fallback.
+    lo, hi = 100.0, 104.0
+    data = _alternating_market(lo, hi, volume=0.0)
+    trades = _zero_trades(data)
+    t = data.dates[60]
+    trades.loc[t, "AAA"] = 0.01
+    model = RealisticCost(
+        commission_per_share=0.0, half_spread_bps=0.0, impact_coeff=0.1,
+        adv_window=20, vol_window=10,
+    )
+    with pytest.warns(UserWarning, match="ADV cap on 1 of 1 traded cells"):
+        cost = model.cost(trades, data, NAV)
+    vol = _alt_vol(lo, hi, window=10)
+    assert cost.loc[t] == pytest.approx(
+        0.01 * 0.1 * vol * math.sqrt(RealisticCost.PARTICIPATION_CAP), rel=1e-9
+    )
+    fallback = 0.01 * 0.1 * vol * math.sqrt(RealisticCost.PARTICIPATION_FALLBACK)
+    assert cost.loc[t] > 6.0 * fallback  # sqrt(2 / 0.05) ~ 6.3
+
+
+def test_missing_volume_panel_uses_fallback_participation_and_warns():
+    lo, hi = 100.0, 104.0
+    with_volume = _alternating_market(lo, hi)
+    data = MarketData.from_frames(with_volume.close, unadjusted_close=with_volume.close.copy())
+    assert data.volume is None
+    trades = _zero_trades(data)
+    t = data.dates[60]
+    trades.loc[t, "AAA"] = 0.5
+    model = RealisticCost(
+        commission_per_share=0.0, half_spread_bps=0.0, impact_coeff=0.1,
+        adv_window=20, vol_window=10,
+    )
+    with pytest.warns(UserWarning, match="no volume"):
+        cost = model.cost(trades, data, NAV)
+    expected = 0.5 * 0.1 * _alt_vol(lo, hi, window=10) * math.sqrt(RealisticCost.PARTICIPATION_FALLBACK)
+    assert cost.loc[t] == pytest.approx(expected, rel=1e-9)
+    assert expected > 0.0  # not free trading
+
+    # warns ONCE per model instance, and the cost is the same for any book
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        huge = model.cost(trades, data, NAV * 1e6)
+        # nothing traded, or no impact term: nothing to warn about
+        RealisticCost().cost(_zero_trades(data), data, NAV)
+        RealisticCost(impact_coeff=0.0).cost(trades, data, NAV)
+    assert huge.loc[t] == pytest.approx(expected, rel=1e-9)
 
 
 def test_negative_volume_cannot_silently_eliminate_impact():
@@ -381,7 +457,7 @@ def test_missing_unadjusted_close_warns_and_falls_back():
 
     # warns ONCE per model instance: a second call is silent
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error", UserWarning)
         model.cost(trades, data, NAV)
 
 

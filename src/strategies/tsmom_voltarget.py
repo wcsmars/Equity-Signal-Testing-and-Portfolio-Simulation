@@ -17,8 +17,11 @@ There is no untouched holdout claim. Under common binding constraints,
 volatility scaling cancels the two normalization schemes' scalar difference.
 
 Run the module to write computed CSV/JSON results; --quiet hides the table.
+A saved result file that differs from the new run is kept and the new output
+goes to results/recomputed/ instead; pass --rebase to replace the saved files.
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -28,12 +31,12 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "src" / "strategies"))
 
 from qcore.backtest import TRADING_DAYS, MAX_ABS_WEIGHT, _resolve_cash_rate, metrics, run_backtest  # noqa: E402
 from qcore.costs import IBKRHKCostModel  # noqa: E402
 from qcore.data import load_indices, load_prices  # noqa: E402
-from tsmom_trend import (  # noqa: E402
+from qcore.records import save_csv, save_json  # noqa: E402
+from strategies.tsmom_trend import (  # noqa: E402
     CASH, RISK, SLIPPAGE_BPS, build_signals, month_end_weights, to_daily_drift,
 )
 
@@ -180,8 +183,7 @@ def sweep(px, sigs, elig, vol_me, shy_ok):
     df["duplicate_of"] = df.variant.where(
         df.variant.str.startswith("conc_vt10_"), ""
     ).str.replace("conc_", "dilute_", regex=False)
-    (ROOT / "results").mkdir(parents=True, exist_ok=True)
-    df.to_csv(ROOT / "results" / "tsmom_voltarget_variants.csv", index=False)
+    save_csv(ROOT / "results" / "tsmom_voltarget_variants.csv", df, index=False)
     return df, runs
 
 
@@ -238,13 +240,20 @@ def main():
             "Selection depends on the data snapshot, costs and rounded in-sample metrics.",
         ],
     }
-    (ROOT / "results").mkdir(exist_ok=True)
-    with open(ROOT / "results" / "tsmom_voltarget.json", "w") as f:
-        json.dump(out, f, indent=2)
+    save_json(ROOT / "results" / "tsmom_voltarget.json", out)
     print(f"\nselected variant by configured rule: {winner}"
           f"   (unconstrained IS-Sharpe max: {sharpe_max})")
     print(json.dumps(m, indent=2))
 
 
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--quiet", action="store_true", help="do not print the sweep table")
+    parser.add_argument("--rebase", action="store_true",
+                        help="replace the saved variants CSV and JSON when this run differs from them")
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
+    _parse_args()
     main()

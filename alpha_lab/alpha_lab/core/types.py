@@ -17,6 +17,12 @@ from alpha_lab.core.errors import DataError
 
 TRADING_DAYS_PER_YEAR = 252
 
+#: Date spellings accepted from files and configs: a full ISO 8601 calendar
+#: date, optionally with a time of day and without a UTC offset, or compact
+#: YYYYMMDD. Anything else (``10/01/2024``) needs a guess at the day/month
+#: order, and a guess made cell by cell can reorder a price history.
+ISO_DATE_PATTERN = r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?|\d{8}"
+
 #: optional fields, all aligned to close when present
 _OPTIONAL_FIELDS = ("open", "high", "low", "volume", "unadjusted_close", "universe")
 
@@ -60,15 +66,31 @@ class MarketData:
             frame = fields.get(name)
             if frame is None:
                 aligned[name] = None
-            elif name == "universe":
+                continue
+            # Reindexing needs unique source labels; report a repeated date or
+            # ticker by field name instead of a bare pandas reindex error.
+            if not isinstance(frame, pd.DataFrame):
+                raise DataError(f"{name} must be a DataFrame")
+            if frame.index.has_duplicates:
+                raise DataError(f"{name} has duplicate dates")
+            if frame.columns.has_duplicates:
+                raise DataError(f"{name} has duplicate tickers")
+            if name == "universe":
                 if (not all(is_bool_dtype(dt) for dt in frame.dtypes)
                         and not frame.map(lambda value: pd.isna(value) or isinstance(value, (bool, np.bool_))).all().all()):
                     raise DataError("universe must contain boolean values (missing cells are False)")
-                aligned[name] = (
-                    frame.reindex(index=close.index, columns=close.columns)
-                    .fillna(False)
-                    .astype(bool)
-                )
+                # fill_value covers the cells the reindex adds, so a boolean
+                # frame stays boolean. Reindexing first and filling the
+                # resulting object frame would warn on pandas 2.2/2.3.
+                universe = frame.reindex(index=close.index, columns=close.columns, fill_value=False)
+                if not all(dt == bool for dt in universe.dtypes):
+                    # missing cells that were already in the frame
+                    universe = pd.DataFrame(
+                        np.where(universe.notna().to_numpy(), universe.to_numpy(dtype=object), False).astype(bool),
+                        index=universe.index,
+                        columns=universe.columns,
+                    )
+                aligned[name] = universe
             else:
                 aligned[name] = frame.reindex(index=close.index, columns=close.columns)
         return cls(close=close, **aligned)
@@ -150,11 +172,13 @@ class MarketData:
         return self._iloc(slice(lo, hi))
 
     def _iloc(self, rows: slice) -> "MarketData":
+        # Copies, not views: writing to a slice must never change the parent
+        # panel (without copy-on-write a positional slice shares its memory).
         def cut(frame: pd.DataFrame | None) -> pd.DataFrame | None:
-            return None if frame is None else frame.iloc[rows]
+            return None if frame is None else frame.iloc[rows].copy()
 
         return MarketData(
-            close=self.close.iloc[rows],
+            close=cut(self.close),
             open=cut(self.open),
             high=cut(self.high),
             low=cut(self.low),

@@ -184,6 +184,15 @@ class TestPsrDsr:
         assert math.isnan(m.norm_ppf(1.0))
         assert math.isnan(m.norm_ppf(-0.1))
 
+    def test_norm_ppf_accepts_numpy_scalars(self):
+        # np.float32 is not a Python float; it used to fall through to NaN
+        assert m.norm_ppf(np.float64(0.975)) == m.norm_ppf(0.975)
+        assert m.norm_ppf(np.float32(0.975)) == m.norm_ppf(float(np.float32(0.975)))
+        assert m.norm_ppf(np.float32(0.975)) == pytest.approx(1.96, abs=1e-4)
+        assert math.isnan(m.norm_ppf(True))
+        assert math.isnan(m.norm_ppf("0.5"))
+        assert math.isnan(m.norm_ppf(None))
+
     def test_norm_cdf_roundtrip(self):
         for p in (0.05, 0.3, 0.5, 0.9, 0.999):
             assert m.norm_cdf(m.norm_ppf(p)) == pytest.approx(p, abs=1e-8)
@@ -289,7 +298,8 @@ class TestSummary:
     def test_summary_keys_and_json(self):
         s = m.summary(self._result(), n_trials=5)
         assert set(s) == SUMMARY_KEYS
-        json.dumps(s)  # every value json-serializable
+        # strict JSON: on a well-behaved series no value is NaN or infinite
+        json.dumps(s, allow_nan=False)
         for key, val in s.items():
             assert isinstance(val, (float, int, str)), f"{key}: {type(val)}"
 
@@ -318,6 +328,48 @@ class TestSummary:
         assert s["dsr"] == m.dsr(net, 5)
         assert s["sharpe_se_ann"] == pytest.approx(m.sharpe_se(net) * math.sqrt(252), rel=1e-12)
         assert m.summary(result, n_trials=np.int64(5))["dsr"] == s["dsr"]
+
+    def test_summary_net_statistics_are_not_computed_from_gross(self):
+        rng = np.random.default_rng(9)
+        idx = pd.bdate_range("2019-01-02", periods=300)
+        gross = pd.Series(rng.normal(0.0002, 0.008, 300), index=idx)
+        costs = pd.Series(0.0005, index=idx)  # large enough to flip many days
+        net = gross - costs
+        weights = pd.DataFrame({"SYMA": 0.5, "SYMB": -0.5}, index=idx, dtype=float)
+        s = m.summary(BacktestResult(
+            gross_returns=gross, costs=costs, net_returns=net,
+            turnover=pd.Series(0.1, index=idx), holdings=weights.copy(),
+            target_weights=weights, meta={"mode": "insample"},
+        ))
+        assert s["sortino"] == m.sortino(net) != m.sortino(gross)
+        assert s["hit_rate"] == m.hit_rate(net) != m.hit_rate(gross)
+        assert s["calmar"] == m.calmar(net) != m.calmar(gross)
+        assert s["max_drawdown"] == m.max_drawdown(net)["depth"] != m.max_drawdown(gross)["depth"]
+        assert s["max_drawdown_trough"] == m.max_drawdown(net)["trough_date"].isoformat()
+        assert s["ann_return_net"] == m.ann_return(net)
+        assert s["ann_return_gross"] == m.ann_return(gross)
+
+    def test_hit_rate_counts_strictly_positive_days(self):
+        assert m.hit_rate(_series([0.01, 0.0, 0.0, -0.01])) == 0.25
+
+    @pytest.mark.parametrize("n_trials,stored", [(5, 5), (5.0, 5), (np.int64(5), 5), (2.5, 2.5),
+                                                 (np.float32(2.5), 2.5), (0, 0)])
+    def test_summary_reports_the_trial_count_it_deflated_by(self, n_trials, stored):
+        result = self._result()
+        s = m.summary(result, n_trials=n_trials)
+        # int() used to truncate 2.5 to 2 while the DSR was deflated by 2.5
+        assert s["n_trials"] == stored and type(s["n_trials"]) is type(stored)
+        expected = m.dsr(result.net_returns, n_trials)
+        assert s["dsr"] == expected or (math.isnan(s["dsr"]) and math.isnan(expected))
+        if stored == 2.5:
+            assert m.dsr(result.net_returns, 3) < s["dsr"] < m.dsr(result.net_returns, 2)
+
+    @pytest.mark.parametrize("n_trials", [None, "3", float("nan"), float("inf"), True])
+    def test_summary_never_raises_on_an_unusable_trial_count(self, n_trials):
+        s = m.summary(self._result(), n_trials=n_trials)  # None used to raise TypeError
+        assert math.isnan(s["dsr"]) and math.isnan(s["n_trials"])
+        assert isinstance(s["n_trials"], float)
+        assert s["psr"] == m.summary(self._result())["psr"]  # the rest is unaffected
 
     def test_walkforward_summary_trims_flat_prefix(self):
         """Regression: metrics of a walk-forward result must cover the ACTIVE
@@ -351,6 +403,32 @@ class TestSummary:
         assert s["sharpe_net"] == pytest.approx(m.sharpe(active), rel=1e-12)
         assert s["hit_rate"] == pytest.approx(m.hit_rate(active), rel=1e-12)
         assert s["turnover_daily_mean"] == pytest.approx(0.2, rel=1e-12)
+
+    def test_walkforward_summary_trims_gross_and_costs_too(self):
+        from alpha_lab.core.results import WalkForwardWindow
+
+        rng = np.random.default_rng(3)
+        idx = pd.bdate_range("2019-01-02", periods=300)
+        prefix = 120
+        gross = pd.Series(0.0, index=idx)
+        gross.iloc[prefix:] = rng.normal(0.0008, 0.008, 300 - prefix)
+        costs = pd.Series(0.0, index=idx)
+        costs.iloc[prefix:] = 0.0002
+        turnover = pd.Series(0.0, index=idx)
+        turnover.iloc[prefix:] = 0.2
+        weights = pd.DataFrame({"SYMA": 0.5, "SYMB": -0.5}, index=idx, dtype=float)
+        result = BacktestResult(
+            gross_returns=gross, costs=costs, net_returns=gross - costs, turnover=turnover,
+            holdings=weights.copy(), target_weights=weights,
+            windows=[WalkForwardWindow(idx[0], idx[prefix - 6], idx[prefix], idx[-1])],
+            meta={"mode": "walkforward"},
+        )
+        s = m.summary(result)
+        assert s["cost_drag_ann"] == pytest.approx(0.0002 * 252, rel=1e-12)
+        assert s["sharpe_gross"] == pytest.approx(m.sharpe(gross.iloc[prefix:]), rel=1e-12)
+        assert s["ann_return_gross"] == pytest.approx(m.ann_return(gross.iloc[prefix:]), rel=1e-12)
+        assert s["turnover_ann"] == pytest.approx(0.2 * 252, rel=1e-12)
+        assert s["n_windows"] == 1 and s["mode"] == "walkforward"
 
 
 # --------------------------------------------------------------------------

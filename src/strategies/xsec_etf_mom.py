@@ -11,8 +11,22 @@ Default execution prints metrics for the buffered, drifting rule. --sweep
 retains an earlier unbuffered, daily-retargeted parameter grid; it does not
 reconstruct selection of every parameter in the default specification.
 The fixed 2018 split should not be interpreted as an untouched holdout.
+--sweep prints the grid and saves it to results/xsec_etf_mom_variants.csv; a
+saved table that differs from the new run is kept and the new one is written
+to results/recomputed/ unless --rebase is given. Unknown flags are rejected.
+
+Reported statistics begin at the first position, not at the first decision.
+Every variant decides from the 15th month-end, but with the breaker on the
+rule can spend its first months in modeled cash, which the engine trims, so
+breaker-on and breaker-off variants are scored over different windows.
+
+A blank month-end close after a ticker's first close raises an error naming
+the ticker and date. Without that check a blank SPY close would read as
+risk-on, a blank member close would drop the name from the ranking, and a
+blank IEF close would leave the portfolio in cash.
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -27,6 +41,7 @@ from qcore.backtest import drift_weights, metrics, run_backtest  # noqa: E402
 from qcore.calendar import confirmed_month_ends  # noqa: E402
 from qcore.costs import IBKRHKCostModel  # noqa: E402
 from qcore.data import load_prices  # noqa: E402
+from qcore.records import save_csv  # noqa: E402
 
 EQ_UNIVERSE = [
     # US broad + style/size
@@ -41,7 +56,7 @@ EQ_UNIVERSE = [
 DEFENSIVE = "IEF"
 LOOKBACKS = (3, 6, 12)
 SMA_MONTHS = 10           # breaker: SPY vs 10-month SMA (fixed, not swept)
-MIN_HISTORY_MONTHS = 14   # common start across variants (skip needs 13)
+MIN_HISTORY_MONTHS = 14   # first decision row for every variant (skip needs 13)
 SLIPPAGE_BPS = 3.0        # sector/country ETF class
 
 BEST_PARAMS = {"k": 3, "skip": False, "breaker": True, "buffer": 9, "drift": True}
@@ -55,15 +70,30 @@ def month_end_closes(px: pd.DataFrame) -> pd.DataFrame:
     return px.loc[confirmed_month_ends(px.index)]
 
 
+def _require_closes(closes: pd.DataFrame) -> None:
+    """Raise when a ticker has a blank month-end close after its first one."""
+    present = closes.notna().to_numpy()
+    rows, cols = np.nonzero(~present & np.maximum.accumulate(present, axis=0))
+    if len(rows):
+        cells = [f"{closes.columns[c]} {closes.index[r].date()}"
+                 for r, c in zip(rows[:10], cols[:10])]
+        raise ValueError(
+            f"blank month-end close after listing in {len(rows)} cell(s): {', '.join(cells)}. "
+            "The rule would silently change the breaker or the ranking; "
+            "repair the price cache.")
+
+
 def build_targets(px: pd.DataFrame, k: int, skip: bool, breaker: bool,
                   buffer: int) -> pd.DataFrame:
-    """Monthly decision rows (post-trade target weights at month-end closes)."""
+    """Monthly decision rows (post-trade target weights at month-end closes).
+    Fails closed on a blank decision close after listing (module docstring)."""
     if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or not 1 <= k <= len(EQ_UNIVERSE):
         raise ValueError("k must be an integer within the equity universe")
     if isinstance(buffer, bool) or not isinstance(buffer, (int, np.integer)) or buffer < k:
         raise ValueError("buffer must be an integer >= k")
     cols = EQ_UNIVERSE + [DEFENSIVE]
     m = month_end_closes(px[cols])
+    _require_closes(m)
 
     parts = []
     for lb in LOOKBACKS:
@@ -81,7 +111,7 @@ def build_targets(px: pd.DataFrame, k: int, skip: bool, breaker: bool,
     held: list = []
     for i, t in enumerate(m.index):
         if i < MIN_HISTORY_MONTHS:
-            continue  # common warm-up so all variants start together
+            continue  # warm-up: same first decision month for every variant
         if breaker and bool(risk_off.loc[t]):
             held = []  # book liquidated into IEF: hysteresis memory gone
             if not np.isnan(m.loc[t, DEFENSIVE]):
@@ -126,7 +156,7 @@ def run_variant(px: pd.DataFrame, k: int, skip: bool, breaker: bool,
 
 def sweep() -> pd.DataFrame:
     """Legacy 12-variant blend/K/breaker selection sweep (B=K, daily
-    re-target accounting) — regenerates results/xsec_etf_mom_variants.csv."""
+    re-target accounting) — the rule behind results/xsec_etf_mom_variants.csv."""
     px = load_prices()
     rows = []
     for skip in (False, True):
@@ -156,12 +186,18 @@ def sweep() -> pd.DataFrame:
 
 
 def main() -> None:
-    if "--sweep" in sys.argv:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--sweep", action="store_true",
+                    help="re-run the legacy 12-variant grid instead of the default rule")
+    ap.add_argument("--rebase", action="store_true",
+                    help="with --sweep: replace the saved variants table if this run differs")
+    args = ap.parse_args()  # --rebase itself is read by qcore.records
+
+    if args.sweep:
         df = sweep()
-        out = ROOT / "results" / "xsec_etf_mom_variants.csv"
-        out.parent.mkdir(exist_ok=True)
-        df.to_csv(out, index=False)
-        print(f"\nsaved {out}")
+        print()
+        # saved table is kept if this run differs (see qcore.records)
+        save_csv(ROOT / "results" / "xsec_etf_mom_variants.csv", df, index=False)
         best = df.sort_values("is_sharpe", ascending=False).iloc[0]
         print("best by IS Sharpe:", best["name"])
         return

@@ -10,6 +10,7 @@ membership and delisted names. Neither absolute returns nor performance
 relative to that same universe estimates an unbiased investable result.
 Run the module to print descriptive metrics for the locally obtained cache.
 """
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -31,6 +32,11 @@ LAM = 0.25       # short-term-reversal tilt weight
 VOL_WIN = 63     # trailing window (days) for inverse-vol weights
 MIN_NAMES = 20   # minimum eligible names before trading
 SLIPPAGE_BPS = 5.0
+
+
+def run_name(K: int = K, lam: float = LAM) -> str:
+    """Name of the backtest run for one (K, lam) variant."""
+    return f"xsec_stock_mom_K{K}_lam{lam:g}"
 
 
 def build_weights(px: pd.DataFrame, K: int = K, lam: float = LAM) -> pd.DataFrame:
@@ -76,11 +82,17 @@ def main():
     px = load_prices()[STOCK_UNIVERSE]
     w = build_weights(px)
     res = run_backtest(w, px, IBKRHKCostModel(slippage_bps=SLIPPAGE_BPS),
-                       name=f"xsec_stock_mom_K{K}_lam{LAM:g}")
+                       name=run_name())
     m = metrics(res)
     print(json.dumps(m, indent=2))
     return m
 
 
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
+    _parse_args()
     main()

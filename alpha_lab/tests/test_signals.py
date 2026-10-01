@@ -18,7 +18,7 @@ from alpha_lab.core.types import MarketData
 from alpha_lab.data.synthetic import make_market
 from alpha_lab.features.library import Momentum, WindowReturn
 from alpha_lab.features.store import FeatureStore
-from alpha_lab.signals.momentum import CrossSectionalMomentum
+from alpha_lab.signals.momentum import CrossSectionalMomentum, cross_sectional_zscore
 from alpha_lab.signals.registry import SIGNALS, build_signal
 from alpha_lab.signals.reversal import ShortTermReversal
 
@@ -161,6 +161,37 @@ def test_zero_dispersion_row_is_nan():
     # constant prices -> every 5-day return is exactly 0 -> row std 0
     scores = _score(ShortTermReversal(window=5), data)
     assert scores.isna().all().all()
+
+
+def test_zero_dispersion_row_with_rounding_residue_is_nan():
+    # the mean of six 0.1 cells is 0.10000000000000002, so their std is
+    # 1.5e-17 rather than 0: residue, which must not be scaled into scores
+    assert pd.DataFrame([[0.1] * 6]).std(axis=1).iloc[0] > 0.0  # the trap is real
+    for value in (0.1, -0.1, 0.3, 1.0 / 3.0, 1e-9, 1e6 + 0.1):
+        scores = cross_sectional_zscore(pd.DataFrame([[value] * 6]), 5)
+        assert scores.isna().all().all(), value
+
+    # six names growing exactly 1% a day from different levels: equal 5-day
+    # returns up to the last bit, so there is nothing to rank
+    dates = pd.bdate_range("2020-01-01", periods=40)
+    levels = np.array([10.0, 33.3, 57.1, 101.7, 250.9, 999.3])
+    close = pd.DataFrame(
+        np.outer(1.01 ** np.arange(40), levels), index=dates, columns=[f"S{i}" for i in range(6)]
+    )
+    assert _score(ShortTermReversal(window=5), MarketData.from_frames(close)).isna().all().all()
+
+
+def test_small_but_real_dispersion_is_still_scored():
+    # the zero-dispersion gate is relative (1e-12 of the row's largest
+    # |value|): a spread a million times above it must standardize normally,
+    # at any overall scale
+    for scale in (1e-9, 1.0, 1e9):
+        row = pd.DataFrame([scale * (1.0 + 1e-6 * np.arange(6.0))])
+        scores = cross_sectional_zscore(row, 5)
+        assert scores.notna().all().all()
+        assert scores.iloc[0].is_monotonic_increasing
+        np.testing.assert_allclose(scores.iloc[0].std(), 1.0, rtol=1e-6)
+        np.testing.assert_allclose(scores.iloc[0].mean(), 0.0, atol=1e-6)
 
 
 # --------------------------------------------------------------------------

@@ -7,9 +7,11 @@ assume execution at that close; the engine credits subsequent returns and
 charges fixed commissions plus 3 bps per side in assumed slippage.
 
 The retained parameters are research examples, not a validated investment
-recommendation. Run this module to print metrics for the local cache.
+recommendation. Run this module to print metrics for the local cache; it
+takes no options and rejects unknown flags.
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -102,4 +104,5 @@ def main() -> dict:
 
 
 if __name__ == "__main__":
+    argparse.ArgumentParser(description=__doc__.split("\n")[0]).parse_args()
     print(json.dumps(main(), indent=2))

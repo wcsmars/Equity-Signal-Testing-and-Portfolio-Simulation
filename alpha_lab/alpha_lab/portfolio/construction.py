@@ -27,6 +27,13 @@ CONSTRUCTORS = Registry("constructor")
 #: (all scores equal -> every name gets eps -> equal weights)
 _EPS = 1e-9
 
+#: largest multiple by which vol targeting may scale a row. The constructor
+#: builds the book at ``gross_leverage`` first and scales it afterwards, so
+#: with ``vol_target`` set the gross can reach
+#: ``VOL_TARGET_MAX_SCALE * gross_leverage`` in a calm market (and
+#: ``max_weight`` is then the only other bound). Not a config field.
+VOL_TARGET_MAX_SCALE = 3.0
+
 
 @CONSTRUCTORS.register("quantile_long_short")
 class QuantileLongShort(PortfolioConstructor):
@@ -36,16 +43,32 @@ class QuantileLongShort(PortfolioConstructor):
     (NaN and +-inf count as no opinion):
     ``k = max(1, floor(n * quantile))`` names go in each bucket. ``equal``
     weighting spreads gross_leverage/2 evenly per side; ``score`` weighting
-    is proportional to the score's distance from the bucket's worst score.
+    is proportional to the score's distance from the bucket's worst score,
+    so the bucket's least extreme name gets (almost) no weight: a k-name
+    bucket holds k - 1 names in effect, and with k = 2 the whole side sits
+    on one name, limited only by ``max_weight``.
     Dates with fewer than ``max(min_names, 2)`` valid names get an all-zero
-    row. Weights are 0.0 (never NaN) outside the effective universe.
+    row, and so do dates whose valid scores are all equal (no dispersion is
+    no opinion). Weights are 0.0 (never NaN) outside the effective universe.
 
-    With ``vol_target`` set (annualized), each row is scaled by
-    ``clip(target_daily / est_t, 0, 3)`` where ``est_t`` is a diagonal
-    portfolio-vol estimate from trailing per-name vol through t, then the
-    per-name cap is re-applied. Rows with no usable estimate keep their
-    unscaled weights: rows holding nothing, and rows where any held name
-    lacks ``vol_lookback // 2`` days of return history (e.g. a new entrant).
+    Ties never depend on column order. When the score at a bucket's edge is
+    shared by names on both sides of the edge, the whole tied group joins
+    the bucket and splits the slots it straddles equally (m names tied over
+    j slots each get j/m of a slot). A group tied across both edges is long
+    and short at once and nets out, so such a row holds less than
+    ``gross_leverage``.
+
+    ``gross_leverage`` is the gross of the book BEFORE vol targeting. With
+    ``vol_target`` set (annualized), each row is then scaled by
+    ``clip(target_daily / est_t, 0, VOL_TARGET_MAX_SCALE)`` (3x), where
+    ``est_t`` is a diagonal portfolio-vol estimate from trailing per-name
+    vol through t, and the per-name cap is re-applied: gross can fall below
+    ``gross_leverage`` or rise to 3x that figure. A held name with fewer
+    than ``vol_lookback // 2`` days of return history (e.g. a new entrant)
+    is given the largest trailing vol known on that date, so one untested
+    name neither counts as riskless nor switches the scaling off. Rows with
+    no estimate at all keep their unscaled weights: rows holding nothing,
+    and the warm-up rows before ANY name has ``vol_lookback // 2`` returns.
     """
 
     def __init__(
@@ -95,10 +118,11 @@ class QuantileLongShort(PortfolioConstructor):
         """Target weight panel aligned to ``scores`` (same index/columns)."""
         if not isinstance(scores, pd.DataFrame):
             raise DataError("scores must be a wide DataFrame (dates x tickers)")
+        # fill_value keeps the frame boolean: dates or tickers the data does
+        # not carry are simply outside the universe
         eff = (
             data.effective_universe()
-            .reindex(index=scores.index, columns=scores.columns)
-            .fillna(False)
+            .reindex(index=scores.index, columns=scores.columns, fill_value=False)
             .astype(bool)
         )
         masked = scores.where(eff)  # outside the effective universe -> NaN
@@ -112,22 +136,25 @@ class QuantileLongShort(PortfolioConstructor):
             n = len(row)
             if n < min_active:
                 continue  # no-opinion row stays all-zero
-            # +1e-9 guards float artifacts like 10 * 0.3 == 2.9999999999999996
+            if row.max() == row.min():
+                continue  # no dispersion to rank: no opinion either
+            # +1e-9 guards float artifacts like 100 * 0.29 == 28.999999999999996
             k = max(1, int(math.floor(n * self.quantile + 1e-9)))
-            # stable sort => deterministic bucket membership under score ties;
-            # quantile <= 0.5 guarantees 2k <= n, so buckets never overlap
+            # quantile <= 0.5 guarantees 2k <= n, so the two k-name buckets
+            # never overlap; only a group tied across both edges can sit on
+            # both sides, and it is netted below
             order = row.sort_values(kind="mergesort")
+            book = pd.Series(0.0, index=order.index)
             if self.dollar_neutral:
                 half = self.gross_leverage / 2.0
-                longs = order.iloc[-k:]
-                shorts = order.iloc[:k]
-                out.loc[t, longs.index] = self._bucket_weights(longs, half, long=True)
-                out.loc[t, shorts.index] = -self._bucket_weights(shorts, half, long=False)
+                longs = self._bucket_weights(order, k, half, long=True)
+                shorts = self._bucket_weights(order, k, half, long=False)
+                book.loc[longs.index] += longs
+                book.loc[shorts.index] -= shorts
             else:
-                longs = order.iloc[-k:]
-                out.loc[t, longs.index] = self._bucket_weights(
-                    longs, self.gross_leverage, long=True
-                )
+                longs = self._bucket_weights(order, k, self.gross_leverage, long=True)
+                book.loc[longs.index] += longs
+            out.loc[t, book.index] = book
 
         requested_gross = out.abs().sum(axis=1)
         out = cap_weights(out, self.max_weight)
@@ -161,13 +188,35 @@ class QuantileLongShort(PortfolioConstructor):
 
     # -- internals ------------------------------------------------------
 
-    def _bucket_weights(self, bucket: pd.Series, target: float, long: bool) -> pd.Series:
-        """Non-negative weights for one bucket, summing to ``target``."""
+    def _bucket_weights(self, order: pd.Series, k: int, target: float, long: bool) -> pd.Series:
+        """Non-negative weights for one bucket, summing to ``target``.
+
+        ``order`` is the date's valid scores sorted ascending; the bucket is
+        its top (``long``) or bottom ``k`` names. If the score at the
+        bucket's edge also occurs outside the bucket, every name with that
+        score becomes a member with share j/m (m tied names over the j slots
+        they straddle), so the result does not depend on column order.
+        """
+        values = order.to_numpy()
+        inside = np.zeros(len(values), dtype=bool)
+        if long:
+            inside[-k:] = True
+            tied = values == values[-k]
+        else:
+            inside[:k] = True
+            tied = values == values[k - 1]
+        member = inside | tied
+        bucket = order[member]
         if self.weighting == "equal":
-            return pd.Series(target / len(bucket), index=bucket.index)
+            # exactly 1.0 for every member when the tied group lies inside
+            # the bucket; the shares always add up to k
+            share = np.where(tied, (tied & inside).sum() / tied.sum(), 1.0)[member]
+            return pd.Series(share * (target / k), index=bucket.index)
         # 'score': proportional to distance from the bucket's worst score
         # (bucket min for longs, bucket max for shorts, mirrored so the most
-        # extreme score gets the most weight on both sides).
+        # extreme score gets the most weight on both sides). A group tied at
+        # the edge IS the worst score: its names get the same near-zero
+        # weight, whatever their share of the bucket.
         raw = (bucket - bucket.min() + _EPS) if long else (bucket.max() - bucket + _EPS)
         return raw / raw.sum() * target
 
@@ -183,18 +232,25 @@ class QuantileLongShort(PortfolioConstructor):
             .std()
             .reindex(index=weights.index, columns=weights.columns)
         )
+        # A held name with no estimate of its own yet (a new entrant) gets
+        # the largest trailing vol known on that date. Leaving it out of the
+        # sum would count it as riskless and over-lever the row; dropping the
+        # whole row back to scale 1.0 would switch the risk control off (and
+        # jump the gross to gross_leverage) whenever one such name is held.
+        held = weights != 0.0
+        sigma = sigma.where(sigma.notna() | ~held, sigma.max(axis=1), axis=0)
         # Diagonal covariance approximation, documented: cross-correlations
         # are ignored, est_t = sqrt(sum_i w_i^2 sigma_i,t^2).
         est = np.sqrt((weights.pow(2) * sigma.pow(2)).sum(axis=1))
         daily_target = self.vol_target / math.sqrt(TRADING_DAYS_PER_YEAR)
         with np.errstate(divide="ignore", invalid="ignore"):
             raw = daily_target / est
-        scale = raw.clip(0.0, 3.0)
-        # Rows with no usable estimate keep their weights: zero-holding rows
-        # (est == 0) and rows where a held name has no vol history yet — a
-        # blind 3x lever-up on est ~ 0 would be spurious.
-        incomplete = ((weights != 0.0) & sigma.isna()).any(axis=1)
-        usable = np.isfinite(raw) & (est > 0.0) & ~incomplete
+        scale = raw.clip(0.0, VOL_TARGET_MAX_SCALE)
+        # Rows with no estimate at all keep their weights: zero-holding rows
+        # and warm-up rows where no name has vol history yet (est == 0 in
+        # both, since the sum skips the missing terms) — a blind lever-up on
+        # est == 0 would be spurious.
+        usable = np.isfinite(raw) & (est > 0.0)
         scale = scale.where(usable, 1.0)
         return cap_weights(weights.mul(scale, axis=0), self.max_weight)
 

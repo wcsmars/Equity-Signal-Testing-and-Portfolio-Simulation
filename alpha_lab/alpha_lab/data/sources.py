@@ -13,11 +13,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from alpha_lab.config.schema import DataConfig
+from alpha_lab.config.schema import DataConfig, iso_date
 from alpha_lab.core.errors import ConfigError, DataError
 from alpha_lab.core.interfaces import DataSource
 from alpha_lab.core.registry import Registry
-from alpha_lab.core.types import MarketData
+from alpha_lab.core.types import ISO_DATE_PATTERN, MarketData
 from alpha_lab.data.synthetic import make_market
 
 SOURCES = Registry("data_source")
@@ -88,6 +88,12 @@ class CSVSource(DataSource):
     optionally ``open,high,low,volume,unadjusted_close``; each value column is
     pivoted to a wide panel.
 
+    Dates must be ISO 8601 in both layouts: ``YYYY-MM-DD`` (optionally with a
+    time of day, no UTC offset) or ``YYYYMMDD``. Other spellings such as
+    ``10/01/2024`` raise ``DataError``; the day/month order is never guessed.
+    A wide panel with a repeated or blank ticker header, or an optional panel
+    that shares no ticker or no date with ``close.csv``, also raises.
+
     ``tickers`` / ``start`` / ``end`` subset the loaded panel; a requested
     ticker absent from the files raises ``DataError`` naming it.
     """
@@ -104,6 +110,9 @@ class CSVSource(DataSource):
     ) -> None:
         if format not in ("wide", "long"):
             raise ConfigError(f"unknown csv format '{format}'; expected 'wide' or 'long'")
+        for bound, value in (("start", start), ("end", end)):
+            if value is not None:
+                iso_date(value, f"csv source {bound}")
         self.path = Path(path)
         self.format = format
         self.tickers = list(tickers) if tickers is not None else None
@@ -127,11 +136,23 @@ class CSVSource(DataSource):
         close_path = self.path / "close.csv"
         if not close_path.exists():
             raise DataError(f"required close.csv not found in {self.path}")
-        frames = {"close": _read_panel_csv(close_path)}
+        close = _read_panel_csv(close_path)
+        frames = {"close": close}
         for field in (*_PRICE_FIELDS, "universe"):
             file = self.path / f"{field}.csv"
-            if file.exists():
-                frames[field] = _read_panel_csv(file)
+            if not file.exists():
+                continue
+            frame = _read_panel_csv(file)
+            # Optional panels are aligned to close afterwards. One that shares
+            # no ticker or no date with it (headers in another case, another
+            # date range) would turn into an all-missing panel without notice.
+            for axis, theirs, ours in (
+                ("tickers", frame.columns, close.columns),
+                ("dates", frame.index, close.index),
+            ):
+                if len(ours) and not len(theirs.intersection(ours)):
+                    raise DataError(f"{file}: shares no {axis} with close.csv")
+            frames[field] = frame
         return frames
 
     def _read_long(self) -> dict[str, pd.DataFrame]:
@@ -140,13 +161,19 @@ class CSVSource(DataSource):
         try:
             # tickers stay literal strings, as in the wide format and config:
             # no numeric inference ('10001') and no NA conversion ('NA')
-            raw = pd.read_csv(self.path, parse_dates=["date"], converters={"ticker": str})
+            raw = pd.read_csv(
+                self.path,
+                dtype={"date": str},
+                converters={"ticker": str},
+                float_precision="round_trip",
+            )
         except (ValueError, KeyError) as exc:
             raise DataError(f"{self.path}: could not parse long csv ({exc})") from exc
         required = {"date", "ticker", "close"}
         missing = required - set(raw.columns)
         if missing:
             raise DataError(f"{self.path}: long csv missing columns {sorted(missing)}")
+        raw["date"] = _parse_dates(raw["date"], self.path)
         value_cols = [c for c in raw.columns if c not in ("date", "ticker")]
         unknown = [c for c in value_cols if c not in _LONG_FIELDS]
         if unknown:
@@ -196,13 +223,49 @@ def source_from_config(cfg: DataConfig) -> DataSource:
 # -- helpers -------------------------------------------------------------
 
 
-def _read_panel_csv(path: Path) -> pd.DataFrame:
-    """Read one wide panel: first column 'date' (parsed index), rest tickers."""
+def _parse_dates(values, path: Path) -> pd.DatetimeIndex:
+    """Parse a column of date strings strictly as ISO dates.
+
+    Format inference is not used: it reads ``10/01/2024`` month-first and
+    ``15/01/2024`` day-first within one file, after which sorting reorders the
+    rows and the price history is scrambled without any error.
+    """
+    text = pd.Series(np.asarray(values, dtype=object))
+    bad = text.isna() | ~text.astype(str).str.fullmatch(ISO_DATE_PATTERN)
+    if bad.any():
+        row = int(bad.to_numpy().argmax())
+        found = "is blank" if pd.isna(text.iloc[row]) else f"{text.iloc[row]!r} is not an ISO date"
+        raise DataError(
+            f"{path}: date in data row {row + 1} {found}; "
+            "use YYYY-MM-DD (optionally with a time, no UTC offset) or YYYYMMDD"
+        )
     try:
-        frame = pd.read_csv(path, index_col="date", parse_dates=["date"])
+        return pd.DatetimeIndex(pd.to_datetime(text.to_numpy(), format="ISO8601"))
+    except (ValueError, TypeError) as exc:
+        reason = str(exc).split(". You might want to try")[0].splitlines()[0]
+        raise DataError(f"{path}: could not parse dates ({reason})") from exc
+
+
+def _read_panel_csv(path: Path) -> pd.DataFrame:
+    """Read one wide panel: first column 'date' (ISO dates, the index), rest tickers."""
+    try:
+        header = pd.read_csv(path, header=None, nrows=1, dtype=str, keep_default_na=False)
+        # round_trip: the default float parser can be one unit in the last
+        # place away from the value written in the file
+        frame = pd.read_csv(
+            path, index_col="date", dtype={"date": str}, float_precision="round_trip"
+        )
     except (ValueError, KeyError) as exc:
         raise DataError(f"{path}: first column must be 'date' ({exc})") from exc
-    frame.index = pd.DatetimeIndex(frame.index)
+    # read_csv renames a repeated header ('A' -> 'A.1') and names a blank one
+    # 'Unnamed: n', so both would load as extra tickers; check the raw header.
+    names = [str(cell).strip() for cell in header.iloc[0]]
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise DataError(f"{path}: repeated column headers {repeated}")
+    if "" in names:
+        raise DataError(f"{path}: blank column header (column {names.index('') + 1})")
+    frame.index = _parse_dates(frame.index, path).rename("date")
     return frame.sort_index()
 
 
