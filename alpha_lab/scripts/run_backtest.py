@@ -9,8 +9,9 @@ Usage:
     python scripts/run_backtest.py --config configs/base.yaml \
         --override signal.params.window=126 --n-trials 12
 
-Exit status: 0 on success, 1 on a configuration or data error, 2 when
-market-data validation reports errors and --force was not given.
+Exit status: 0 on success, 1 on a configuration, data or file-system error
+(printed as one `error: ...` line), 2 when market-data validation reports
+errors and --force was not given.
 """
 
 from __future__ import annotations
@@ -118,7 +119,7 @@ def never_traded(result) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(allow_abbrev=False, description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True, help="path to a YAML run config")
     parser.add_argument(
         "--override",
@@ -231,6 +232,8 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except AlphaLabError as exc:
+    except (AlphaLabError, OSError) as exc:
+        # OSError: a runs or cache directory that cannot be written, a full
+        # disk. The message names the path; a traceback would add nothing.
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)

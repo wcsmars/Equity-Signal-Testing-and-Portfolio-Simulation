@@ -5,6 +5,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
 build/
@@ -19,8 +21,10 @@ dist/
 .env.*
 *.pem
 *.key
+*.p12
 /state/
 credentials/
+secrets/
 private/
 config.yaml
 data/raw/
@@ -33,13 +37,19 @@ slides/
 literature/
 *.tex
 *.bib
+*.doc
 *.docx
 *.pdf
+*.ppt
 *.pptx
 
-# Downloaded data and generated artifacts; retain library data modules
+# Downloaded data and generated output. Tracked on purpose and not matched
+# here: examples/ (including the results in examples/qcore/), research/ and
+# the alpha_lab/alpha_lab/data package.
 /data/
 /results/
+/sample_data/
+/ci-run/
 /alpha_lab/data/
 /alpha_lab/runs/
 /alpha_lab/feature_cache/

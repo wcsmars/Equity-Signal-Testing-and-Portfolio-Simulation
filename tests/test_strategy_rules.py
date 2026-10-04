@@ -571,6 +571,12 @@ def test_turn_of_month_matches_a_close_by_close_reference_around_special_closure
         got = seasonality_flows.tom_weights(flat, n_last=n_last, m_first=m_first)
         assert list(got.columns) == ["SPY"] and got["SPY"].dtype == float
         pd.testing.assert_series_equal(got["SPY"], _tom_reference(idx, n_last, m_first))
+    # rows dated on a non-session (a weekend, the closure day itself) follow
+    # the same rule: a closure is known from its own date on
+    days = pd.date_range(start, end)
+    for n_last, m_first in ((4, 2), (5, 3), (0, 1)):
+        got = seasonality_flows.tom_weights(pd.Series(100.0, index=days), n_last=n_last, m_first=m_first)
+        pd.testing.assert_series_equal(got["SPY"], _tom_reference(days, n_last, m_first))
     # the answer at a close does not depend on where the sample starts or ends
     full = seasonality_flows.tom_weights(flat)
     for cut in range(5, len(idx), 7):
@@ -622,6 +628,40 @@ def test_turn_of_month_rejects_invalid_windows(bad):
     with pytest.raises(ValueError, match="unique, sorted dates"):
         seasonality_flows.tom_weights(pd.Series(100.0, index=idx[::-1]))
     assert seasonality_flows.tom_weights(pd.Series(100.0, index=idx[:0])).empty
+
+
+def test_turn_of_month_backtests_fail_closed_on_a_blank_spy_close(monkeypatch):
+    idx = nyse_bdays("2016-07-01", "2018-06-29")
+    spy = pd.Series(np.linspace(100.0, 130.0, len(idx)), index=idx)
+    cache = {"px": pd.DataFrame({"SPY": spy, "QQQ": 2.0 * spy})}
+    monkeypatch.setattr(seasonality_flows, "load_prices", lambda: cache["px"])
+    monkeypatch.setattr(seasonality_flows, "run_backtest",
+                        lambda *a, **k: bt.run_backtest(*a, cash_rate=0.0, withholding=0.0, **k))
+    gap = pd.Series(np.where(np.arange(len(idx)) % 2, 0.999, 1.001), index=idx)        # open / close
+    monkeypatch.setattr(seasonality_flows, "load", lambda name: cache["px"].mul(gap, axis=0))
+    clean = seasonality_flows.run_best()
+    assert clean["start"] == "2016-07-01" and clean["end"] == "2018-06-29"
+    assert set(seasonality_flows.overnight_note()) == {"SPY", "QQQ"}
+    # a blank close inside the sample would be dropped with its row: stop instead
+    day = idx[300]
+    cache["px"] = pd.DataFrame({"SPY": spy.where(spy.index != day), "QQQ": 2.0 * spy})
+    with pytest.raises(ValueError, match=f"blank SPY close after listing on 1 date.*{day.date()}"):
+        seasonality_flows.run_best()
+    with pytest.raises(ValueError, match=f"blank SPY close after listing on 1 date.*{day.date()}"):
+        seasonality_flows.sweep()
+    with pytest.raises(ValueError, match=f"blank SPY close after listing on 1 date.*{day.date()}"):
+        seasonality_flows.overnight_note()
+    cache["px"] = pd.DataFrame({"SPY": spy, "QQQ": (2.0 * spy).where(spy.index != day)})
+    with pytest.raises(ValueError, match=f"blank QQQ close after listing on 1 date.*{day.date()}"):
+        seasonality_flows.overnight_note()
+    # blanks before the first close are a late listing: the sample starts there
+    late = spy.where(spy.index > idx[40])
+    listed = seasonality_flows._listed_closes(late.rename("SPY"))
+    pd.testing.assert_series_equal(listed, spy.iloc[41:], check_names=False)
+    cache["px"] = pd.DataFrame({"SPY": late, "QQQ": 2.0 * spy})
+    from_listing = seasonality_flows.run_best()
+    cache["px"] = pd.DataFrame({"SPY": spy.iloc[41:]})
+    assert from_listing == seasonality_flows.run_best() != clean
 
 
 # =========================================================== mean_reversion
@@ -738,6 +778,27 @@ def test_mean_reversion_rejects_invalid_parameters(bad):
         mean_reversion.build_weights(px, **{**mean_reversion.BEST_PARAMS, **bad})
 
 
+def test_mean_reversion_fails_closed_on_a_blank_close_after_listing():
+    params = mean_reversion.BEST_PARAMS
+    one, entry = _dip_path(0.004, after=[-0.0005] * 3)
+    px = pd.DataFrame({"SPY": one["SPY"], "QQQ": 1.01 * one["SPY"]})
+    clean = mean_reversion.build_weights(px, **params)
+    assert clean.iloc[entry].tolist() == pytest.approx([0.20, 0.20])     # both dips are bought
+    # a close inside the 200-day window, the entry close, the final row
+    for row in (150, entry, len(px) - 1):
+        bad = px.copy()
+        bad.iloc[row, 1] = np.nan
+        with pytest.raises(ValueError, match=f"blank close after listing in 1 cell.*QQQ {px.index[row].date()}"):
+            mean_reversion.build_weights(bad, **params)
+    # blanks before the first close are a late listing: that ticker waits for
+    # its own 200-day average and the other one trades as before
+    late = px.copy()
+    late.iloc[:60, 1] = np.nan
+    w = mean_reversion.build_weights(late, **params)
+    assert not w["QQQ"].any() and late["QQQ"].iloc[:entry + 1].notna().sum() < 200
+    pd.testing.assert_series_equal(w["SPY"], clean["SPY"])
+
+
 # ============================================================ command line
 def _cli_prices() -> pd.DataFrame:
     tickers = sorted(set(tsmom_trend.RISK + [tsmom_trend.CASH] + XSEC_COLS))
@@ -782,8 +843,24 @@ def test_sweep_never_replaces_a_differing_saved_table_without_rebase(
                          ids=lambda m: m.__name__.rsplit(".", 1)[-1])
 def test_command_line_rejects_unknown_flags_before_running_anything(module, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", [module.__file__, "--sweeep"])
+    monkeypatch.setattr(sys, "path", list(sys.path))         # the script prepends src/ to it
     with pytest.raises(SystemExit) as stop:
         runpy.run_path(module.__file__, run_name="__main__")
     assert stop.value.code == 2
     captured = capsys.readouterr()
     assert "unrecognized arguments: --sweeep" in captured.err and captured.out == ""
+
+
+@pytest.mark.parametrize("module", [tsmom_trend, xsec_etf_mom, seasonality_flows, mean_reversion],
+                         ids=lambda m: m.__name__.rsplit(".", 1)[-1])
+def test_command_line_reports_a_missing_cache_in_one_line(module, monkeypatch, tmp_path, capsys):
+    from qcore import data
+    monkeypatch.setattr(data, "DATA_DIR", tmp_path)          # an empty folder: no adj_close.csv
+    monkeypatch.setattr(sys, "argv", [module.__file__])
+    monkeypatch.setattr(sys, "path", list(sys.path))         # the script prepends src/ to it
+    with pytest.raises(SystemExit) as stop:                  # an exit message, not a traceback
+        runpy.run_path(module.__file__, run_name="__main__")
+    message = stop.value.code                                # a string exit code is printed, status 1
+    assert isinstance(message, str) and "\n" not in message
+    assert message.startswith(f"{tmp_path / 'adj_close.csv'} not found") and "download_data.py" in message
+    assert capsys.readouterr().out == "" and list(tmp_path.iterdir()) == []

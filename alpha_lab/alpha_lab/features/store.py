@@ -10,12 +10,15 @@ Corrections to historical prices, membership or liquidity must invalidate
 both memory and disk entries.
 
 A disk entry is also keyed by the implementation that produced it: the
-qualified name of the feature's type and the source text of that type and
-its bases. Editing a feature's implementation, or registering a different
-one under the same name, is therefore a cache miss. Code a feature merely
-calls (module-level helpers, pandas itself) is not tracked — the cache is
-not a full code-version provenance system: clear it after changing such
-code.
+qualified name of the feature's type, the source text of that type and its
+bases, and the functions they define as loaded in the running process (so
+a session that imported a feature before its file was edited does not
+write under the edited text's key; entries are specific to the Python
+version that compiled them). Editing a feature's implementation, or
+registering a different one under the same name, is therefore a cache
+miss. Code a feature merely calls (module-level helpers, pandas itself) is
+not tracked — the cache is not a full code-version provenance system:
+clear it after changing such code.
 
 Disk entries are written to a temporary file and renamed into place, so an
 interrupted or concurrent run never leaves a half-written panel under the
@@ -28,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import os
+import types
 import uuid
 import warnings
 from abc import ABC
@@ -76,13 +80,45 @@ def fingerprint(data: MarketData) -> str:
     return sha.hexdigest()
 
 
+def _hash_loaded_code(sha, klass: type) -> None:
+    """Feed ``sha`` the functions ``klass`` defines, as loaded in this process.
+
+    Bytecode, names and constants; no file names or line numbers. Sets are
+    fed in sorted order because their ``repr`` follows the hash seed.
+    """
+
+    def feed(code: types.CodeType) -> None:
+        sha.update(code.co_code)
+        sha.update(repr((code.co_names, code.co_varnames, code.co_freevars)).encode())
+        for const in code.co_consts:
+            if isinstance(const, types.CodeType):
+                feed(const)
+            elif isinstance(const, frozenset):
+                sha.update(repr(sorted(map(repr, const))).encode())
+            else:
+                sha.update(repr(const).encode())
+
+    for name, attr in sorted(vars(klass).items()):
+        func = getattr(attr, "__func__", attr)  # staticmethod, classmethod
+        func = getattr(func, "fget", func)  # property
+        code = getattr(func, "__code__", None)
+        if isinstance(code, types.CodeType):
+            sha.update(name.encode())
+            feed(code)
+
+
 def _code_token(feature: Feature) -> str:
     """Identity of the code behind ``feature``, for the disk cache key.
 
-    The qualified name of the feature's type plus a hash of the source text
-    of that type and of every base it inherits ``compute`` or parameters
-    from. Source that cannot be retrieved (a type defined interactively)
-    contributes nothing, leaving the qualified name as the only identity.
+    The qualified name of the feature's type plus a hash of two things, for
+    that type and for every base it inherits ``compute`` or parameters from:
+
+    - the source text, read from the file now. Source that cannot be
+      retrieved (a type defined interactively) contributes nothing;
+    - the functions the type defines, as loaded. The file can be edited
+      after a session imported it: that session still runs the old code, and
+      its panel must not be stored under the key of the edited text. This
+      part also tells two versions of a type without source apart.
     """
     cls = type(feature)
     sha = hashlib.sha256()
@@ -93,6 +129,7 @@ def _code_token(feature: Feature) -> str:
             sha.update(inspect.getsource(klass).encode())
         except (OSError, TypeError):
             pass
+        _hash_loaded_code(sha, klass)
     return f"{cls.__module__}.{cls.__qualname__}:{sha.hexdigest()[:16]}"
 
 

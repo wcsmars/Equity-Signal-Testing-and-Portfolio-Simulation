@@ -17,7 +17,7 @@ from alpha_lab.config.schema import DataConfig, iso_date
 from alpha_lab.core.errors import ConfigError, DataError
 from alpha_lab.core.interfaces import DataSource
 from alpha_lab.core.registry import Registry
-from alpha_lab.core.types import ISO_DATE_PATTERN, MarketData
+from alpha_lab.core.types import ISO_DATE_FORMATS, ISO_DATE_PATTERN, MarketData
 from alpha_lab.data.synthetic import make_market
 
 SOURCES = Registry("data_source")
@@ -89,8 +89,9 @@ class CSVSource(DataSource):
     pivoted to a wide panel.
 
     Dates must be ISO 8601 in both layouts: ``YYYY-MM-DD`` (optionally with a
-    time of day, no UTC offset) or ``YYYYMMDD``. Other spellings such as
-    ``10/01/2024`` raise ``DataError``; the day/month order is never guessed.
+    time of day, no UTC offset) or ``YYYYMMDD``; whitespace around a date
+    cell is ignored. Other spellings such as ``10/01/2024`` raise
+    ``DataError``; the day/month order is never guessed.
     A wide panel with a repeated or blank ticker header, or an optional panel
     that shares no ticker or no date with ``close.csv``, also raises.
 
@@ -231,16 +232,15 @@ def _parse_dates(values, path: Path) -> pd.DatetimeIndex:
     rows and the price history is scrambled without any error.
     """
     text = pd.Series(np.asarray(values, dtype=object))
-    bad = text.isna() | ~text.astype(str).str.fullmatch(ISO_DATE_PATTERN)
+    # padding around a cell is not a question of format, so it is dropped
+    cells = text.astype(str).str.strip()
+    bad = text.isna() | ~cells.str.fullmatch(ISO_DATE_PATTERN)
     if bad.any():
         row = int(bad.to_numpy().argmax())
         found = "is blank" if pd.isna(text.iloc[row]) else f"{text.iloc[row]!r} is not an ISO date"
-        raise DataError(
-            f"{path}: date in data row {row + 1} {found}; "
-            "use YYYY-MM-DD (optionally with a time, no UTC offset) or YYYYMMDD"
-        )
+        raise DataError(f"{path}: date in data row {row + 1} {found}; use {ISO_DATE_FORMATS}")
     try:
-        return pd.DatetimeIndex(pd.to_datetime(text.to_numpy(), format="ISO8601"))
+        return pd.DatetimeIndex(pd.to_datetime(cells.to_numpy(), format="ISO8601"))
     except (ValueError, TypeError) as exc:
         reason = str(exc).split(". You might want to try")[0].splitlines()[0]
         raise DataError(f"{path}: could not parse dates ({reason})") from exc

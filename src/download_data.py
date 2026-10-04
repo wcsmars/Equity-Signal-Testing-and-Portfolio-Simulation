@@ -7,8 +7,12 @@ the QCORE_DATA_DIR environment variable, which keeps a new download apart
 from a cache that earlier results were computed from. A refresh is refused,
 and the cache left untouched, when the response lacks observations the
 existing cache holds (a ticker that starts later, stops earlier or has a new
-hole); --allow-shrink accepts such a response when the loss is a genuine
-vendor correction.
+hole; a withdrawn index bar counts too), when an existing file cannot be read
+for that comparison, or when the index panel ends more than
+INDEX_MAX_LAG_SESSIONS sessions before prices. The error lists what is
+missing. --allow-shrink is the way through in each case: use it when the loss
+is a genuine vendor correction, to replace a damaged file, or to take the
+price refresh while the index series lag.
 The public project includes no downloaded prices; users must obtain data
 under terms permitting their intended use. Run the data-quality check after
 refreshing and before using the cache in research.
@@ -30,7 +34,8 @@ from qcore.data import DATA_DIR, ETF_UNIVERSE, INDEX_UNIVERSE, OPERATIONAL_UNIVE
 
 START = "2000-01-01"
 # Price sessions the newest index row may trail the newest price row. A
-# longer lag is a partial index response and must not replace the cache.
+# longer lag is a partial index response and does not replace the cache
+# unless --allow-shrink is passed.
 INDEX_MAX_LAG_SESSIONS = 5
 
 
@@ -170,12 +175,17 @@ def _write_cache(frames: dict[str, pd.DataFrame]) -> None:
                     unrestored.append(name)
             if unrestored:
                 keep_stage = True
+                # named from what existed before, not from which backups are
+                # left: a restore interrupted after its rename has no backup
+                # either, and that file must not be deleted
+                added = [name for name in unrestored if name not in existing]
                 raise RuntimeError(
                     f"cache refresh failed ({error!r}) and the rollback could not "
-                    f"restore {unrestored}: {DATA_DIR} now mixes old and new files. "
-                    f"The originals are kept in {stage} as <name>.backup (a listed "
-                    "name with no backup is a new file and should be deleted); copy "
-                    "them back before using the cache.") from error
+                    f"restore {unrestored}: {DATA_DIR} may now mix old and new files. "
+                    f"The originals are kept in {stage} as <name>.backup; copy them "
+                    "back before using the cache."
+                    + (f" {added} did not exist before this refresh and should be "
+                       "deleted." if added else "")) from error
             raise
     finally:
         if not keep_stage:
@@ -201,12 +211,18 @@ def main(allow_shrink: bool = False) -> None:
     _validate_download(idx, INDEX_UNIVERSE, "indices")
     lag = int((valid > idx.index[-1]).sum())
     if lag > INDEX_MAX_LAG_SESSIONS:
-        raise ValueError(f"indices: panel ends {idx.index[-1].date()}, {lag} sessions "
-                         f"before prices ({valid[-1].date()})")
+        stale = (f"indices: panel ends {idx.index[-1].date()}, {lag} sessions "
+                 f"before prices ({valid[-1].date()})")
+        if not allow_shrink:
+            raise ValueError(
+                f"{stale}; refresh refused, the cache in {DATA_DIR} is unchanged. "
+                "Retry later, or rerun with --allow-shrink to accept the short index panel.")
+        print(f"WARNING: --allow-shrink: keeping a short index panel ({stale})")
     frames["indices"] = idx
 
     # coverage.csv: each ticker's first/last valid date and row count. A
-    # reference for people choosing sample starts; no code reads it.
+    # reference for choosing sample starts; the data-quality gate also compares
+    # the cache against it to detect a ticker that lost history.
     cov = pd.DataFrame({
         "first": data["close"].apply(lambda s: s.first_valid_index()),
         "last": data["close"].apply(lambda s: s.last_valid_index()),
@@ -221,7 +237,8 @@ def main(allow_shrink: bool = False) -> None:
             raise ValueError(
                 f"refresh refused; the cache in {DATA_DIR} is unchanged. The response "
                 f"lacks history the cache holds:\n  {shown}\n"
-                "Retry later, or pass --allow-shrink if the loss is a genuine vendor correction.")
+                "Retry later, or rerun with --allow-shrink if the loss is a genuine vendor "
+                "correction or the existing file is damaged and should be replaced.")
         print(f"WARNING: --allow-shrink: replacing the cache although history was lost:\n  {shown}")
     _write_cache(frames)
     for name, frame in frames.items():
@@ -232,9 +249,15 @@ def main(allow_shrink: bool = False) -> None:
     print(cov.sort_values("first").tail(8))
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Refresh the local market-data cache.")
+def _cli(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="Refresh the local market-data cache.")
     parser.add_argument("--allow-shrink", action="store_true",
                         help="replace the cache even though the response lacks "
-                             "observations the existing cache holds")
-    main(allow_shrink=parser.parse_args().allow_shrink)
+                             "observations the existing cache holds, or its index "
+                             f"panel ends more than {INDEX_MAX_LAG_SESSIONS} sessions "
+                             "before prices")
+    main(allow_shrink=parser.parse_args(argv).allow_shrink)
+
+
+if __name__ == "__main__":
+    _cli()

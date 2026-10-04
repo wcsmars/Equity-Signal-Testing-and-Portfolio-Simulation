@@ -1,0 +1,8 @@
+sleeve,ticker,shares,as_of
+mean_reversion,XLE,40,2025-03-31
+seasonality_flows,SPY,6,2025-03-31
+tsmom_trend,GLD,25,2025-03-31
+tsmom_trend,IEF,30,2025-03-31
+xsec_etf_mom,EWJ,45,2025-03-31
+xsec_etf_mom,XLK,15,2025-03-31
+cash,SGOV,120,2025-03-31

@@ -196,6 +196,24 @@ def test_all_cash_book_scores_zero_after_a_csv_round_trip(monkeypatch):
     assert bt.metrics(dict(res, returns=back))["full"]["sharpe"] == 0.0
 
 
+def test_tiny_but_real_excess_is_scored_and_not_treated_as_zero():
+    # the zero floor is 1e-15 per day; CSV residue is below 1e-16 and the
+    # smallest real daily excess in a saved stream is above 1e-8. A series a
+    # thousand times above the floor keeps the Sharpe of the unscaled one
+    # (2**-33 is an exact power of two, so every ratio is bit-identical)
+    r = _skewed_fat_tailed()
+    tiny = r * 2.0 ** -33
+    assert 1e-12 < tiny.abs().max() < 1e-11 and tiny.std() > 1e-13
+    assert sharpe_daily(tiny) == sharpe_daily(r)
+    assert probabilistic_sharpe(tiny)["sharpe_ann"] == 0.863
+    assert block_bootstrap_sharpe_ci(tiny, n_boot=200) == block_bootstrap_sharpe_ci(r, n_boot=200)
+    # one real observation in an otherwise idle book is not an all-cash book
+    one_trade = pd.Series(np.where(np.arange(300) == 150, 1e-12, 0.0))
+    assert sharpe_daily(one_trade) == pytest.approx(1 / math.sqrt(300), rel=1e-9)
+    # ... while the same shape at residue size is
+    assert sharpe_daily(one_trade * 1e-4) == 0.0
+
+
 def test_constant_nonzero_excess_has_no_sharpe():
     with pytest.raises(ValueError, match="constant nonzero"):
         sharpe_daily(pd.Series(np.full(90, 0.001)))

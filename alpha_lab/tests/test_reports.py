@@ -325,6 +325,36 @@ def test_rebuild_removes_outputs_it_no_longer_writes(tmp_path, result_400):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.txt", "report.html"]
 
 
+def test_rebuild_removes_nothing_but_its_own_report_files(tmp_path, result_400):
+    """The clean-up is limited to the five file names a build can write,
+    directly inside the report directory it was given."""
+    assert {*performance._REPORT_FILES.values(), *performance._FIGURE_FILES} == {
+        "report.html", "report.md", "equity.png", "rolling_sharpe.png", "turnover_costs.png",
+    }
+    run = tmp_path / "run"
+    out = run / "report"
+    generate_report(result_400, METRICS, out)  # html + md + three figures
+    bystanders = [
+        # the run directory around the report directory
+        run / "report.md", run / "report.html", run / "equity.png", run / "metrics.json",
+        # other files inside the report directory, similar names included
+        out / "notes.txt", out / "report.md.bak", out / "report.htm", out / "equity.png.txt",
+        out / "my_equity.png", out / "rolling_sharpe_252.png",
+        # the same five names one level down
+        out / "figures" / "equity.png", out / "figures" / "report.html",
+    ]
+    for path in bystanders:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("keep me")
+    short = make_result(pd.bdate_range("2024-01-02", periods=30), seed=1, with_windows=False)
+
+    generate_report(short, METRICS, out, formats=("html",))
+
+    left = sorted(p.relative_to(run).as_posix() for p in run.rglob("*") if p.is_file())
+    assert left == sorted([*(p.relative_to(run).as_posix() for p in bystanders), "report/report.html"])
+    assert all(path.read_text() == "keep me" for path in bystanders)
+
+
 # --------------------------------------------------------------------------
 # period note
 # --------------------------------------------------------------------------

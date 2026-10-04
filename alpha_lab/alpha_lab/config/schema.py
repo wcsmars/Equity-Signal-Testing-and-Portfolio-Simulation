@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from alpha_lab.core.errors import ConfigError
-from alpha_lab.core.types import ISO_DATE_PATTERN
+from alpha_lab.core.types import ISO_DATE_FORMATS, ISO_DATE_PATTERN
 
 
 def finite_number(value, name: str) -> None:
@@ -39,15 +39,17 @@ def iso_date(value, name: str) -> pd.Timestamp:
     one would otherwise surface there as a raw traceback, and an ambiguous
     one (``10/01/2024``) would be read month-first without any notice.
     """
-    is_text = isinstance(value, str)
+    if isinstance(value, str):
+        well_formed = re.fullmatch(ISO_DATE_PATTERN, value) is not None
+    else:
+        well_formed = isinstance(value, datetime.date)
+    if not well_formed:
+        raise ConfigError(f"{name} must be an ISO date: {ISO_DATE_FORMATS}; got {value!r}")
     try:
-        if is_text and not re.fullmatch(ISO_DATE_PATTERN, value):
-            raise ValueError("not an ISO date")
-        if not is_text and not isinstance(value, datetime.date):
-            raise TypeError("not a date")
         stamp = pd.Timestamp(value)
     except (ValueError, TypeError) as exc:
-        raise ConfigError(f"{name} must be an ISO date (YYYY-MM-DD), got {value!r}") from exc
+        # the spelling is right but the date is not: 2024-02-30, month 13
+        raise ConfigError(f"{name} must be a valid calendar date, got {value!r} ({exc})") from exc
     if pd.isna(stamp) or stamp.tzinfo is not None:
         raise ConfigError(f"{name} must be a timezone-naive ISO date (YYYY-MM-DD), got {value!r}")
     return stamp
@@ -230,7 +232,9 @@ class PortfolioConfig:
     quantile: float = 0.2            # fraction in each of long / short buckets
     weighting: str = "equal"         # "equal" | "score"
     dollar_neutral: bool = True
-    gross_leverage: float = 2.0      # sum of |weights|
+    # sum of |weights| BEFORE vol targeting: with vol_target set, each row is
+    # then scaled by clip(target / estimate, 0, 3), so gross can reach 3x this
+    gross_leverage: float = 2.0
     max_weight: float = 0.10         # per-name cap on |weight|
     vol_target: Optional[float] = None  # annualized; None = off
     vol_lookback: int = 63
@@ -306,6 +310,8 @@ class WalkForwardConfig:
 @dataclass
 class BacktestConfig:
     execution_lag: int = 2           # H_t = W_{t-lag}; next-close execution
+    # False is a comparison aid only: gross still assumes a daily reset to the
+    # target, so turnover and cost then omit the trades that undo each day's drift
     drift_adjust_turnover: bool = True
     walkforward: Optional[WalkForwardConfig] = field(default_factory=WalkForwardConfig)
 

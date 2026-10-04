@@ -331,8 +331,72 @@ def test_git_revision_identifies_the_checkout(tmp_path):
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
     assert tracker_mod._git_revision(package) == head
+    # a second package that merely sits in the same checkout, untracked, is
+    # not described by that commit
+    other = repo / "other"
+    other.mkdir()
+    (other / "__init__.py").write_text("y = 1\n")
+    assert tracker_mod._git_revision(other) is None
     (package / "__init__.py").write_text("x = 2\n")
     assert tracker_mod._git_revision(package) == head + "+dirty"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError("git"),                      # git is not installed
+        PermissionError("git"),
+        subprocess.TimeoutExpired("git", 10),          # a hanging git is abandoned
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        RuntimeError("unexpected"),
+    ],
+    ids=lambda exc: type(exc).__name__,
+)
+def test_git_failure_never_fails_a_run(tmp_path, monkeypatch, failure):
+    def broken(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(tracker_mod.subprocess, "run", broken)
+    assert tracker_mod._git_revision(tmp_path) is None
+    tracker = ExperimentTracker(tmp_path / "runs")
+    rec = tracker.log_run(config_from_dict({}), _small_result(), METRICS)
+    assert "git_revision" not in json.loads((rec.path / "env.json").read_text())
+    assert tracker.load_run(rec.run_id)["metrics"] == METRICS
+    assert list(tracker.list_runs()["run_id"]) == [rec.run_id]
+
+
+def test_git_is_asked_read_only_questions_with_a_time_limit(tmp_path, monkeypatch):
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    answers = {
+        "ls-files": b"__init__.py\n",
+        "rev-parse": commit.encode() + b"\n",
+        "status": b" M experiments/tracker.py\n",
+    }
+    calls = []
+    failing = set()
+
+    def fake_git(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        status = 1 if cmd[4] in failing else 0
+        return subprocess.CompletedProcess(cmd, status, stdout=answers[cmd[4]], stderr=b"")
+
+    monkeypatch.setattr(tracker_mod.subprocess, "run", fake_git)
+    # the commit id and the dirty flag, nothing else git printed
+    assert tracker_mod._git_revision(tmp_path) == commit + "+dirty"
+    assert [cmd[4] for cmd, _ in calls] == ["ls-files", "rev-parse", "status"]
+    for cmd, kwargs in calls:
+        assert cmd[:4] == ["git", "--no-optional-locks", "-C", str(tmp_path)]
+        assert 0 < kwargs["timeout"] <= 10                 # never waits on git indefinitely
+        assert kwargs["stdin"] is subprocess.DEVNULL       # never reads the terminal
+
+    # output that is not a commit id is never stored
+    answers["rev-parse"] = b"refs/heads/main\n"
+    assert tracker_mod._git_revision(tmp_path) is None
+    answers["rev-parse"], answers["status"] = commit.encode() + b"\n", b""
+    assert tracker_mod._git_revision(tmp_path) == commit
+    # a commit whose state could not be read is not reported as clean
+    failing.add("status")
+    assert tracker_mod._git_revision(tmp_path) is None
 
 
 def test_compare_pulls_from_metrics_json(tmp_path):

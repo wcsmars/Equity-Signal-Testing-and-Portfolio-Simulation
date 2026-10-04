@@ -2,9 +2,10 @@
 
 pairs_statarb, xsec_stock_mom, tsmom_voltarget and vol_regime are pinned on
 small constructed inputs (no data cache needed): what each documented rule
-does, that no builder reads a later row, that a missing index print cannot
-pass silently, and that running a module never replaces a saved result file
-that differs.
+does, that no builder reads a later row, that a run of missing index prints
+is held only up to a stated bound, that running a module never replaces a
+saved result file that differs, and that a run without a data cache stops
+with one line.
 """
 
 import ast
@@ -409,7 +410,7 @@ def test_vix_term_structure_cannot_use_same_day_post_equity_close_print():
     assert one.loc[idx[d + 2], "QQQ"] == 1.0
 
 
-def test_vol_regime_reports_a_held_regime_and_refuses_a_stale_index():
+def test_vol_regime_holds_a_bounded_gap_without_a_message_and_refuses_a_stale_index():
     from strategies import vol_regime as vr
     n, limit = vr.SMOOTH_DAYS, vr.MAX_MISSING_PRINTS
     idx = nyse_bdays("2024-01-02", "2024-04-30")
@@ -417,48 +418,56 @@ def test_vol_regime_reports_a_held_regime_and_refuses_a_stale_index():
     indices = pd.DataFrame({"^VIX": 18.0, "^VIX3M": 20.0}, index=idx)
     indices.iloc[40:, 0] = 22.0  # ratio 0.90 -> 1.10 at row 40
     risk = vr.RISK_ASSET
+    assert limit == 5
 
-    # Complete input: every session from the first average on has a signal,
-    # and nothing is reported.
+    # Inside the bound nothing is printed: a hold of a few sessions is the
+    # documented behaviour, and a message here would repeat for every variant
+    # of a sweep. Any warning in this block fails the test.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
+
+        # Complete input: every session from the first average on has a signal.
         full = vr.build_weights(prices, indices)
-    assert full.index.equals(idx[n:])
-    assert full.loc[idx[40], risk] == 1.0 and full.loc[idx[40 + n], risk] == 0.0
+        assert full.index.equals(idx[n:])
+        assert full.loc[idx[40], risk] == 1.0 and full.loc[idx[40 + n], risk] == 0.0
 
-    # One missing print: the n averages containing it are invalid, the last
-    # decided weights are held over those sessions, and the hold is reported.
-    holed = indices.copy()
-    holed.iloc[40, 1] = np.nan
-    with pytest.warns(UserWarning, match=f"unavailable on {n} session"):
+        # One missing print: the n averages containing it are invalid and the
+        # last decided weights are held over those sessions.
+        holed = indices.copy()
+        holed.iloc[40, 1] = np.nan
         held = vr.build_weights(prices, holed)
-    assert held.index.equals(full.index)
-    assert held.loc[idx[41]:idx[40 + n], risk].eq(1.0).all()
-    assert not full.loc[idx[41]:idx[40 + n], risk].eq(1.0).all()
-    pd.testing.assert_frame_equal(held.loc[:idx[40]], full.loc[:idx[40]])
-    pd.testing.assert_frame_equal(held.loc[idx[41 + n]:], full.loc[idx[41 + n]:])
+        assert held.index.equals(full.index)
+        assert held.loc[idx[41]:idx[40 + n], risk].eq(1.0).all()
+        assert not full.loc[idx[41]:idx[40 + n], risk].eq(1.0).all()
+        pd.testing.assert_frame_equal(held.loc[:idx[40]], full.loc[:idx[40]])
+        pd.testing.assert_frame_equal(held.loc[idx[41 + n]:], full.loc[idx[41 + n]:])
 
-    # Prints missing before the series starts only delay the first decision.
-    late = indices.copy()
-    late.iloc[:10, 1] = np.nan
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        # Prints missing before the series starts only delay the first decision.
+        late = indices.copy()
+        late.iloc[:10, 1] = np.nan
         assert vr.build_weights(prices, late).index.equals(idx[10 + n:])
 
-    # The tolerated run of missing prints is bounded.
-    gap = indices.copy()
-    gap.iloc[50:50 + limit, 0] = np.nan
-    with pytest.warns(UserWarning, match="previous regime is held"):
-        assert vr.build_weights(prices, gap).index.equals(full.index)
+        # The longest tolerated run of missing prints.
+        gap = indices.copy()
+        gap.iloc[50:50 + limit, 0] = np.nan
+        # (the regime does not move across it here, so holding changes nothing)
+        pd.testing.assert_frame_equal(vr.build_weights(prices, gap), full)
+
+        # An index file that ends a few sessions before the prices.
+        short = vr.build_weights(prices, indices.iloc[:-3])
+        assert short.index.equals(full.index) and short.loc[idx[-1], risk] == 0.0
+
+        # Every term-structure row of a sweep takes the same quiet path.
+        for variant in vr.TS_VARIANTS:
+            assert vr._ts_weights(prices, holed, *variant).index[-1] == idx[-1]
+
+    # One more missing print than the bound is refused, wherever it sits.
     gap.iloc[50 + limit, 0] = np.nan
     with pytest.raises(ValueError, match=f"{limit + 1} consecutive sessions"):
         vr.build_weights(prices, gap)
-
-    # An index file that ends before the prices: a short lag is held and
-    # reported, a long one is refused instead of passing as a current signal.
-    with pytest.warns(UserWarning, match=f"latest {idx[-1].date()}"):
-        short = vr.build_weights(prices, indices.iloc[:-3])
-    assert short.index.equals(full.index) and short.loc[idx[-1], risk] == 0.0
+    with pytest.raises(ValueError, match=f"limit {limit}; signal last unavailable on {idx[-1].date()}"):
+        vr.build_weights(prices, indices.iloc[:-(limit + 1)])
+    # A stale index file is refused instead of passing as a current signal.
     with pytest.raises(ValueError, match="refresh or repair the index data"):
         vr.build_weights(prices, indices.iloc[:60])
     # The sweep path goes through the same check.
@@ -517,7 +526,9 @@ def test_pair_and_vol_target_builders_do_not_read_later_rows(monkeypatch):
 # ---- running a module: arguments and saved result files --------------------
 
 @pytest.mark.parametrize("name", MODULES)
-@pytest.mark.parametrize("argv,code", [(["--help"], 0), (["--sweeep"], 2), (["extra"], 2)])
+@pytest.mark.parametrize("argv,code", [(["--help"], 0), (["--sweeep"], 2), (["extra"], 2),
+                                       # a shortened flag is not a flag
+                                       (["--reb"], 2), (["--sw"], 2), (["--q"], 2)])
 def test_entry_points_reject_unknown_arguments_before_any_backtest(monkeypatch, capsys, name, argv, code):
     import qcore.data
 
@@ -534,6 +545,30 @@ def test_entry_points_reject_unknown_arguments_before_any_backtest(monkeypatch, 
     assert stop.value.code == code
     shown = capsys.readouterr()
     assert "usage:" in (shown.out if code == 0 else shown.err)
+
+
+@pytest.mark.parametrize("name,argv", [(name, []) for name in MODULES] + [("vol_regime", ["--sweep"])])
+def test_entry_points_without_a_data_cache_stop_with_one_line(monkeypatch, tmp_path, name, argv):
+    """The loader names the missing file and the download command; run as a
+    script, a module passes that line on as its exit message instead of a
+    traceback, and writes nothing."""
+    import qcore.data
+    import qcore.records
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a result file was written")
+
+    monkeypatch.setattr(qcore.data, "DATA_DIR", tmp_path)  # an empty directory
+    monkeypatch.setattr(qcore.records, "save_record", refuse)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    script = STRATEGIES / f"{name}.py"
+    monkeypatch.setattr(sys, "argv", [str(script)] + argv)
+    with pytest.raises(SystemExit) as stop:
+        runpy.run_path(str(script), run_name="__main__")
+    message = stop.value.code
+    assert isinstance(message, str) and len(message.splitlines()) == 1
+    assert message.startswith(str(tmp_path / "adj_close.csv")) and "download_data.py" in message
+    assert list(tmp_path.iterdir()) == []
 
 
 def _direct_writes(path):

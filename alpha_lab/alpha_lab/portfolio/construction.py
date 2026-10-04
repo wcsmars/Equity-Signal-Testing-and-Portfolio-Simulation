@@ -53,10 +53,11 @@ class QuantileLongShort(PortfolioConstructor):
 
     Ties never depend on column order. When the score at a bucket's edge is
     shared by names on both sides of the edge, the whole tied group joins
-    the bucket and splits the slots it straddles equally (m names tied over
-    j slots each get j/m of a slot). A group tied across both edges is long
-    and short at once and nets out, so such a row holds less than
-    ``gross_leverage``.
+    the bucket and, under ``equal`` weighting, splits the slots it straddles
+    equally (m names tied over j slots each get j/m of a slot); under
+    ``score`` weighting it carries the bucket's least extreme score and its
+    near-zero weight. A group tied across both edges is long and short at
+    once and nets out, so such a row can hold less than ``gross_leverage``.
 
     ``gross_leverage`` is the gross of the book BEFORE vol targeting. With
     ``vol_target`` set (annualized), each row is then scaled by

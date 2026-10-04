@@ -35,7 +35,7 @@ from alpha_lab.risk import summary
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(allow_abbrev=False, description=__doc__.splitlines()[0])
     parser.add_argument("--run", required=True, help="run directory, e.g. runs/<run_id>")
     parser.add_argument(
         "--formats",
@@ -142,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except AlphaLabError as exc:
+    except (AlphaLabError, OSError) as exc:
+        # OSError: a report directory that cannot be written. The message
+        # names the path; a traceback would add nothing.
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)

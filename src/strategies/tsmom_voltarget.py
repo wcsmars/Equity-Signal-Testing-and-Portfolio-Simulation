@@ -1,20 +1,92 @@
-"""Exploratory volatility-targeting and concentration variants.
+"""Volatility-target and concentration study on the trend rule. Rejected.
 
-Reuse tsmom_trend's signals and compare normalization across all eligible
-assets versus active assets. A trailing 60-day proposed-portfolio volatility
-estimate scales risky exposure toward 10%, subject to decision-time gross
-and per-name caps. SHY holds positive residual capital. Leveraged positions
-pay a modeled prior ^IRX rate plus 150 bps; actual broker financing, margin
-requirements and forced liquidation are not implemented. Gross exposure
-can drift above its decision-time cap between rebalances.
+Question
+    tsmom_trend runs at about 6% volatility because, on average, only two
+    thirds of capital is in risky assets. Can it be brought to about 10%
+    without losing risk-adjusted return? Two routes were compared:
+      A. Leverage: scale the existing mix above 1.0 gross and borrow.
+      B. Concentration: normalise the inverse-volatility shares over the
+         assets whose signal is on, not over all eligible assets, so the
+         portfolio is fully invested without borrowing.
 
-The sweep includes unscaled, capped-volatility and fixed 1.64x variants.
-Scaled variants in an 8.5%-11.5% pre-2018 volatility band are ranked by
-in-sample Sharpe, then drawdown. This is a retained exploratory rule, not
-an independently verified preregistration; the fixed-leverage comparison
-and historical specification changes followed examination of test results.
-There is no untouched holdout claim. Under common binding constraints,
-volatility scaling cancels the two normalization schemes' scalar difference.
+Hypothesis
+    Scaling exposure to hold predicted volatility constant keeps the Sharpe
+    ratio of the unscaled rule, less the financing cost, and concentration
+    does the same without financing. This is a sizing study on an existing
+    signal, so there is no separate argument about who takes the other side.
+
+Rule
+    Signals, eligibility, month-end decisions and drift between decisions
+    are imported from tsmom_trend. The baseline here keeps SHY for the
+    remainder.
+    Volatility target: at each month-end the predicted volatility is the
+    standard deviation of the proposed risky portfolio's daily returns over
+    the trailing 60 days (weights held fixed across the window), annualised,
+    from data up to the decision close. The scale factor is
+      k = min(10% / predicted, gross cap / gross, 1.5 / largest weight).
+    A positive remainder goes to SHY. A negative remainder is borrowed:
+    interest is (gross long weight - 1) x (the previous close of the 13-week
+    bill yield + 150 bps), charged daily in this module because the engine
+    does not model margin. The spread is a modelling assumption. Margin
+    requirements and forced liquidation are not implemented, and gross
+    exposure can drift above its decision-time cap between rebalances.
+    Constant leverage: 1.64x, which is 10% divided by the unscaled rule's
+    in-sample volatility of 6.1%.
+    Trading costs are modelling assumptions: the commissions and fees of
+    qcore.costs plus 3 bps of slippage per side.
+
+Variants tried
+    9 runs: mix {existing, concentrated} x scaling {none, 10% target with
+    gross cap 1.0, 1.5 or 2.0}, plus constant 1.64x on the existing mix. The
+    unscaled existing mix is the baseline. Under a volatility target the two
+    mixes are identical: both are proportional to signal/vol and differ only
+    by a normalising constant, which the scale factor cancels. The three
+    duplicate runs stay in the table, marked in its duplicate_of column,
+    which leaves six distinct portfolios.
+
+Selection
+    Among scaled variants whose in-sample volatility (data before
+    2018-01-01) lies between 8.5% and 11.5%: the highest in-sample Sharpe at
+    two decimals, ties broken by the shallower in-sample drawdown. This is a
+    retained exploratory rule, not an independently verified
+    pre-registration; the constant-leverage comparison and earlier
+    specification changes followed examination of test results. There is no
+    untouched holdout claim.
+
+Result
+    This code on data ending 2026-07-01, net of the modelled costs and
+    financing, Sharpe ratios in excess of the cash rate, from 2001-02-28.
+    Columns: Sharpe full sample / in sample / out of sample, volatility,
+    maximum drawdown.
+      unscaled (baseline)       0.65 / 0.82 / 0.34     6.34%   -14.45%
+      10% target, cap 1.0       0.53 / 0.70 / 0.26     8.55%   -18.35%
+      10% target, cap 1.5       0.53 / 0.72 / 0.23    10.58%   -26.97%
+      10% target, cap 2.0       0.54 / 0.76 / 0.22    11.49%   -35.17%
+      constant 1.64x            0.62 / 0.76 / 0.37    10.29%   -23.47%
+      concentrated, unscaled    0.44 / 0.58 / 0.19    10.52%   -26.29%
+    The rule selects constant 1.64x: it ties the cap-2.0 variant at 0.76 in
+    sample and has the shallower in-sample drawdown (-12.59% against
+    -19.28%). At double slippage it scores 0.61 / 0.75 / 0.36. Its daily
+    returns correlate 0.997 with the baseline's.
+
+Verdict
+    Rejected: no variant was adopted and the trend rule stays unscaled.
+    - No scaled or concentrated variant matches the unscaled rule in sample
+      (0.82), and the selected one is a tie decided on drawdown.
+    - The volatility target adds leverage at the wrong time. Its scale
+      factor is negatively correlated with the rule's own exposure (-0.57
+      over the full sample and -0.70 from 2018, at cap 2.0), so it levers
+      most when few assets are trending. It reached the 2.0 cap at 27 of 292
+      decisions, and gross exposure drifted to 2.38x on 2020-03-19, the
+      trough of the -35.17% drawdown of a portfolio aimed at 10% volatility.
+    - Concentration discards the information in the exposure level: 0.58 in
+      sample against 0.82.
+    - Constant leverage is the baseline scaled up. It pays 0.78% a year in
+      financing and deepens the drawdown from -14.45% to -23.47%. Its
+      out-of-sample 0.37 against 0.34 was seen after the fact and is not
+      evidence for it.
+    If more trend exposure is wanted, giving the unscaled rule a larger
+    share of the combined portfolio provides it without borrowing.
 
 Run the module to write computed CSV/JSON results; --quiet hides the table.
 A saved result file that differs from the new run is kept and the new output
@@ -42,7 +114,7 @@ from strategies.tsmom_trend import (  # noqa: E402
 
 TARGET_VOL = 0.10
 VOL_LOOKBACK = 60          # days; matches the sleeve's per-asset estimator
-MARGIN_SPREAD_BPS = 150.0  # IBKR Pro Tiered USD, first 100k: BM + 1.5%
+MARGIN_SPREAD_BPS = 150.0  # modelling assumption: bill yield + 1.5% to borrow
 ENGINE_PER_ASSET_CAP = 1.5  # run_backtest clips weights to +/-1.5
 KLEV = round(TARGET_VOL / 0.061, 2)  # 1.64x: target / baseline IS vol
 
@@ -247,7 +319,9 @@ def main():
 
 
 def _parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # allow_abbrev=False: a shortened flag such as --reb is refused, not accepted
+    # by the parser and then missed by the exact-name checks that act on it
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--quiet", action="store_true", help="do not print the sweep table")
     parser.add_argument("--rebase", action="store_true",
                         help="replace the saved variants CSV and JSON when this run differs from them")
@@ -256,4 +330,7 @@ def _parse_args(argv=None):
 
 if __name__ == "__main__":
     _parse_args()
-    main()
+    try:
+        main()
+    except FileNotFoundError as exc:  # no data cache: the loader's one line, no traceback
+        sys.exit(str(exc))

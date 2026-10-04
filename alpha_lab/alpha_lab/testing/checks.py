@@ -54,8 +54,10 @@ def _resolve_dates(
       returns the whole panel, so that comparison could never fail.
     - The warm-up: the first two dates, the middle of the first sixth and,
       when the full-panel output ``full`` is supplied, the first date on
-      which it holds any value. Long-lookback outputs are legitimately
-      missing there, which is exactly where a backfill (``bfill``, two-sided
+      which it holds any value and the first date on which it holds a
+      non-zero value. Long-lookback outputs are legitimately missing there
+      (NaN for features and scores, 0.0 for target weights, which are never
+      NaN), which is exactly where a backfill (``bfill``, two-sided
       interpolation, filling the warm-up with a later statistic) writes
       future values, so these rows must be compared too.
     """
@@ -68,9 +70,14 @@ def _resolve_dates(
         pos = list(np.linspace(lo, n - 2, DEFAULT_SAMPLES).round().astype(int))
         pos += [0, 1, lo // 2]
         if full is not None:
-            valued = np.flatnonzero(idx.isin(full.index[full.notna().any(axis=1).to_numpy()]))
-            if len(valued):
-                pos.append(int(valued[0]))
+            # A warm-up is blank (NaN) or flat (0.0): a short backfill into a
+            # flat one sits behind rows that already "hold a value".
+            present = full.notna()
+            for filled in (present, present & full.ne(0)):
+                rows = filled.any(axis=1).to_numpy(dtype=bool)
+                valued = np.flatnonzero(idx.isin(full.index[rows]))
+                if len(valued):
+                    pos.append(int(valued[0]))
         return idx[np.unique(pos)]
     out = []
     for t in dates:
@@ -81,6 +88,24 @@ def _resolve_dates(
     if not out:
         raise DataError("empty dates iterable")
     return pd.DatetimeIndex(out)
+
+
+def _require_values(full: pd.DataFrame, checked: pd.DatetimeIndex, label: str) -> None:
+    """Raise DataError when ``full`` is blank on every checked date.
+
+    Blank means missing or 0.0. Blank rows matching blank rows prove
+    nothing: a panel shorter than the lookback, or a constructor fed scores
+    that are all missing, would pass without one value being compared.
+    Called after the comparisons, so a leak that blanks rows is still
+    reported as a leak.
+    """
+    filled = (full.notna() & full.ne(0)).any(axis=1).to_numpy(dtype=bool)
+    if not checked.isin(full.index[filled]).any():
+        raise DataError(
+            f"{label}: the full-panel output holds no non-zero value on any "
+            "checked date, so the check would pass vacuously (is the panel "
+            "shorter than the lookback?)"
+        )
 
 
 def _compare_rows(
@@ -220,12 +245,15 @@ def assert_truncation_invariant(
     plus the warm-up rows, see :func:`_resolve_dates`) the truncated row t
     must match the full-panel row t exactly — identical NaN pattern, values
     equal within ``rtol``/``atol``. Raises LookaheadError with the offending
-    date, tickers, and max deviation.
+    date, tickers, and max deviation, and DataError when the full-panel
+    output is blank (missing or 0.0) on every checked date: nothing would
+    have been compared.
     """
     full = compute(data)
     if not isinstance(full, pd.DataFrame):
         raise DataError(f"{label} must return a DataFrame, got {type(full).__name__}")
-    for t in _resolve_dates(data, dates, full):
+    checked = _resolve_dates(data, dates, full)
+    for t in checked:
         sliced = compute(data.slice_until(t))
         if t not in sliced.index:
             raise LookaheadError(
@@ -233,6 +261,7 @@ def assert_truncation_invariant(
                 f"{t.date()} — the computation dropped the as-of date"
             )
         _compare_rows(sliced.loc[t], full.loc[t], t, rtol, atol, label)
+    _require_values(full, checked, label)
 
 
 def assert_feature_pit(
@@ -266,13 +295,16 @@ def assert_signal_pit(
     composition. The signal is deep-copied per evaluation so no state can
     bleed between runs; ``fit`` is not called — this checks the pure scoring
     path (train-window fitting discipline is the walk-forward engine's job).
+    DataError is raised when no checked date holds a score (a panel shorter
+    than the signal's lookback).
     """
     label = f"signal '{signal.name}'"
     specs = tuple(signal.required_features)
     full_scores = copy.deepcopy(signal).score(
         _compute_feature_panels(specs, data, registry), data
     )
-    for t in _resolve_dates(data, dates, full_scores):
+    checked = _resolve_dates(data, dates, full_scores)
+    for t in checked:
         sliced = data.slice_until(t)
         trunc_scores = copy.deepcopy(signal).score(
             _compute_feature_panels(specs, sliced, registry), sliced
@@ -280,6 +312,7 @@ def assert_signal_pit(
         if t not in trunc_scores.index:
             raise LookaheadError(f"{label}: no score row for as-of date {t.date()}")
         _compare_rows(trunc_scores.loc[t], full_scores.loc[t], t, rtol, atol, label)
+    _require_values(full_scores, checked, label)
 
 
 def assert_constructor_pit(
@@ -294,17 +327,21 @@ def assert_constructor_pit(
 
     W_t may use information through close t, so the weights row t built from
     ``scores.loc[:t]`` and ``data.slice_until(t)`` must equal the row t of
-    the full-panel weights. Raises LookaheadError on any deviation.
+    the full-panel weights. Raises LookaheadError on any deviation, and
+    DataError when no checked date holds a position (scores that are all
+    missing: nothing would have been compared).
     """
     label = f"constructor '{type(constructor).__name__}'"
     full = constructor.weights(scores, data)
-    for t in _resolve_dates(data, dates, full):
+    checked = _resolve_dates(data, dates, full)
+    for t in checked:
         if t not in scores.index:
             raise DataError(f"{label}: date {t.date()} not in the scores index")
         trunc = constructor.weights(scores.loc[:t], data.slice_until(t))
         if t not in trunc.index:
             raise LookaheadError(f"{label}: no weights row for as-of date {t.date()}")
         _compare_rows(trunc.loc[t], full.loc[t], t, rtol, atol, label)
+    _require_values(full, checked, label)
 
 
 def assert_cost_pit(

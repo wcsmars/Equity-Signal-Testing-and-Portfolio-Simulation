@@ -20,7 +20,9 @@ charged here; strategies using leverage or shorts must model them separately.
 Dividend withholding uses inferred payouts and fixed Treasury exemptions,
 which are approximations rather than fund/year-specific tax accounting.
 Inferred payouts cannot separate cash dividends from spin-off adjustments,
-so spin-off dates can be charged withholding.
+so spin-off dates can be charged withholding. Fund special and capital-gain
+distributions are charged like ordinary dividends, and vendor rounding noise
+just above qcore.data.DIVIDEND_NOISE_FLOOR is charged as a tiny dividend.
 
 Metrics include a fixed 2018 split and excess-return Sharpe. The split alone
 does not establish untouched evaluation data or validate parameter selection.

@@ -245,6 +245,30 @@ def test_failed_rollback_keeps_the_backups_and_restores_the_rest(monkeypatch, tm
     stages = list(tmp_path.glob(".refresh-*"))
     assert len(stages) == 1 and str(stages[0]) in str(failure.value)
     assert (stages[0] / "a.backup").read_text() == "original a"
+    assert "should be deleted" not in str(failure.value)  # a.csv is not a new file
+
+
+def test_failed_rollback_names_new_files_separately_from_backups(monkeypatch, tmp_path):
+    # "a" did not exist before; promoting b fails and removing the new a.csv
+    # fails too. The operator is told to delete a.csv by name, never to infer
+    # it from a missing backup.
+    monkeypatch.setattr(download_data, "DATA_DIR", tmp_path)
+    (tmp_path / "b.csv").write_text("original b")
+    _failing_replace(monkeypatch, fail_on={2})
+    actual_unlink = Path.unlink
+
+    def unlink(self, *args, **kwargs):
+        if self.name == "a.csv":
+            raise PermissionError("locked")
+        return actual_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(RuntimeError, match=r"could not restore \['a'\]") as failure:
+        download_data._write_cache({"a": _response(), "b": _response()})
+    assert "['a'] did not exist before this refresh and should be deleted" in str(failure.value)
+    assert (tmp_path / "b.csv").read_text() == "original b"
+    stages = list(tmp_path.glob(".refresh-*"))
+    assert len(stages) == 1 and not (stages[0] / "a.backup").exists()
 
 
 def test_leftover_staging_folder_is_reported_and_not_deleted(monkeypatch, tmp_path, capsys):
@@ -359,6 +383,36 @@ def test_stale_index_panel_aborts_refresh_and_keeps_the_cache(monkeypatch, tmp_p
     _refresh(monkeypatch, tmp_path, equity, index=_index_response(n=7))
     assert len(_read(tmp_path / "indices.csv")) == 7
     assert len(_read(tmp_path / "adj_close.csv")) == allowed + 7
+
+
+def test_allow_shrink_is_the_way_through_a_stale_index_panel(monkeypatch, tmp_path, capsys):
+    allowed = download_data.INDEX_MAX_LAG_SESSIONS
+    equity, index = _response(n=allowed + 7), _index_response(n=6)
+    with pytest.raises(ValueError, match="indices: panel ends 2024-01-09") as refusal:
+        _refresh(monkeypatch, tmp_path, equity, index=index)
+    assert f"the cache in {tmp_path} is unchanged" in str(refusal.value)
+    assert "--allow-shrink" in str(refusal.value)
+    assert list(tmp_path.iterdir()) == []
+    capsys.readouterr()
+    _refresh(monkeypatch, tmp_path, equity, index=index, allow_shrink=True)
+    out = capsys.readouterr().out
+    assert "WARNING: --allow-shrink" in out and "indices: panel ends 2024-01-09" in out
+    assert len(_read(tmp_path / "indices.csv")) == 6
+    assert len(_read(tmp_path / "adj_close.csv")) == allowed + 7
+
+
+def test_command_line_passes_the_escape_hatch_to_the_refresh(monkeypatch, capsys):
+    seen = []
+    monkeypatch.setattr(download_data, "main", lambda **kwargs: seen.append(kwargs))
+    download_data._cli([])
+    download_data._cli(["--allow-shrink"])
+    assert seen == [{"allow_shrink": False}, {"allow_shrink": True}]
+    with pytest.raises(SystemExit) as stop:
+        download_data._cli(["--allow-shrnk"])  # a mistyped flag must not start a refresh
+    assert stop.value.code == 2 and len(seen) == 2
+    with pytest.raises(SystemExit) as stop:
+        download_data._cli(["--help"])
+    assert stop.value.code == 0 and "--allow-shrink" in capsys.readouterr().out
 
 
 # ------------------------------------------------------ download validation
@@ -534,8 +588,9 @@ def test_existing_cache_that_cannot_be_compared_blocks_the_refresh(monkeypatch, 
     victim.write_text("" if damage == "empty file"
                       else victim.read_text().replace("2024-01-04", "not-a-date"))
     before = _snapshot(tmp_path)
-    with pytest.raises(ValueError, match=r"close\.csv: existing file cannot be compared"):
+    with pytest.raises(ValueError, match=r"close\.csv: existing file cannot be compared") as refusal:
         _refresh(monkeypatch, tmp_path, _response())
+    assert "--allow-shrink" in str(refusal.value) and "damaged" in str(refusal.value)
     assert _snapshot(tmp_path) == before
     _refresh(monkeypatch, tmp_path, _response(), allow_shrink=True)  # the repair path
     assert len(_read(victim)) == 6
@@ -630,6 +685,40 @@ def test_environment_override_sets_the_cache_directory(tmp_path, value):
     assert done.stdout.strip() == str(expected)
 
 
+def test_non_default_cache_directory_is_announced_once_on_stderr(monkeypatch, tmp_path, capsys):
+    home, other = tmp_path / "data", tmp_path / "live"
+    for folder in (home, other):
+        folder.mkdir()
+        (folder / "adj_close.csv").write_text(_cache_csv(_DATES))
+    monkeypatch.setattr(qcore.data, "_ANNOUNCED", set())
+    monkeypatch.setattr(qcore.data, "DEFAULT_DATA_DIR", home)
+    monkeypatch.setattr(qcore.data, "DATA_DIR", home)
+    qcore.data.load_prices()
+    assert capsys.readouterr().err == ""  # the default cache needs no notice
+    monkeypatch.setattr(qcore.data, "DATA_DIR", other)
+    qcore.data.load_prices()
+    qcore.data.load("adj_close", strict=False)
+    with pytest.raises(FileNotFoundError):
+        qcore.data.load_indices()
+    shown = capsys.readouterr()
+    assert shown.out == ""  # never on stdout, where scripts print their results
+    assert shown.err.count("\n") == 1 and "QCORE_DATA_DIR" in shown.err
+    assert str(other) in shown.err and str(home) in shown.err
+
+
+def test_exported_override_is_visible_in_a_fresh_process(tmp_path):
+    src = Path(qcore.data.__file__).resolve().parents[1]
+    (tmp_path / "adj_close.csv").write_text(_cache_csv(_DATES))
+    env = dict(os.environ, PYTHONPATH=str(src), PYTHONDONTWRITEBYTECODE="1",
+               QCORE_DATA_DIR=str(tmp_path))
+    code = "import qcore.data as d; d.load_prices(); print(len(d.load_prices()))"
+    done = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                          text=True, check=True)
+    assert done.stdout.strip() == str(len(_DATES))
+    notices = [line for line in done.stderr.splitlines() if line.startswith("NOTE:")]
+    assert len(notices) == 1 and str(tmp_path.resolve()) in notices[0]
+
+
 def test_dividend_noise_floor_decides_which_differences_count_as_payouts(monkeypatch):
     dates = pd.bdate_range("2020-01-01", periods=400)
     rng = np.random.default_rng(3)
@@ -657,3 +746,33 @@ def test_dividend_noise_floor_decides_which_differences_count_as_payouts(monkeyp
     clean = qcore.data.dividend_yields()
     pd.testing.assert_frame_equal(clean > 0, expected)
     assert clean.iloc[ex_rows, 0].to_numpy() == pytest.approx(paid, rel=0.02)
+
+
+def test_blank_close_guard_passes_a_late_listing_and_names_every_later_hole():
+    dates = pd.bdate_range("2024-01-02", periods=30)
+    closes = pd.DataFrame(100.0, index=dates, columns=["AAA", "BBB"])
+    closes.iloc[:5, 1] = np.nan                       # BBB lists late: not a hole
+    assert qcore.data.require_listed_closes(closes, "unused") is None
+    assert qcore.data.require_listed_closes(closes["BBB"], "unused") is None
+
+    holes = closes.copy()
+    holes.iloc[7, 1] = np.nan                         # one BBB close after its listing
+    holes.iloc[10:22, 0] = np.nan                     # twelve AAA closes in a row
+    with pytest.raises(ValueError) as stop:
+        qcore.data.require_listed_closes(holes, "The rule would do X", what="month-end close")
+    message = str(stop.value)
+    cells = [f"BBB {dates[7].date()}"] + [f"AAA {d.date()}" for d in dates[10:19]]
+    assert message == ("blank month-end close after listing in 13 cell(s): " + ", ".join(cells)
+                       + ". The rule would do X; repair the price cache.")   # first ten cells, all counted
+
+    # one ticker's series is reported by date under the series name
+    with pytest.raises(ValueError) as stop:
+        qcore.data.require_listed_closes(holes["AAA"], "Dropping the row would do Y")
+    listed = ", ".join(str(d.date()) for d in dates[10:20])
+    assert str(stop.value) == (f"blank AAA close after listing on 12 date(s): {listed}. "
+                               "Dropping the row would do Y; repair the price cache.")
+    # a blank final row is a hole too: the last close is a decision close
+    final = closes.copy()
+    final.iloc[-1, 1] = np.nan
+    with pytest.raises(ValueError, match=f"in 1 cell.*BBB {dates[-1].date()}"):
+        qcore.data.require_listed_closes(final, "unused")

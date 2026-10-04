@@ -1,10 +1,15 @@
 name: Tests
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  # Manual runs: a dependency release can break a leg without any push.
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -17,4 +22,50 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements.txt
       - run: python -m pytest
-      - run: python alpha_lab/scripts/run_backtest.py --config alpha_lab/configs/base.yaml
+      # The steps below run even when a test failed, so each gives its own signal.
+      # The sample report in examples/ must be what the default configuration produces.
+      - run: python alpha_lab/scripts/run_backtest.py --config alpha_lab/configs/base.yaml --runs-dir ci-run
+        if: ${{ !cancelled() }}
+      - run: diff ci-run/*/report/report.md examples/synthetic_report.md
+        if: ${{ !cancelled() }}
+      # The market-data commands must run offline on the synthetic sample cache:
+      # the data-quality gate, the four sleeve records, then the blend.
+      - run: python scripts/make_sample_data.py
+        if: ${{ !cancelled() }}
+      - run: |
+          python scripts/data_quality.py
+          mkdir -p results
+          for key in mean_reversion seasonality_flows tsmom_trend xsec_etf_mom; do
+            python "src/strategies/$key.py" > "results/$key.json"
+          done
+          python src/ensemble.py
+        if: ${{ !cancelled() }}
+        env:
+          QCORE_DATA_DIR: ${{ github.workspace }}/sample_data
+  minimum-versions:
+    # The lowest versions requirements.txt allows, on the oldest supported Python.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: python -m pip install numpy==1.24.0 pandas==2.2.0 PyYAML==6.0 matplotlib==3.7.0 yfinance==0.2.40 pytest==7.4.0
+      - run: python -m pytest
+      - run: python alpha_lab/scripts/run_backtest.py --config alpha_lab/configs/base.yaml --runs-dir ci-run
+        if: ${{ !cancelled() }}
+      - run: diff ci-run/*/report/report.md examples/synthetic_report.md
+        if: ${{ !cancelled() }}
+      - run: python scripts/make_sample_data.py
+        if: ${{ !cancelled() }}
+      - run: |
+          python scripts/data_quality.py
+          mkdir -p results
+          for key in mean_reversion seasonality_flows tsmom_trend xsec_etf_mom; do
+            python "src/strategies/$key.py" > "results/$key.json"
+          done
+          python src/ensemble.py
+        if: ${{ !cancelled() }}
+        env:
+          QCORE_DATA_DIR: ${{ github.workspace }}/sample_data

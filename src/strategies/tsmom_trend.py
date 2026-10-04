@@ -1,19 +1,69 @@
-"""Monthly multi-asset time-series momentum research example.
+"""Monthly multi-asset trend following (time-series momentum) on 14 ETFs.
 
-Blend a 10-month moving-average filter with positive 12-1 momentum.
-Inverse 60-day volatility shares are normalized over all eligible ETFs;
-the signal scales each share and residual weight remains in modeled cash.
-Assets require 13 month-end observations and available volatility estimates.
-Holdings drift between monthly decisions; the model assumes execution at
-the decision close and charges 3 bps per-side slippage.
+Hypothesis
+    Trends in broad asset classes persist for months. News is absorbed
+    gradually, and large investors adjust slowly or trade against the move
+    for reasons other than expected return: rebalancing to fixed weights,
+    hedging, taking profits. Holding what has been rising and stepping aside
+    from what has been falling collects from them, at the price of whipsaw
+    losses when a trend reverses.
 
-The cash residual replaced SHY after post-2018 results had been examined.
-It is a historical post-test revision, not a choice supported solely by
-the pre-2018 selection rule. The 2018+ segment is therefore not an untouched
-holdout for this specification. --sweep retains both cash and SHY variants.
+Rule
+    Universe: SPY QQQ IWM EFA EEM FXI EWJ (equities), TLT IEF LQD (bonds),
+    GLD SLV DBC (commodities), VNQ (real estate).
+    Decisions are made at the close of the last trading day of each month,
+    from data up to that close.
+    Eligibility: 13 month-end closes and a 60-day volatility estimate. ETFs
+    listed after 2000 join as they qualify.
+    Signal per asset, in {0, 0.5, 1}: the average of
+      1 if the month-end close is above the mean of the last 10 month-end
+        closes, else 0, and
+      1 if 12-1 momentum is positive (close one month ago / close twelve
+        months ago - 1 > 0), else 0.
+    Weight: signal x inverse-volatility share. The share is (1/vol) divided
+    by the sum of 1/vol over ALL eligible assets, vol being the 60-day
+    standard deviation of daily returns. Exposure therefore reaches 1.0 only
+    when every eligible asset is fully on; it averaged 0.66.
+    The remainder stays in cash earning the engine's Treasury-bill proxy
+    (13-week bill yield less 10 bps). No shorts, no leverage.
+    Holdings drift between month-ends; orders are placed only at the monthly
+    decision. The engine assumes execution at the decision close.
+    Costs are modelling assumptions: the commissions and fees of
+    qcore.costs plus 3 bps of slippage per side.
+
+Variants tried
+    12: signal {10-month average, 12-1 momentum, blend of the two} x
+    weighting {equal, inverse volatility} x remainder {cash, SHY}.
+    --sweep re-runs all of them.
+
+Selection
+    In-sample Sharpe (data before 2018-01-01) chose the blend signal with
+    inverse-volatility weights. For the remainder the same rule preferred
+    SHY in all six signal/weighting pairs (0.82 against 0.77 for the chosen
+    pair). The default nevertheless holds cash: from 2018 the order reverses
+    in all six pairs (0.42 with cash against 0.34 with SHY), and over the
+    full period the two are level (0.64 and 0.65).
+    The cash remainder replaced SHY after post-2018 results had been
+    examined. It is a post-test revision, not a choice supported by the
+    pre-2018 selection rule, and the 2018+ segment is therefore not an
+    untouched holdout for this specification. --sweep retains both.
+
+Result
+    This code on data ending 2026-07-01, net of the modelled costs, Sharpe
+    ratios in excess of the cash rate, from the first position on
+    2001-02-28:
+    Sharpe 0.64 full sample / 0.77 in sample / 0.42 out of sample (0.41 at
+    double slippage); CAGR 5.58%, volatility 6.25%, maximum drawdown
+    -14.67%. Turnover is 2.0x a year (buys plus sells) and costs take 0.18%
+    a year.
+
+Verdict
+    Kept, as one of the four strategies of the combined portfolio
+    (src/ensemble.py; with xsec_etf_mom, seasonality_flows and
+    mean_reversion).
 
 Run the module to print metrics; --sweep prints the 12 signal, weighting
-and residual-allocation combinations and saves them to
+and remainder combinations and saves them to
 results/tsmom_trend_variants.csv. A saved table that differs from the new
 run is kept and the new one is written to results/recomputed/ unless
 --rebase is given. Unknown flags are rejected.
@@ -37,7 +87,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from qcore.backtest import drift_weights, metrics, run_backtest  # noqa: E402
 from qcore.calendar import confirmed_month_ends  # noqa: E402
 from qcore.costs import IBKRHKCostModel  # noqa: E402
-from qcore.data import load_prices  # noqa: E402
+from qcore.data import load_prices, require_listed_closes  # noqa: E402
 from qcore.records import save_csv  # noqa: E402
 
 RISK = ["SPY", "QQQ", "IWM", "EFA", "EEM", "FXI", "EWJ",
@@ -49,19 +99,6 @@ BEST = {"signal": "blend", "weighting": "iv", "sleeve": "cash"}
 # Cash is a post-test revision; the sweep retains the earlier SHY variant.
 
 
-def _require_closes(closes: pd.DataFrame) -> None:
-    """Raise when an asset has a blank close after its first close."""
-    present = closes.notna().to_numpy()
-    rows, cols = np.nonzero(~present & np.maximum.accumulate(present, axis=0))
-    if len(rows):
-        cells = [f"{closes.columns[c]} {closes.index[r].date()}"
-                 for r, c in zip(rows[:10], cols[:10])]
-        raise ValueError(
-            f"blank close after listing in {len(rows)} cell(s): {', '.join(cells)}. "
-            "The rule would silently drop the asset and raise every other share; "
-            "repair the price cache.")
-
-
 def build_signals(px: pd.DataFrame):
     """Month-end signals/eligibility. Uses only data up to each decision close.
     Month-ends are calendar-confirmed (qcore.calendar): a mid-month final data
@@ -69,7 +106,8 @@ def build_signals(px: pd.DataFrame):
     Fails closed on a blank close after listing (see module docstring)."""
     mp = px.loc[confirmed_month_ends(px.index), RISK]       # month-end closes
     if len(mp):  # every close up to the last decision feeds a signal or a vol window
-        _require_closes(px.loc[:mp.index[-1], RISK])
+        require_listed_closes(px.loc[:mp.index[-1], RISK],
+                              "The rule would silently drop the asset and raise every other share")
     ma10 = (mp > mp.rolling(10).mean()).astype(float)       # 10m MA filter
     mom121 = ((mp.shift(1) / mp.shift(12) - 1) > 0).astype(float)  # 12-1 mom
     vol_me = (px[RISK].pct_change(fill_method=None)
@@ -148,7 +186,7 @@ def sweep(px, sigs, elig, vol_me, shy_ok):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(allow_abbrev=False, description=__doc__.split("\n")[0])
     ap.add_argument("--sweep", action="store_true",
                     help="re-run the 12 tested variants instead of the default one")
     ap.add_argument("--rebase", action="store_true",
@@ -171,4 +209,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except FileNotFoundError as exc:  # no data cache: the loader's one line, no traceback
+        sys.exit(str(exc))

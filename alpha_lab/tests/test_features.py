@@ -380,7 +380,8 @@ def test_disk_cache_misses_when_the_feature_source_changes(tmp_path, market_simp
     assert len(list(tmp_path.iterdir())) == 2
 
     # source that cannot be read (a feature defined interactively) falls
-    # back to the qualified name alone: still cached, under its own entry
+    # back to the qualified name and the code as loaded: still cached,
+    # under its own entry
     def no_source(obj):
         raise OSError("source code not available")
 
@@ -517,6 +518,117 @@ def test_disk_cache_misses_when_the_implementation_differs(tmp_path, market_simp
     # each implementation still finds its own entry
     back = FeatureStore(cache_dir=tmp_path).get(spec, market_simple)
     pd.testing.assert_frame_equal(back, original, check_freq=False)
+
+
+def _sourceless_registry(scaled, calls):
+    """A 'returns' feature whose class has no source text to read, as when
+    it is defined in an interactive session."""
+    namespace = {"WindowReturn": WindowReturn, "calls": calls, "__name__": "interactive_session"}
+    exec(
+        "class Scaled(WindowReturn):\n"
+        "    def compute(self, data):\n"
+        "        calls.append(1)\n"
+        f"        return {scaled} super().compute(data)\n",
+        namespace,
+    )
+    registry = Registry("feature")
+    registry.register("returns")(namespace["Scaled"])
+    return registry
+
+
+def test_disk_cache_separates_versions_of_a_class_without_source(tmp_path, market_simple):
+    # versions of an interactively defined class share a qualified name and
+    # have no source text: the code they loaded must tell them apart
+    spec = FeatureSpec.make("returns", window=1)
+    calls = []
+
+    def get(scaled):
+        store = FeatureStore(registry=_sourceless_registry(scaled, calls), cache_dir=tmp_path)
+        return store.get(spec, market_simple)
+
+    one = get("1.0 *")
+    two = get("2.0 *")  # another constant
+    pd.testing.assert_frame_equal(two, 2.0 * one)
+    shifted = get("1.0 +")  # same constants and names, another operation
+    pd.testing.assert_frame_equal(shifted, 1.0 + one)
+    assert len(calls) == 3 and len(list(tmp_path.iterdir())) == 3
+    # the same code defined again is a hit
+    pd.testing.assert_frame_equal(get("2.0 *"), two, check_freq=False)
+    assert len(calls) == 3 and len(list(tmp_path.iterdir())) == 3
+
+
+def test_disk_cache_keeps_stale_loaded_code_apart_from_its_edited_file(
+    tmp_path, market_simple, monkeypatch
+):
+    # The source text is read from the file when a panel is requested. A
+    # session that imported the feature BEFORE its file was edited still
+    # runs the old code: that panel must not land under the key the edited
+    # code will look up once it is loaded.
+    import importlib.util
+    import linecache
+    import sys
+
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    path = tmp_path / "edited_feature.py"
+    text = (
+        "from alpha_lab.features.library import WindowReturn\n\n\n"
+        "class Scaled(WindowReturn):\n"
+        "    def compute(self, data):\n"
+        "        return 1.0 * super().compute(data)\n"
+    )
+
+    def load():
+        module_spec = importlib.util.spec_from_file_location("edited_feature", path)
+        module = importlib.util.module_from_spec(module_spec)
+        monkeypatch.setitem(sys.modules, "edited_feature", module)
+        module_spec.loader.exec_module(module)
+        registry = Registry("feature")
+        registry.register("returns")(module.Scaled)
+        return registry
+
+    path.write_text(text)
+    old_session = load()
+    path.write_text(text.replace("1.0 *", "20.0 *"))  # edited on disk, not reloaded
+    linecache.clearcache()
+    spec = FeatureSpec.make("returns", window=1)
+    cache = tmp_path / "cache"
+    stale = FeatureStore(registry=old_session, cache_dir=cache).get(spec, market_simple)
+    pd.testing.assert_frame_equal(stale, market_simple.returns())  # the old code ran
+
+    fresh = FeatureStore(registry=load(), cache_dir=cache).get(spec, market_simple)
+    pd.testing.assert_frame_equal(fresh, 20.0 * market_simple.returns())
+    assert len(list(cache.iterdir())) == 2
+
+
+def test_code_token_does_not_depend_on_the_hash_seed():
+    # A set literal compiles to a frozenset constant whose repr order follows
+    # PYTHONHASHSEED. The disk key must be the same in every process, or the
+    # cache would never be hit again.
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from alpha_lab.features import store
+
+    code = (
+        "from alpha_lab.core.interfaces import Feature\n"
+        "from alpha_lab.features.store import _code_token\n"
+        "class Tagged(Feature):\n"
+        "    name = 'tagged'\n"
+        "    def compute(self, data):\n"
+        "        return data.close if self.name in {'alpha', 'beta', 'gamma', 'delta'} else None\n"
+        "print(_code_token(Tagged()))\n"
+    )
+    package_root = str(Path(store.__file__).resolve().parents[2])
+    tokens = []
+    for seed in ("1", "2", "3", "4"):
+        env = dict(os.environ, PYTHONHASHSEED=seed)
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, env.get("PYTHONPATH")]))
+        proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        tokens.append(proc.stdout.strip().splitlines()[-1])
+    assert tokens[0].startswith("__main__.Tagged:") and len(set(tokens)) == 1, tokens
 
 
 def test_fingerprint_distinguishes_seeds():

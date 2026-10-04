@@ -1,20 +1,84 @@
-"""Turn-of-month seasonality example for SPY.
+"""Turn-of-month seasonality on SPY.
 
-Hold SPY through the last four trading days of a month and the first two
-of the next, with modeled cash otherwise. Weights anticipate the next
-session's calendar window and the engine shifts them by one row. Window dates use approximate NYSE holiday rules independently of the
-price sample; future unscheduled closures are not assumed known. Costs assume 2 bps per side.
+Hypothesis
+    Money reaches the equity market on a calendar. Salaries and pension
+    contributions are invested around the month-end, and funds rebalance and
+    tidy positions for month-end reporting. These buyers act on the date,
+    not the price, so the sessions around the turn of the month have carried
+    more than their share of the equity return. Holding SPY only on those
+    sessions collects the price pressure that the scheduled buyers pay.
 
-Default execution prints metrics. --sweep compares window/filter settings,
-prints the table and saves it to results/seasonality_flows_variants.csv; a
-saved table that differs from the new run is kept and the new one is written
-to results/recomputed/ unless --rebase is given. --overnight-note reports a
-descriptive gross close-to-open versus open-to-close decomposition. Unknown
-flags are rejected. Neither the fixed parameters nor the calendar split
-establish an untouched evaluation sample.
+Rule
+    Hold SPY with 100% of capital on the last N=4 trading days of each month
+    and the first M=2 of the next. Hold cash, earning the engine's
+    Treasury-bill proxy (13-week bill yield less 10 bps), on all other days.
+    No trend filter.
+    The window is calendar information: the exchange calendar is published
+    in advance, so whether the next session lies in the window is known at
+    today's close. The weight at a close is 1 exactly when the next
+    scheduled session is in the window, and the engine applies it to that
+    session's return. Window dates use approximate NYSE holiday rules
+    independently of the price sample; an unscheduled closure is not assumed
+    known before it happens.
+    One entry and one exit a month; the position is held on 28.6% of
+    sessions.
+    Costs are modelling assumptions: the commissions and fees of
+    qcore.costs plus 2 bps of slippage per side.
 
-Reported statistics begin at a variant's first position, so the 200-day
-filter variants are scored over a shorter window than the unfiltered ones.
+Variants tried
+    12: N {3, 4, 5} x M {2, 3} x 200-day moving-average filter {off, on}.
+    --sweep re-runs all of them.
+
+Selection
+    In-sample Sharpe (data before 2018-01-01): N=4, M=2, no filter, at 0.58;
+    N=4, M=3 is next at 0.56. The 200-day filter lowered the in-sample
+    Sharpe of every N=4 and N=5 combination. It raised it for N=3 (0.55 and
+    0.46 against 0.42 and 0.40) without reaching the unfiltered N=4, M=2.
+    Reported statistics begin at a variant's first position, so the filter
+    variants are scored from 2002 and the unfiltered ones from 2000-01-03.
+    Out-of-sample results (2018-01-01 onwards) are reported, not selected
+    on. Neither the fixed parameters nor the calendar split establish an
+    untouched evaluation sample.
+
+Result
+    This code on data ending 2026-07-01, net of the modelled costs, Sharpe
+    ratios in excess of the cash rate, from 2000-01-03:
+    Sharpe 0.58 full sample / 0.58 in sample / 0.58 out of sample (0.52 at
+    double slippage); CAGR 7.35%, volatility 10.08%, maximum drawdown
+    -13.47%. Turnover is 24.1x a year (12 buys and 12 sells of the whole
+    portfolio) and costs take 0.59% a year. Interest on the idle cash
+    contributes 1.27% a year.
+    SPY held throughout, same engine and period: Sharpe 0.39 full sample /
+    0.26 in sample / 0.66 out of sample, CAGR 7.70%, maximum drawdown
+    -55.58%.
+
+Verdict
+    Kept, as one of the four strategies of the combined portfolio
+    (src/ensemble.py; with tsmom_trend, xsec_etf_mom and mean_reversion).
+
+Secondary measurement, rejected (--overnight-note)
+    Close-to-open against open-to-close returns of SPY and QQQ from 2000 to
+    2026-07-01, before costs. Overnight: SPY 2.94 bps a day (Sharpe 0.66,
+    t = 3.40), QQQ 4.66 bps a day (Sharpe 0.82, t = 4.24). Intraday: SPY
+    0.94 bps a day (Sharpe 0.15), QQQ 0.10 bps (Sharpe 0.01).
+    Harvesting the overnight return takes two trades a day at full size, so
+    the breakeven cost per side is half the mean return: SPY 1.47 bps (2.09
+    from 2018), QQQ 2.33 bps (2.66 from 2018). The 2 bps of slippage per
+    side assumed here, plus commission, is above the SPY breakeven and about
+    equal to QQQ's, before closing- and opening-auction slippage and
+    withholding on dividends, which accrue overnight. The effect is present
+    before costs and not tradable at these costs: rejected, and never part
+    of the strategy above.
+
+Default execution prints metrics. --sweep prints the variants table and
+saves it to results/seasonality_flows_variants.csv; a saved table that
+differs from the new run is kept and the new one is written to
+results/recomputed/ unless --rebase is given. Unknown flags are rejected.
+
+A blank SPY close after its first close raises an error naming the date.
+Dropping the row instead would merge two sessions into one return and
+stretch each 200-day average that spans the gap, without notice.
+--overnight-note applies the same check to SPY and QQQ.
 """
 
 import argparse
@@ -31,7 +95,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from qcore.backtest import OOS_SPLIT, TRADING_DAYS, metrics, run_backtest
 from qcore.quality import SPECIAL_CLOSURES, nyse_bdays
 from qcore.costs import IBKRHKCostModel
-from qcore.data import load, load_prices
+from qcore.data import load, load_prices, require_listed_closes
 from qcore.records import save_csv
 
 N_LAST = 4   # last N trading days of the month
@@ -85,8 +149,15 @@ def tom_weights(spy: pd.Series, n_last: int = N_LAST, m_first: int = M_FIRST,
     return pd.DataFrame({"SPY": hold.astype(float)}, index=idx)
 
 
+def _listed_closes(closes: pd.Series) -> pd.Series:
+    """Closes from the first one on; raises on a blank close after it
+    (see module docstring) instead of dropping the row."""
+    require_listed_closes(closes, "Dropping the row would silently merge two sessions into one return")
+    return closes.dropna()
+
+
 def run_best() -> dict:
-    spy = load_prices()["SPY"].dropna()
+    spy = _listed_closes(load_prices()["SPY"])
     w = tom_weights(spy)
     res = run_backtest(w, spy.to_frame("SPY"),
                        IBKRHKCostModel(slippage_bps=SLIPPAGE_BPS),
@@ -106,7 +177,7 @@ def _is_sharpe_unrounded(res: dict) -> float:
 
 def sweep() -> pd.DataFrame:
     """All 12 variants (N x M x dma200), rows sorted by IS Sharpe desc."""
-    spy = load_prices()["SPY"].dropna()
+    spy = _listed_closes(load_prices()["SPY"])
     rows = []
     for n_last in (3, 4, 5):
         for m_first in (2, 3):
@@ -150,7 +221,7 @@ def overnight_note() -> dict:
     px, op = load_prices(), load("open")
     out = {}
     for tkr in ("SPY", "QQQ"):
-        c = px[tkr].dropna()
+        c = _listed_closes(px[tkr])
         o = op[tkr].reindex(c.index)
         on = (o / c.shift(1) - 1).dropna()
         iday = (c / o - 1).reindex(on.index)
@@ -178,7 +249,7 @@ def overnight_note() -> dict:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(allow_abbrev=False, description=__doc__.split("\n")[0])
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--sweep", action="store_true",
                       help="re-run the 12 tested variants instead of the default one")
@@ -201,4 +272,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except FileNotFoundError as exc:  # no data cache: the loader's one line, no traceback
+        sys.exit(str(exc))
