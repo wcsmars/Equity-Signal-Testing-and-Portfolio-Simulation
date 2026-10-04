@@ -31,6 +31,10 @@ MISSING_INTERNAL_FAIL_PCT = 0.01   # >1% of a ticker's life missing mid-series
 MISSING_GAP_FAIL_DAYS = 5          # one contiguous internal hole this long
 STALE_RUN_WARN = 5                 # identical raw closes in a row
 STALE_RUN_FAIL = 10
+# Treasury-bill funds: with bill yields near zero the close does not move for
+# weeks (SGOV printed the same close for 11-13 sessions three times in 2020),
+# so a pinned close there is reported as WARN and is never an automatic FAIL.
+CASH_LIKE_FUNDS = frozenset({"SGOV", "BIL", "SHV"})
 FROZEN_ROW_WARN = 2                # identical full OHLCV rows in a row (with
                                    # nonzero volume even ONE exact repeat of
                                    # all five fields is a re-served record)
@@ -45,6 +49,11 @@ VOL_COLLAPSE_MIN_SIGMA = 0.003     # ...only for instruments that usually move
 EXTREME_IDIO_WARN = 0.30           # |idiosyncratic daily return|
 EXTREME_SIGMA_K = 15               # vol-scaled companion gate (low-vol names)
 EXTREME_SIGMA_FLOOR = 0.01
+REVERSAL_SIGMA_K = 6               # whole-bar prints below both gates: a move
+REVERSAL_FLOOR = 0.04              # this many trailing sigmas (at least 4%)
+                                   # that the next bar undoes, on a bar whose
+                                   # range clears both neighbours' ranges
+                                   # (2000-2026 on the default universe: none)
 CRISIS_INDEX = "^GSPC"             # independent series that must confirm a
 CRISIS_INDEX_MOVE = 0.02           # market-wide extreme day: |index return|
                                    # that day (smallest on a real such day,
@@ -72,9 +81,25 @@ DELIST_GRACE_DAYS = 5              # trailing rows a ticker may lag the file
 LIVE_EDGE_FAIL_FRAC = 0.25         # share of live tickers with no price on the
                                    # final row that makes it a partial bar
 OHLC_REL_TOL = 1e-3                # rounding slack for low<=px<=high
+WICK_ABS = 0.10                    # high/low this far outside the open-close
+                                   # body...
+WICK_RANGE_K = 5.0                 # ...and this many trailing-median ranges
+WICK_RANGE_WINDOW = 252            # sessions in that trailing median
+WICK_SYSTEMIC_TICKERS = 3          # this many tickers on one day = a market
+                                   # dislocation, reported once for the day
 CAL_YEAR_DAYS = (249, 254)         # plausible trading days per full year
 LEADLAG_MARGIN = 0.10              # lagged |corr| beats contemporaneous by
 LEADLAG_MIN_CORR = 0.25            # ...and is material -> series is shifted
+LEADLAG_BLOCK_MIN_OBS = 200        # returns a calendar year needs to be tested
+                                   # on its own
+LEADLAG_BLOCK_TAIL = 250           # trailing rows tested as one more window
+LEADLAG_BLOCK_MARGIN = 0.30        # one window: lagged |rank corr| beats the
+                                   # same-day one by this much (largest margin
+                                   # in any window a cache of the default
+                                   # universe ending on any day of 2000-2026
+                                   # would have tested: 0.23)
+HISTORY_LOSS_FAIL_ROWS = 5         # recorded observations a series may lose
+                                   # before the loss is a FAIL
 RATE_ZIRP_LEVEL = 0.25             # yield (%) at/below which bills pin for weeks
 RATE_STALE_RUN_WARN = 10           # identical ^IRX prints above that level
                                    # (2000-2026 maximum: 5)
@@ -87,12 +112,35 @@ KNOWN_EVENT_ABS_TOL = 0.01         # an acknowledgement carrying an `expect`
 KNOWN_EVENT_REL_TOL = 0.05         # value holds while |value - expect| <=
                                    # max(abs, rel x |expect|)
 
-# Tickers whose adj_close MUST show dividend events (bond ETFs and broad
-# index funds always distribute); a dividend-free stretch here means the
-# cache silently degraded from total-return to price-return data.
+# Tickers whose adj_close MUST show dividend events (bond, broad index,
+# sector, real-estate and single-country funds that always distribute); a
+# dividend-free stretch here means the cache silently degraded from
+# total-return to price-return data. Every name below has no payout gap
+# above DIV_MAX_GAP_DAYS in a 2000-2026 vendor history (longest: 486 days).
+# Deliberately left out: EWJ, EWT, EWY, XBI and GDX (real multi-year payout
+# gaps) and the commodity / currency funds (GLD, SLV, USO, UNG, DBC, UUP,
+# FXE, FXY).
 EXPECT_DIVIDENDS = {
+    # bonds / credit
     "TLT", "IEF", "SHY", "LQD", "HYG", "TIP", "AGG", "EMB",
+    # broad equity
     "SPY", "QQQ", "IWM", "DIA", "MDY", "EFA", "EEM", "VGK",
+    # single-country funds
+    "EWA", "EWC", "EWG", "EWH", "EWU", "EWZ", "FXI",
+    # US sectors / industries / real estate
+    "XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY",
+    "SMH", "KRE", "XME", "XOP", "IYR", "VNQ",
+}
+
+# Expected payers whose FIRST payout arrives late in the vendor history,
+# mapped to the date by which it must have appeared. Any other expected
+# payer must show a payout within DIV_MAX_GAP_DAYS of its first row. A date,
+# not a blanket exemption: history stripped beyond the known quiet period
+# still fails.
+DIV_FIRST_PAYOUT_BY = {
+    "QQQ": "2003-12-31",  # paid nothing 1999-2002: expenses exceeded income
+    "XLK": "2002-12-31",  # same dot-com-era pattern, first payout 2002-12
+    "SMH": "2012-12-31",  # vendor history shows no payout before 2012-12
 }
 
 # Ratios a real split can take. Forward splits include 3:2 / 4:3 / 5:4.
@@ -222,9 +270,12 @@ class PriceBundle:
     @classmethod
     def load(cls) -> "PriceBundle":
         from qcore.data import INDEX_UNIVERSE, load
-        kw = {f: load(f) for f in cls.FIELDS}
+        # strict=False: duplicate or unsorted dates and a file with no rows
+        # are findings for the checks to locate, not reasons to refuse the
+        # bundle
+        kw = {f: load(f, strict=False) for f in cls.FIELDS}
         try:
-            kw["indices"] = load("indices")
+            kw["indices"] = load("indices", strict=False)
         except FileNotFoundError:
             pass  # check_indices reports it; the price checks still run
         return cls(**kw, required_indices=tuple(INDEX_UNIVERSE))
@@ -530,11 +581,14 @@ def check_stale_prices(b: PriceBundle) -> list[Finding]:
         runs = _runs_of_equal(life)
         runs = runs[runs["length"] >= STALE_RUN_WARN]
         for _, r in runs.iterrows():
-            sev = "FAIL" if r["length"] >= STALE_RUN_FAIL else "WARN"
+            cash_like = t in CASH_LIKE_FUNDS
+            sev = "FAIL" if r["length"] >= STALE_RUN_FAIL and not cash_like else "WARN"
+            note = (" (Treasury-bill fund: plausible when bill yields are near zero)"
+                    if cash_like and r["length"] >= STALE_RUN_FAIL else "")
             out.append(Finding(
                 "stale_prices", sev, t,
                 f"{_fmt_d(r['start'])}..{_fmt_d(r['end'])}",
-                f"close pinned at {r['value']:.4g} for {int(r['length'])} days",
+                f"close pinned at {r['value']:.4g} for {int(r['length'])} days{note}",
                 value=float(r["length"])))
         if len(life) > 40:
             frac = float((life.diff() == 0).sum() / max(len(life) - 1, 1))
@@ -567,10 +621,11 @@ def check_zero_volume(b: PriceBundle) -> list[Finding]:
     """Zero volume with a MOVING price is contradictory (price changes
     require prints); zero-volume runs mean the instrument wasn't trading -
     fine for a tiny 2000s country ETF, alarming for AAPL. Move-with-no-volume
-    gets the harsher treatment."""
+    gets the harsher treatment. The move is measured from the previous valid
+    bar, so a zero-volume bar right after a missing one is still judged."""
     out = []
     common = b.volume.columns.intersection(b.adj_close.columns)
-    ret = b.adj_close[common].pct_change(fill_method=None)
+    ret = _bridged_returns(b.adj_close[common])
     for t in common:
         life = _life(b.adj_close[t])
         if len(life) == 0:
@@ -616,6 +671,19 @@ def check_extreme_returns(b: PriceBundle) -> list[Finding]:
     below the absolute threshold; its persistent hits log as INFO so
     genuine vol outliers never spam the WARN board.
 
+    A WHOLE bar printed at the wrong level (open, high, low and close
+    scaled together) that stays below both gates leaves every other check
+    green: the bar is internally consistent and the adjustment factor is
+    untouched. Its shape gives it away instead: a move beyond
+    REVERSAL_SIGMA_K trailing sigmas (floor REVERSAL_FLOOR, in raw and
+    idiosyncratic return alike) that the next bar undoes, on a bar whose
+    entire range lies outside both neighbours' ranges. Real one-day
+    whipsaws of that size trade through at least one neighbour's range, so
+    they are not flagged; a genuine gap-and-return would be, which is why
+    this is a WARN (it can be adjudicated in the known-events file) and not
+    a FAIL. It is not applied inside a market-wide extreme window, and it
+    cannot judge the latest bar.
+
     A hit with NO later print (the latest bar) can be neither confirmed nor
     reversed yet - a bad print looks exactly like this on the day it
     arrives. It is WARN and says so, whichever gate fired, unless the whole
@@ -642,7 +710,7 @@ def check_extreme_returns(b: PriceBundle) -> list[Finding]:
     idio = ret.sub(ret.median(axis=1), axis=0)
     # pass 1: gates for every ticker, so classification can see how much
     # of the UNIVERSE was extreme on each day
-    hit_cols = {}
+    hit_cols, rev_cols = {}, {}
     for t in ret.columns:
         r = ret[t]
         sig = (r - r.rolling(63, min_periods=40).median()).abs() \
@@ -651,6 +719,9 @@ def check_extreme_returns(b: PriceBundle) -> list[Finding]:
                                  EXTREME_SIGMA_FLOOR)
         hit_cols[t] = ((idio[t].abs() > EXTREME_IDIO_WARN)
                        | (r.abs() > scaled_gate)) & r.notna()
+        rev_gate = np.maximum(REVERSAL_SIGMA_K * sig.shift(), REVERSAL_FLOOR)
+        rev_cols[t] = ((r.abs() > rev_gate) & (idio[t].abs() > rev_gate)
+                       & r.notna() & ~hit_cols[t])
     hit_df = pd.DataFrame(hit_cols, index=ret.index)
     # bad prints are idiosyncratic by nature - they do not synchronize.
     # When a chunk of the board is extreme on the same day (2020-03-16,
@@ -765,6 +836,39 @@ def check_extreme_returns(b: PriceBundle) -> list[Finding]:
                 out.append(Finding(
                     "extreme_returns", sev, t, _fmt_d(d),
                     f"{what}{gap}, {tail}{hint}", value=float(r_adj)))
+    # whole-bar prints below both gates (see docstring). A day that already
+    # carries a finding (previous-day attribution) is not reported twice.
+    reported = {(f.ticker, f.date) for f in out}
+    for t in ret.columns:
+        if t not in b.high.columns or t not in b.low.columns:
+            continue
+        r, hi, lo = ret[t], b.high[t], b.low[t]
+        bars = b.adj_close[t].dropna().index  # neighbours = adjacent VALID bars
+        for d in ret.index[rev_cols[t]]:
+            pos = bars.get_loc(d)
+            if pos + 1 >= len(bars) or bool(crisis.loc[d]) \
+                    or (t, _fmt_d(d)) in reported:
+                continue
+            d_prev, d_next = bars[pos - 1], bars[pos + 1]
+            r_adj, r_next = r.at[d], r.at[d_next]
+            if not abs((1.0 + r_adj) * (1.0 + r_next) - 1.0) \
+                    < 0.25 * abs(r_adj):
+                continue
+            if r_adj > 0:
+                island = (lo.get(d, np.nan) > hi.get(d_prev, np.nan)
+                          and lo.get(d, np.nan) > hi.get(d_next, np.nan))
+            else:
+                island = (hi.get(d, np.nan) < lo.get(d_prev, np.nan)
+                          and hi.get(d, np.nan) < lo.get(d_next, np.nan))
+            if island:
+                out.append(Finding(
+                    "extreme_returns", "WARN", t, _fmt_d(d),
+                    f"adjusted return {r_adj:+.1%} (>{REVERSAL_SIGMA_K}x this "
+                    "instrument's typical daily move) fully reversed next "
+                    f"day ({r_next:+.1%}) and the whole bar printed outside "
+                    "both neighbours' ranges: possible bad print, verify "
+                    "against the tape" + _gap_note(b.adj_close[t], d),
+                    value=float(r_adj)))
     # one finding per (ticker, date): prev-day attribution can duplicate
     seen, dedup = set(), []
     for f in out:
@@ -942,21 +1046,32 @@ def check_adjustment_factor(b: PriceBundle) -> list[Finding]:
 
 
 def check_dividend_presence(b: PriceBundle,
-                            expect_dividends: set[str] | None = None
+                            expect_dividends: set[str] | None = None,
+                            first_payout_by: dict[str, str] | None = None
                             ) -> list[Finding]:
-    """Bond ETFs and broad index funds ALWAYS distribute. If the factor
+    """The funds in EXPECT_DIVIDENDS ALWAYS distribute. If the factor
     shows no dividend events for one of them over a long stretch, the
     cache has silently degraded from total-return to price-return data -
     a few percent a year of phantom underperformance that no other check
     can see (each daily factor ratio is a perfectly innocent 1.0).
 
-    Gaps are measured from the FIRST observed payout onward: a young fund
-    that has not started distributing yet (QQQ paid nothing 1999-2002 -
-    expenses exceeded income) is not 'degraded'; one that paid and then
-    went silent is."""
+    Three rules, each a FAIL:
+      1. no payout over the whole life (a history that ends on or before
+         the fund's date in `first_payout_by` is not judged: its first
+         payout was not due yet);
+      2. the first payout arrives more than DIV_MAX_GAP_DAYS after the
+         first row - an early history that lost its dividends. A fund
+         that really started paying late (QQQ paid nothing 1999-2002 -
+         expenses exceeded income) is listed in `first_payout_by`
+         (default DIV_FIRST_PAYOUT_BY) with the date its first payout
+         must have appeared by;
+      3. a later gap above DIV_MAX_GAP_DAYS between payouts, or after the
+         last one: the fund paid and then went silent."""
     out = []
     if expect_dividends is None:
         expect_dividends = EXPECT_DIVIDENDS
+    if first_payout_by is None:
+        first_payout_by = DIV_FIRST_PAYOUT_BY
     common = b.close.columns.intersection(b.adj_close.columns)
     for t in sorted(expect_dividends & set(common)):
         ft = (b.adj_close[t] / b.close[t]).dropna()
@@ -965,6 +1080,9 @@ def check_dividend_presence(b: PriceBundle,
         g = (ft / ft.shift()).dropna()
         ev = g.index[(g - 1.0) > FACTOR_NOISE_TOL]
         if len(ev) == 0:
+            if (t in first_payout_by
+                    and ft.index[-1] <= pd.Timestamp(first_payout_by[t])):
+                continue  # the cache ends before its first payout was due
             out.append(Finding(
                 "dividend_presence", "FAIL", t,
                 f"{_fmt_d(ft.index[0])}..{_fmt_d(ft.index[-1])}",
@@ -972,6 +1090,17 @@ def check_dividend_presence(b: PriceBundle,
                 "of an instrument that always distributes: total-return "
                 "data degraded to price-return"))
             continue
+        lead = int((ev[:1].values - ft.index[:1].values)
+                   .astype("timedelta64[D]").astype(int)[0])
+        late_ok = (t in first_payout_by
+                   and ev[0] <= pd.Timestamp(first_payout_by[t]))
+        if lead > DIV_MAX_GAP_DAYS and not late_ok:
+            out.append(Finding(
+                "dividend_presence", "FAIL", t,
+                f"{_fmt_d(ft.index[0])}..{_fmt_d(ev[0])}",
+                f"no payout for the first {lead} days of an instrument "
+                "that always distributes: total-return data degraded to "
+                "price-return at the start of the history"))
         marks = ev.append(pd.DatetimeIndex([ft.index[-1]]))
         gaps = np.diff(marks.values).astype("timedelta64[D]").astype(int)
         if len(gaps) and gaps.max() > DIV_MAX_GAP_DAYS:
@@ -1026,11 +1155,26 @@ def check_lead_lag(b: PriceBundle) -> list[Finding]:
     look-ahead for every cross-sectional signal, yet every per-ticker
     check passes (the series itself is pristine - it is just in the wrong
     place). Signature: its returns correlate more with YESTERDAY's (or
-    tomorrow's) market than with today's."""
+    tomorrow's) market than with today's.
+
+    The whole-history test cannot see a shift confined to a SEGMENT (a bad
+    merge, a partial re-download): the unshifted years dominate the
+    full-sample correlation. So each calendar year with at least
+    LEADLAG_BLOCK_MIN_OBS returns, and the trailing LEADLAG_BLOCK_TAIL
+    rows, is also tested on its own. One window is a small sample, and in
+    a crisis thinly traded bond and currency funds really do trail the
+    equity market for weeks, so the window test uses rank correlations (a
+    handful of crash days cannot carry it) and the wider
+    LEADLAG_BLOCK_MARGIN. A shifted stretch much shorter than a window, and
+    instruments that barely correlate with the market, stay out of reach of
+    both tests."""
     out = []
     ret = b.adj_close.pct_change(fill_method=None)
     if ret.shape[1] < 5:
         return out  # need a market to compare against
+    years = ret.index.year
+    windows = [np.flatnonzero(years == y) for y in np.unique(years)]
+    windows.append(np.arange(max(len(ret) - LEADLAG_BLOCK_TAIL, 0), len(ret)))
     for t in ret.columns:
         r = ret[t]
         if r.notna().sum() < 250:
@@ -1046,6 +1190,30 @@ def check_lead_lag(b: PriceBundle) -> list[Finding]:
                 f"returns correlate with the {day} day's market "
                 f"({best:.2f}) better than the same day's ({c0:.2f}): "
                 "series shifted by one day"))
+            continue  # the windows would only repeat it
+        w = pd.DataFrame({"r": r, "same": mkt, "previous": mkt.shift(1),
+                          "next": mkt.shift(-1)})
+        shifted = []
+        for rows in windows:
+            seg = w.iloc[rows]
+            seg = seg[seg["r"].notna()]
+            if len(seg) < LEADLAG_BLOCK_MIN_OBS:
+                continue
+            c = seg.rank().corr()["r"].abs()
+            day = "previous" if c["previous"] >= c["next"] else "next"
+            if c[day] > c["same"] + LEADLAG_BLOCK_MARGIN:
+                shifted.append((c[day] - c["same"], day, c[day], c["same"],
+                                seg.index[0], seg.index[-1]))
+        if shifted:
+            _, day, best, c0, _, _ = max(shifted)
+            out.append(Finding(
+                "lead_lag", "FAIL", t,
+                f"{_fmt_d(min(s[4] for s in shifted))}.."
+                f"{_fmt_d(max(s[5] for s in shifted))}",
+                f"in {len(shifted)} window(s) of this span returns rank-"
+                f"correlate with the {day} day's market ({best:.2f}) better "
+                f"than the same day's ({c0:.2f}): segment shifted by one "
+                "day"))
     return out
 
 
@@ -1106,6 +1274,71 @@ def check_ohlc_consistency(b: PriceBundle) -> list[Finding]:
     return out
 
 
+def check_range_plausibility(b: PriceBundle) -> list[Finding]:
+    """High or low far outside the day's open-close body (a "wick").
+
+    check_ohlc_consistency only proves that open and close sit inside
+    [low, high]; it cannot say whether the extremes themselves ever traded.
+    Vendor highs and lows keep single erroneous prints, and those sit next
+    to genuine dislocations (flash-crash and crisis sessions) that only the
+    tape can tell apart. A wick counts when it is more than WICK_ABS beyond
+    min/max(open, close) AND more than WICK_RANGE_K times the ticker's own
+    trailing-median daily range (so a habitually wide-ranging name is not
+    flagged for behaving normally; a ticker's first 60 sessions have no
+    trailing median and are not judged).
+
+    Everything here is INFO: close-to-close signals never read high or low,
+    and a bad print cannot be told from a real one without the tape, so
+    this check counts and locates the bars instead of gating on them. One
+    finding per isolated (ticker, day); a day on which
+    WICK_SYSTEMIC_TICKERS or more tickers wick together is a market-wide
+    dislocation and is reported once for the day. Anything that uses high
+    or low as a fill trigger, stop level or range estimator should review
+    these bars first."""
+    out = []
+    common = b.low.columns
+    for df in (b.high, b.open, b.adj_close):
+        common = common.intersection(df.columns)
+    if not len(common):
+        return out
+    idx = b.low.index
+    lo, hi, op, cl = (
+        df.reindex(index=idx, columns=common).apply(pd.to_numeric, errors="coerce")
+        for df in (b.low, b.high, b.open, b.adj_close))
+    ok = (lo > 0) & (hi > 0) & (op > 0) & (cl > 0)
+    lo, hi, op, cl = (df.where(ok) for df in (lo, hi, op, cl))
+    body_lo, body_hi = op.where(op < cl, cl), op.where(op > cl, cl)
+    typical = (hi / lo - 1.0).rolling(
+        WICK_RANGE_WINDOW, min_periods=60).median().shift(1)
+    sides = {"low": (1.0 - lo / body_lo, lo, "below"),
+             "high": (hi / body_hi - 1.0, hi, "above")}
+    hot = {side: (wick > WICK_ABS) & (wick > WICK_RANGE_K * typical)
+           for side, (wick, _, _) in sides.items()}
+    n_day = sum(h.sum(axis=1) for h in hot.values())
+    for d in n_day.index[n_day >= WICK_SYSTEMIC_TICKERS]:
+        worst = max(float(sides[s][0].loc[d].where(hot[s].loc[d]).max())
+                    for s in sides if hot[s].loc[d].any())
+        out.append(Finding(
+            "range_plausibility", "INFO", "", _fmt_d(d),
+            f"{int(n_day.loc[d])} high/low wicks beyond {WICK_ABS:.0%} on one "
+            f"day (largest {worst:.1%}): market-wide dislocation"))
+    for side, (wick, px, word) in sides.items():
+        isolated = hot[side].loc[(n_day < WICK_SYSTEMIC_TICKERS).to_numpy()]
+        for t in common:
+            for d in isolated.index[isolated[t]]:
+                usual = typical.at[d, t]
+                times = (f"{wick.at[d, t] / usual:.0f}x" if usual > 0
+                         else "far beyond")
+                out.append(Finding(
+                    "range_plausibility", "INFO", t, _fmt_d(d),
+                    f"{side} {px.at[d, t]:.4g} is {wick.at[d, t]:.1%} {word} "
+                    f"open {op.at[d, t]:.4g} / close {cl.at[d, t]:.4g}, "
+                    f"{times} its median daily range: single-print wick or "
+                    "real dislocation, verify against the tape before "
+                    f"relying on this {side}"))
+    return out
+
+
 def check_delisting(b: PriceBundle) -> list[Finding]:
     """A ticker whose data stops before the end of the file has either
     delisted (backtests must know: its 'flat forever' tail is survivorship
@@ -1157,6 +1390,80 @@ def check_delisting(b: PriceBundle) -> list[Finding]:
             f"final row has no price for {len(lagging)} of {live} live "
             f"tickers (e.g. {', '.join(lagging[:5])}): partial or "
             "in-progress bar"))
+    return out
+
+
+def check_history_loss(b: PriceBundle,
+                       reference: pd.DataFrame | None = None
+                       ) -> list[Finding]:
+    """History a series HELD when `reference` was recorded and no longer
+    has. A cache that holds only recent years for a ticker looks, to every
+    other check, exactly like a later inception (check_delisting counts it
+    as INFO) while every backtest on it quietly changes.
+
+    `reference` is a coverage table recorded for the same cache: index =
+    series name; columns first, last (dates) and rows (observation count) -
+    the layout of the coverage.csv the downloader writes beside the price
+    files. For each adjusted-close column or index series it lists, the
+    observations dated inside the recorded [first, last] span are counted;
+    fewer than the recorded `rows` means observations vanished: WARN up to
+    HISTORY_LOSS_FAIL_ROWS of them, FAIL beyond. Growth (new rows, earlier
+    history) is never a finding, and a series that is in only one of the
+    two is left to check_symbol_mapping. No reference, no check; a
+    reference that cannot be read is a WARN, because "could not compare"
+    must not read as "nothing lost"."""
+    out = []
+    if reference is None:
+        return out
+    try:
+        # the first ten characters: a date written with a time of day
+        # (2000-01-03 00:00:00) is still that date
+        ref = pd.DataFrame({
+            "first": pd.to_datetime(reference["first"].astype(str).str[:10],
+                                    format="%Y-%m-%d", errors="coerce"),
+            "last": pd.to_datetime(reference["last"].astype(str).str[:10],
+                                   format="%Y-%m-%d", errors="coerce"),
+            "rows": pd.to_numeric(reference["rows"], errors="coerce"),
+        }).dropna()
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return [Finding("history_loss", "WARN", "", "",
+                        "recorded coverage is unreadable (needs first, last "
+                        "and rows for each series): lost history cannot be "
+                        "ruled out")]
+    if len(ref) < len(reference):
+        out.append(Finding(
+            "history_loss", "WARN", "", "",
+            f"{len(reference) - len(ref)} of {len(reference)} recorded "
+            "series have an unreadable first, last or rows: lost history "
+            "cannot be ruled out for them"))
+    series = {}
+    for df in [b.adj_close] + ([b.indices] if b.indices is not None else []):
+        df = df.loc[:, ~df.columns.duplicated()]
+        series.update({str(t): df[t] for t in df.columns})
+    ref = ref[~ref.index.duplicated()]
+    for t, (first, last, rows) in ref.iterrows():
+        if str(t) not in series:
+            continue
+        s = series[str(t)].dropna()
+        kept = int(((s.index >= first) & (s.index <= last)).sum())
+        lost, rows = int(rows) - kept, int(rows)
+        if lost <= 0:
+            continue
+        what, date = "", ""
+        if len(s) == 0:
+            what = "; no observations are left"
+        elif s.index[0] > first:
+            date = _fmt_d(s.index[0])
+            what = f"; history now starts {date}"
+        elif s.index[-1] < last:
+            what = f"; history now ends {_fmt_d(s.index[-1])}"
+        out.append(Finding(
+            "history_loss",
+            "FAIL" if lost > HISTORY_LOSS_FAIL_ROWS else "WARN", str(t), date,
+            f"{lost} of the {rows} observations recorded for "
+            f"{_fmt_d(first)}..{_fmt_d(last)} are gone{what}: results "
+            "computed on the earlier cache no longer reproduce",
+            value=float(lost)))
     return out
 
 
@@ -1572,7 +1879,9 @@ PRICE_CHECKS: list[Callable[[PriceBundle], list[Finding]]] = [
     check_adjustment_factor,
     check_dividend_presence,
     check_ohlc_consistency,
+    check_range_plausibility,
     check_delisting,
+    check_history_loss,
     check_lead_lag,
     check_indices,
 ]
@@ -1600,14 +1909,18 @@ def run_all(bundle: PriceBundle,
             fundamentals: pd.DataFrame | None = None,
             snapshot_date=None,
             universe: set[str] | None = None,
-            expect_dividends: set[str] | None = None) -> DQReport:
+            expect_dividends: set[str] | None = None,
+            reference_coverage: pd.DataFrame | None = None) -> DQReport:
     """Run every check; a crashing check becomes a FAIL finding rather than
-    killing the report (partially-validated data must never look clean)."""
+    killing the report (partially-validated data must never look clean).
+    reference_coverage: a coverage table recorded for this cache (see
+    check_history_loss); without one that check is skipped."""
     report = DQReport()
     structural = (check_calendar_alignment, check_calendar_gaps)
     clean_view = _sanitized(bundle)
     extra_kw = {check_symbol_mapping: {"universe": universe},
-                check_dividend_presence: {"expect_dividends": expect_dividends}}
+                check_dividend_presence: {"expect_dividends": expect_dividends},
+                check_history_loss: {"reference": reference_coverage}}
     for chk in PRICE_CHECKS:
         target = bundle if chk in structural else clean_view
         try:

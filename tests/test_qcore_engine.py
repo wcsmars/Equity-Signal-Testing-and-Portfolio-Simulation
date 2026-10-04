@@ -126,7 +126,7 @@ def test_month_end_before_good_friday_is_kept_with_warning():
 
 def test_ordinary_month_end_is_kept_silently_and_partial_month_dropped():
     with warnings.catch_warnings():
-        warnings.simplefilter("error", UserWarning)
+        warnings.simplefilter("error")
         assert confirmed_month_ends(_nyse_index("2024-04-30"))[-1] == pd.Timestamp("2024-04-30")
         assert confirmed_month_ends(_nyse_index("2024-04-15"))[-1] == pd.Timestamp("2024-03-28")
 

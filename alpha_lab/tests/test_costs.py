@@ -457,7 +457,7 @@ def test_missing_unadjusted_close_warns_and_falls_back():
 
     # warns ONCE per model instance: a second call is silent
     with warnings.catch_warnings():
-        warnings.simplefilter("error", UserWarning)
+        warnings.simplefilter("error")
         model.cost(trades, data, NAV)
 
 

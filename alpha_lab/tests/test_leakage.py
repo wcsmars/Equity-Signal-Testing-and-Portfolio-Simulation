@@ -328,9 +328,17 @@ def test_default_sample_covers_the_warm_up_and_skips_the_final_date(market_simpl
     full = market_simple.close.rolling(30).mean()
     with_full = [dates.get_loc(t) for t in _resolve_dates(market_simple, None, full)]
     assert set(with_full) == set(pos) | {29}
-    # an all-missing output adds nothing and does not fail
+    # a warm-up that is flat (0.0, as target weights are) holds a value from
+    # the first date on: the first NON-ZERO row is added as well
+    flat = [dates.get_loc(t) for t in _resolve_dates(market_simple, None, full.fillna(0.0))]
+    assert set(flat) == set(pos) | {29}
+    late = full.fillna(0.0)
+    late.iloc[:10] = np.nan  # blank, then flat, then valued
+    assert {dates.get_loc(t) for t in _resolve_dates(market_simple, None, late)} == set(pos) | {10, 29}
+    # an all-missing or all-zero output adds nothing and does not fail
     empty = pd.DataFrame(np.nan, index=dates, columns=market_simple.tickers)
     assert list(_resolve_dates(market_simple, None, empty)) == list(_resolve_dates(market_simple, None))
+    assert list(_resolve_dates(market_simple, None, empty.fillna(0.0))) == list(_resolve_dates(market_simple, None))
 
 
 class _BackfilledMomentum(Feature):
@@ -348,12 +356,16 @@ class _BackfilledMomentum(Feature):
             return mom.bfill()
         if self.fill == "bfill_limit":
             return mom.bfill(limit=3)  # only rows 18-20 are filled
+        if self.fill == "bfill_limit_flat":
+            return mom.bfill(limit=3).fillna(0.0)  # ... and rows 0-17 are 0.0
         if self.fill == "interpolate":
             return mom.interpolate(limit_direction="both")
         return mom.fillna(mom.iloc[21:42].mean())  # a later statistic
 
 
-@pytest.mark.parametrize("fill", ["bfill", "bfill_limit", "interpolate", "later_mean"])
+@pytest.mark.parametrize(
+    "fill", ["bfill", "bfill_limit", "bfill_limit_flat", "interpolate", "later_mean"]
+)
 def test_backfilled_warm_up_is_caught_by_the_default_sample(fill, market_simple):
     # Every row from ~1/6 of the index onwards is clean: the future values
     # sit only in the warm-up, which the default sample used to skip.
@@ -396,6 +408,90 @@ def test_constructor_pit_catches_backfilled_warm_up(market_simple):
     assert_constructor_pit(ctor, scores, market_simple, dates=clean_from[::40])
     with pytest.raises(LookaheadError, match="_BackfilledConstructor"):
         assert_constructor_pit(ctor, scores, market_simple)
+
+
+class _EarlyEntryConstructor(PortfolioConstructor):
+    """Enters three days before its first score exists."""
+
+    def weights(self, scores, data):
+        centred = scores.sub(scores.mean(axis=1), axis=0)
+        return centred.bfill(limit=3).fillna(0.0)
+
+
+def test_constructor_pit_catches_short_backfill_into_flat_warm_up(market_simple):
+    # Target weights are 0.0 in the warm-up, never missing, so the first date
+    # holding a value is simply the first date. The future scores sit on
+    # rows 18-20 only, behind it: they are reached through the first date
+    # holding a NON-ZERO value.
+    scores = market_simple.close / market_simple.close.shift(21) - 1.0
+    ctor = _EarlyEntryConstructor()
+    full = ctor.weights(scores, market_simple)
+    assert (full.iloc[:18] == 0.0).all().all() and (full.iloc[18] != 0.0).all()
+    # the fixed warm-up rows (0, 1 and the middle of the first sixth) and
+    # every later row are clean
+    n = len(market_simple.dates)
+    clean = market_simple.dates[[0, 1, (n // 6) // 2]].append(market_simple.dates[n // 6::40])
+    assert_constructor_pit(ctor, scores, market_simple, dates=clean)
+    with pytest.raises(LookaheadError, match="_EarlyEntryConstructor"):
+        assert_constructor_pit(ctor, scores, market_simple)
+
+
+# -- a check that compared no value must not pass -----------------------------
+
+
+class _LongLookbackLeak(Feature):
+    """Tomorrow's 252-day return: a leak that needs 253 dates to show a value."""
+
+    name = "long_lookback_leak"
+    lookback = 253
+
+    def compute(self, data):
+        return (data.close / data.close.shift(252) - 1.0).shift(-1)
+
+
+def test_truncation_checks_refuse_to_pass_without_a_value(market_simple):
+    # 150 dates cannot hold one 252-day value: every row is missing before
+    # and after truncation, so the planted leak used to pass unnoticed
+    short = market_simple.slice_until(market_simple.dates[149])
+    with pytest.raises(DataError, match="long_lookback_leak.*vacuously"):
+        assert_feature_pit(_LongLookbackLeak(), short)
+    with pytest.raises(DataError, match="xs_momentum.*vacuously"):
+        assert_signal_pit(CrossSectionalMomentum(), short)  # 12-1 momentum, same panel
+    # a constructor fed scores that are all missing never takes a position
+    blank = pd.DataFrame(np.nan, index=short.dates, columns=short.tickers)
+    with pytest.raises(DataError, match="_LeakyConstructor.*vacuously"):
+        assert_constructor_pit(_LeakyConstructor(), blank, short)
+    # ... nor does one whose floor exceeds the universe
+    scores = short.close / short.close.shift(21) - 1.0
+    with pytest.raises(DataError, match="QuantileLongShort.*vacuously"):
+        assert_constructor_pit(QuantileLongShort(min_names=50), scores, short)
+
+    # with enough history the same leak is caught and the shipped signal passes
+    with pytest.raises(LookaheadError, match="long_lookback_leak"):
+        assert_feature_pit(_LongLookbackLeak(), market_simple)
+    assert_signal_pit(CrossSectionalMomentum(), market_simple)
+
+
+def test_explicit_dates_must_reach_a_value(market_simple):
+    dates = market_simple.dates
+    feature = FEATURES.create("momentum", window=60, skip=5)  # first value on row 60
+    with pytest.raises(DataError, match="vacuously"):
+        assert_feature_pit(feature, market_simple, dates=dates[[0, 10, 59]])
+    assert_feature_pit(feature, market_simple, dates=dates[[0, 10, 60]])
+
+
+def test_leak_that_blanks_rows_is_reported_as_a_leak(market_simple):
+    # Only the last row of whatever panel it is given holds a value, so the
+    # full-panel row is blank on the checked date and the truncated row is
+    # not. That is a dependence on later rows, not an empty check.
+    def last_row_only(data):
+        returns = data.returns()
+        return returns.where(returns.shift(-1).isna())
+
+    t = market_simple.dates[100]
+    assert last_row_only(market_simple).loc[t].isna().all()
+    with pytest.raises(LookaheadError, match="NaN pattern"):
+        assert_truncation_invariant(last_row_only, market_simple, dates=[t])
 
 
 # -- the cost check must look at dates that carry a trade --------------------

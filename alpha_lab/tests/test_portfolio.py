@@ -110,7 +110,7 @@ def test_infeasible_cap_warns_once(market_simple):
     np.testing.assert_allclose(active.abs(), 0.1, atol=1e-12)
     # warns once per instance
     with _warnings.catch_warnings():
-        _warnings.simplefilter("error", UserWarning)
+        _warnings.simplefilter("error")
         ctor.weights(_scores(market_simple), market_simple)
 
 
@@ -119,7 +119,7 @@ def test_feasible_cap_does_not_warn(market_simple):
 
     ctor = QuantileLongShort(quantile=0.5, gross_leverage=2.0, max_weight=0.5, min_names=2)
     with _warnings.catch_warnings():
-        _warnings.simplefilter("error", UserWarning)
+        _warnings.simplefilter("error")
         ctor.weights(_scores(market_simple), market_simple)
 
 

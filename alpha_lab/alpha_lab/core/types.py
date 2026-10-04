@@ -21,7 +21,13 @@ TRADING_DAYS_PER_YEAR = 252
 #: date, optionally with a time of day and without a UTC offset, or compact
 #: YYYYMMDD. Anything else (``10/01/2024``) needs a guess at the day/month
 #: order, and a guess made cell by cell can reorder a price history.
-ISO_DATE_PATTERN = r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?|\d{8}"
+#: Both alternatives sit inside one group: a caller that anchors the pattern
+#: by wrapping it in ``^...$`` (pandas does so for Arrow-backed strings)
+#: would otherwise bind each anchor to one alternative only.
+ISO_DATE_PATTERN = r"(?:\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?|\d{8})"
+
+#: the same in words, for error messages
+ISO_DATE_FORMATS = "YYYY-MM-DD (optionally with a time, no UTC offset) or YYYYMMDD"
 
 #: optional fields, all aligned to close when present
 _OPTIONAL_FIELDS = ("open", "high", "low", "volume", "unadjusted_close", "universe")

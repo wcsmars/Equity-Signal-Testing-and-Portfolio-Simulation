@@ -110,6 +110,33 @@ def test_undecodable_config_file_is_config_error(tmp_path):
         load_config(cfg_file)
 
 
+@pytest.mark.parametrize(
+    "setting, value",
+    [
+        ("data.start", "2024-02-30"),
+        ("data.end", "2024-13-01"),
+        ("data.end", "2024-01-10 25:00:00"),
+        ("data.synthetic.start", "2015-02-30"),
+    ],
+)
+def test_unquoted_impossible_yaml_date_is_config_error(tmp_path, setting, value):
+    # PyYAML builds an unquoted date itself and fails with a bare ValueError,
+    # which is not a YAMLError
+    key = setting.rsplit(".", 1)[1]
+    if setting.startswith("data.synthetic."):
+        template = "data:\n  synthetic:\n    {key}: {cell}\n"
+    else:
+        template = "data:\n  source: csv\n  path: x\n  {key}: {cell}\n"
+    cfg_file = tmp_path / "dates.yaml"
+    cfg_file.write_text(template.format(key=key, cell=value))
+    with pytest.raises(ConfigError, match="invalid value in YAML"):
+        load_config(cfg_file)
+    # in quotes the same value reaches the schema, which names the setting
+    cfg_file.write_text(template.format(key=key, cell=f"'{value}'"))
+    with pytest.raises(ConfigError, match=f"{setting} must be a valid calendar date"):
+        load_config(cfg_file)
+
+
 def test_override_through_a_non_mapping_is_config_error(tmp_path):
     cfg_file = tmp_path / "run.yaml"
     cfg_file.write_text("backtest:\n  execution_lag: 2\n")
@@ -261,6 +288,24 @@ def test_start_after_end_fails_at_load():
         {"data": {"source": "csv", "path": "x", "start": "2020-01-01", "end": "2020-01-01"}}
     )
     assert same_day.data.start == same_day.data.end
+
+
+@pytest.mark.parametrize("bad", ["10/01/2024", "2018", "today", "2018-01-01T00:00:00+00:00"])
+def test_date_error_names_the_accepted_spellings(bad):
+    # the message has to say what is accepted, not only that the value is not
+    with pytest.raises(ConfigError) as caught:
+        config_from_dict({"data": {"source": "csv", "path": "x", "start": bad}})
+    assert str(caught.value) == (
+        "data.start must be an ISO date: YYYY-MM-DD (optionally with a time, "
+        f"no UTC offset) or YYYYMMDD; got {bad!r}"
+    )
+
+
+@pytest.mark.parametrize("bad", ["2024-02-30", "2024-13-01", "20240230", "2024-01-10 25:00"])
+def test_well_formed_date_that_does_not_exist_is_reported_as_such(bad):
+    # not a spelling problem, so the message must not send the user to the format
+    with pytest.raises(ConfigError, match=f"data.end must be a valid calendar date, got '{bad}'"):
+        config_from_dict({"data": {"source": "csv", "path": "x", "end": bad}})
 
 
 # -- synthetic source vs csv-only subset keys -----------------------------------

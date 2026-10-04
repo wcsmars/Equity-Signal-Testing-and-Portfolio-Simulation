@@ -76,6 +76,56 @@ def test_symlink_target_is_refused(tmp_path):
     assert real.read_text() == "x"
 
 
+def test_directory_target_is_refused(tmp_path):
+    target = tmp_path / "a.json"
+    target.mkdir()
+    with pytest.raises(ValueError, match="non-regular"):
+        records.save_record(target, "y", rebase=True, quiet=True)
+    assert target.is_dir()
+
+
+def test_failed_write_leaves_the_record_and_no_temporary_file(tmp_path, monkeypatch):
+    target = tmp_path / "a.json"
+    target.write_text("old")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(records.os, "replace", boom)
+    with pytest.raises(OSError, match="disk full"):
+        records.save_record(target, "new", rebase=True, quiet=True)
+    assert target.read_text() == "old"
+    assert [p.name for p in tmp_path.iterdir()] == ["a.json"]
+
+
+def test_record_is_replaced_by_rename_not_rewritten_in_place(tmp_path, monkeypatch):
+    target = tmp_path / "a.json"
+    target.write_text("old")
+    calls = []
+    real = records.os.replace
+    monkeypatch.setattr(records.os, "replace", lambda s, d: (calls.append((s, d)), real(s, d))[1])
+    records.save_record(target, "new", rebase=True, quiet=True)
+    assert len(calls) == 1 and calls[0][1] == target and calls[0][0] != target
+    assert target.read_text() == "new"
+
+
+def test_scratch_copy_is_removed_once_the_record_matches_or_is_rebased(tmp_path):
+    target = tmp_path / "a.json"
+    other = tmp_path / "b.json"
+    target.write_text("old")
+    other.write_text("old")
+    scratch = tmp_path / records.RECOMPUTED_DIR
+    records.save_record(target, "new", rebase=False, quiet=True)
+    records.save_record(other, "new", rebase=False, quiet=True)
+    assert sorted(p.name for p in scratch.iterdir()) == ["a.json", "b.json"]
+    # a later run that agrees with the record clears only its own stale copy
+    records.save_record(target, "old", rebase=False, quiet=True)
+    assert [p.name for p in scratch.iterdir()] == ["b.json"]
+    # a rebase clears the other one, and the empty folder goes with it
+    records.save_record(other, "new", rebase=True, quiet=True)
+    assert other.read_text() == "new" and not scratch.exists()
+
+
 def test_json_and_csv_helpers_match_the_plain_writers(tmp_path):
     payload = {"b": 1.5, "a": [1, 2]}
     records.save_json(tmp_path / "m.json", payload, quiet=True)

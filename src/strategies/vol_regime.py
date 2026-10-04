@@ -1,27 +1,77 @@
-"""Volatility term-structure allocation research example.
+"""VIX term-structure regime switch, QQQ or IEF. Rejected: no timing value.
 
-A five-day average of VIX/VIX3M, lagged one additional session for index
-publication timing, assigns QQQ weight 1 below 0.95, 0.5 between 0.95 and
-1.05, and 0 above 1.05; IEF receives the remainder. Costs assume 2 bps
-per-side slippage. The engine credits returns after the decision close.
+Hypothesis
+    When one-month implied volatility (VIX) rises above three-month implied
+    volatility (VIX3M), option buyers are paying more for immediate
+    protection than for later protection, which has coincided with equity
+    stress. When the curve slopes upward, markets are calm and the equity
+    premium is earned. Moving from equities to Treasuries when the curve
+    inverts should avoid part of the drawdowns; the other side would be the
+    investors who hold equities through the stress.
 
-Default execution prints metrics. --sweep adds eight further term-structure
-variants and three VIX-spike variants (long SPY for five sessions after VIX
-closes above k times its 20-day mean) and saves the table to
-results/vol_regime_variants.csv; a saved table that differs is kept and the
-new one goes to results/recomputed/ unless --rebase is passed. The spike
-rows use the same one-session index lag as the term-structure rows.
+Rule
+    Signal: the 5-day average of VIX/VIX3M, lagged one further session
+    because index closes are published after the equity close.
+      below 0.95      100% QQQ
+      0.95 to 1.05    50% QQQ, 50% IEF
+      above 1.05      100% IEF
+    Evaluated daily. The engine assumes execution at the decision close.
+    The sample starts on 2006-07-24, once VIX3M history allows a signal.
+    Costs are modelling assumptions: the commissions and fees of
+    qcore.costs plus 2 bps of slippage per side.
+    The rule held 100% QQQ on 73.6% of days, the mix on 22.1% and 100% IEF
+    on 4.2%; its average QQQ weight was 0.85.
+
+Variants tried
+    12 (--sweep). Nine term-structure variants: one setting changed at a
+    time from a SPY/IEF base (lower threshold 0.90 or 0.95, upper threshold
+    1.00 or 1.05, smoothing 1, 5 or 10 days, cash in place of IEF), then
+    three on QQQ. Three VIX-spike variants: long SPY for five sessions after
+    VIX closes above k times its 20-day mean, k = 1.25, 1.30, 1.40, with the
+    same one-session index lag.
+
+Selection
+    In-sample Sharpe (data before 2018-01-01): QQQ/IEF, 5-day average,
+    0.95/1.05, at 0.79; the next two are 0.78 and 0.77. Out-of-sample
+    results (2018-01-01 onwards) are reported, not selected on. The spike
+    variants score 0.20 or less in sample and 0.17 or less out of sample
+    and were dropped.
+
+Result
+    This code on data ending 2026-07-01, net of the modelled costs, Sharpe
+    ratios in excess of the cash rate, from 2006-07-24:
+    Sharpe 0.70 full sample / 0.79 in sample / 0.62 out of sample;
+    CAGR 11.95%, volatility 15.79%, maximum drawdown -40.95%. Turnover is
+    12.0x a year (buys plus sells) and costs take 0.41% a year.
+    Same engine, costs and period, Sharpe full / in / out of sample:
+      QQQ held throughout                        0.75 / 0.71 / 0.80
+      85% QQQ and 15% IEF, rebalanced monthly
+        (the rule's average weights)             0.77 / 0.77 / 0.78
+      the rule without the publication lag       0.81 / 0.91 / 0.72
+    From 2018 the rule's maximum drawdown is -40.95% and QQQ's is -35.24%.
+
+Verdict
+    Rejected; not part of the combined portfolio. In sample the rule beat
+    holding QQQ (0.79 against 0.71). Out of sample it lost to QQQ (0.62
+    against 0.80), with a deeper drawdown, and to a fixed mix with its own
+    average weights (0.78). What it earned is equity exposure, not timing.
+    An earlier version used the same-day index close, which is published
+    after the trade would have been placed. The one-session lag that
+    corrects this takes 0.11 off the full-sample Sharpe.
+
+Default execution prints metrics. --sweep runs the 12 variants and saves
+the table to results/vol_regime_variants.csv; a saved table that differs is
+kept and the new one goes to results/recomputed/ unless --rebase is passed.
 
 A session without a VIX or VIX3M print invalidates the averages containing
-it; the last decided weights are held over those sessions with a warning,
-and more than MAX_MISSING_PRINTS consecutive missing prints raise an error.
-Results are exploratory.
+it; the last decided weights are held over those sessions. Up to
+MAX_MISSING_PRINTS consecutive missing prints are held without a message
+(scripts/data_quality.py is what reports index holes); more raise an error.
 """
 
 import argparse
 import json
 import sys
-import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -34,7 +84,7 @@ from qcore.costs import IBKRHKCostModel
 from qcore.data import load_indices, load_prices
 from qcore.records import save_csv
 
-# --- retained example parameters ---
+# --- recorded variant: best in-sample Sharpe (before 2018) of the 12 swept ---
 RISK_ASSET = "QQQ"
 DEFENSIVE_ASSET = "IEF"
 SMOOTH_DAYS = 5
@@ -63,7 +113,8 @@ SPIKE_HOLD_DAYS = 5
 
 # A session without a VIX/VIX3M print has no ratio, which invalidates every
 # SMOOTH_DAYS average containing it; the last decided weights are held over
-# those sessions. More consecutive missing prints than this is refused.
+# those sessions. Up to this many consecutive missing prints are held without
+# a message; more is refused.
 MAX_MISSING_PRINTS = 5
 
 
@@ -83,9 +134,10 @@ def build_weights(prices: pd.DataFrame, indices: pd.DataFrame) -> pd.DataFrame:
     # The signal dates are already on the price calendar. This fill only
     # covers sessions whose average is invalid because an index print inside
     # the window is missing: the last decided weights are held (past
-    # information only, no lookahead). The hold is reported, and a run of
-    # missing prints longer than MAX_MISSING_PRINTS (a holed or stale index
-    # file) is refused instead of passing off an old regime as current.
+    # information only, no lookahead). A run of missing prints longer than
+    # MAX_MISSING_PRINTS (a holed or stale index file) is refused instead of
+    # passing off an old regime as current; a shorter run is held without a
+    # message, so a sweep is not interrupted once per variant.
     weights = (
         weights.reindex(prices.index.union(weights.index))
         .ffill()
@@ -96,18 +148,13 @@ def build_weights(prices: pd.DataFrame, indices: pd.DataFrame) -> pd.DataFrame:
     if held.any():
         missing = ratio.loc[ratio.first_valid_index():].isna()
         longest = int(missing.groupby((~missing).cumsum()).sum().max())
-        latest = weights.index[held][-1].date()
         if longest > MAX_MISSING_PRINTS:
+            latest = weights.index[held][-1].date()
             raise ValueError(
                 f"VIX/VIX3M ratio missing for {longest} consecutive sessions "
                 f"(limit {MAX_MISSING_PRINTS}; signal last unavailable on {latest}): "
                 "refresh or repair the index data"
             )
-        warnings.warn(
-            f"VIX/VIX3M signal unavailable on {int(held.sum())} session(s), latest "
-            f"{latest}: the previous regime is held",
-            stacklevel=2,
-        )
     return weights
 
 
@@ -211,7 +258,9 @@ def main() -> dict:
 
 
 def _parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # allow_abbrev=False: a shortened flag such as --reb is refused, not accepted
+    # by the parser and then missed by the exact-name checks that act on it
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--sweep", action="store_true",
                         help="run all 12 variants and save results/vol_regime_variants.csv")
     parser.add_argument("--rebase", action="store_true",
@@ -221,9 +270,12 @@ def _parse_args(argv=None):
 
 if __name__ == "__main__":
     args = _parse_args()
-    if args.sweep:
-        df = sweep()
-        print()
-        save_csv(ROOT / "results" / "vol_regime_variants.csv", df, index=False)
-    else:
-        print(json.dumps(main(), indent=2))
+    try:
+        if args.sweep:
+            df = sweep()
+            print()
+            save_csv(ROOT / "results" / "vol_regime_variants.csv", df, index=False)
+        else:
+            print(json.dumps(main(), indent=2))
+    except FileNotFoundError as exc:  # no data cache: the loader's one line, no traceback
+        sys.exit(str(exc))

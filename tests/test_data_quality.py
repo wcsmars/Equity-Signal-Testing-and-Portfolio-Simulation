@@ -125,6 +125,8 @@ def test_clean_bundle_reports_expected_info():
         "handled 4:1 split should be counted as INFO"
     assert grab(findings, "delisting", "INFO", LATE_TICKER), \
         "late inception should be counted as INFO"
+    assert not grab(findings, "range_plausibility"), \
+        "sub-1% synthetic wicks must not be counted"
 
 
 # --------------------------------------------------------------- injections
@@ -298,6 +300,64 @@ def test_ohlc_violation_flagged():
     assert any(f.severity == "FAIL" for f in hits), hits
 
 
+def test_open_outside_range_warns():
+    b = copy_bundle(CLEAN)
+    c = b.open.columns.get_loc("EEE")
+    b.open.iloc[320, c] = b.high.iloc[320, c] * 1.05
+    hits = grab(run(b), "ohlc_consistency", ticker="EEE")
+    assert [f.severity for f in hits] == ["WARN"], hits
+    assert hits[0].detail.startswith("open "), hits
+
+
+def test_isolated_low_wick_is_counted_not_gated():
+    # a low far below both open and close passes ohlc_consistency (open and
+    # close are still inside the bar); range_plausibility must locate it
+    # without raising the gate
+    b = copy_bundle(CLEAN)
+    b.low.iloc[320, b.low.columns.get_loc("EEE")] *= 0.80
+    b.low.iloc[330, b.low.columns.get_loc("EEE")] *= 0.93  # under WICK_ABS
+    findings = run(b)
+    assert not grab(findings, "ohlc_consistency", ticker="EEE")
+    hits = grab(findings, "range_plausibility", ticker="EEE")
+    assert [(f.severity, f.date) for f in hits] == [("INFO", day(b, 320))], hits
+    assert hits[0].detail.startswith("low "), hits[0].detail
+    assert not [f for f in findings if f.severity in ("FAIL", "WARN")]
+
+
+def test_isolated_high_wick_is_counted():
+    b = copy_bundle(CLEAN)
+    b.high.iloc[400, b.high.columns.get_loc("BBB")] *= 1.15
+    hits = grab(run(b), "range_plausibility", ticker="BBB")
+    assert len(hits) == 1 and hits[0].detail.startswith("high "), hits
+
+
+def test_market_wide_wick_day_reported_once():
+    b = copy_bundle(CLEAN)
+    for t in ("AAA", "BBB", "CCC", "DDD"):
+        b.low.iloc[500, b.low.columns.get_loc(t)] *= 0.85
+    hits = grab(run(b), "range_plausibility")
+    assert [(f.ticker, f.date) for f in hits] == [("", day(b, 500))], hits
+    assert "4 high/low wicks" in hits[0].detail
+    b = copy_bundle(CLEAN)  # one fewer than WICK_SYSTEMIC_TICKERS: per ticker
+    for t in ("AAA", "BBB"):
+        b.low.iloc[500, b.low.columns.get_loc(t)] *= 0.85
+    hits = grab(run(b), "range_plausibility")
+    assert sorted(f.ticker for f in hits) == ["AAA", "BBB"], hits
+
+
+def test_wick_inside_a_habitually_wide_range_is_not_counted():
+    # 12% beyond the body is ordinary for a ticker whose median daily range
+    # is 4%+; the same wick on a quiet ticker is counted
+    b = copy_bundle(CLEAN)
+    b.high["FFF"] *= 1.02
+    b.low["FFF"] *= 0.98
+    for t in ("FFF", "EEE"):
+        b.low.iloc[320, b.low.columns.get_loc(t)] *= 0.88
+    findings = run(b)
+    assert not grab(findings, "range_plausibility", ticker="FFF")
+    assert grab(findings, "range_plausibility", ticker="EEE")
+
+
 # ------------------------------------------- premise / factor-ledger checks
 def test_factor_rescale_fails_when_raw_split_adjusted():
     b = copy_bundle(CLEAN)
@@ -331,6 +391,105 @@ def test_missing_dividends_on_expected_payer_fails():
         "AAA pays quarterly - must not be flagged"
 
 
+def _with_factor(ticker: str, change) -> PriceBundle:
+    """CLEAN with `ticker`'s adj/close factor rewritten by change(factor),
+    applied through the raw close (the adjusted panels stay as they are)."""
+    b = copy_bundle(CLEAN)
+    f = (b.adj_close[ticker] / b.close[ticker]).to_numpy().copy()
+    change(f)
+    b.close[ticker] = b.adj_close[ticker] / f
+    return b
+
+
+def _early_payouts_stripped() -> PriceBundle:
+    def change(f):  # payouts at rows 63..378 removed: first one left is row 441
+        f[:441] = f[440]
+    return _with_factor("AAA", change)
+
+
+def test_expected_payer_with_dividend_free_early_history_fails():
+    b = _early_payouts_stripped()
+    hits = grab(run_all(b, universe=UNIVERSE,
+                        expect_dividends={"AAA", "BBB"}).findings,
+                "dividend_presence")
+    assert [(f.severity, f.ticker) for f in hits] == [("FAIL", "AAA")], hits
+    assert "start of the history" in hits[0].detail, hits
+    assert hits[0].date == f"{day(b, 0)}..{day(b, 441)}", hits
+
+
+def test_known_late_first_payout_is_exempt_only_up_to_its_date():
+    b = _early_payouts_stripped()
+    check = quality.check_dividend_presence
+    assert check(b, {"AAA"}, first_payout_by={"AAA": day(b, 441)}) == []
+    hits = check(b, {"AAA"}, first_payout_by={"AAA": day(b, 440)})
+    assert [f.severity for f in hits] == ["FAIL"], \
+        "history stripped beyond the known quiet period still fails"
+    assert [f.severity for f in check(b, {"AAA"}, first_payout_by={})] \
+        == ["FAIL"]
+
+
+def test_history_ending_before_a_listed_first_payout_is_not_judged():
+    # EEE never pays. A fund whose first payout is due by a listed date has
+    # not gone silent while the cache still ends on or before that date (a
+    # cache cut at an earlier as-of date); one day past it, it has.
+    check = quality.check_dividend_presence
+    hits = check(CLEAN, {"EEE"}, first_payout_by={})
+    assert [f.severity for f in hits] == ["FAIL"], hits
+    assert "zero dividend events" in hits[0].detail, hits
+    assert check(CLEAN, {"EEE"}, first_payout_by={"EEE": day(CLEAN, -1)}) == []
+    hits = check(CLEAN, {"EEE"}, first_payout_by={"EEE": day(CLEAN, -2)})
+    assert [(f.severity, f.ticker) for f in hits] == [("FAIL", "EEE")], hits
+    assert check(CLEAN, {"EEE"}, first_payout_by={"AAA": day(CLEAN, -1)}) == hits, \
+        "another fund's date exempts nothing"
+
+
+def test_expected_payer_going_silent_mid_history_fails():
+    def change(f):  # payouts at rows 63 and 126 kept, every later one dropped
+        f[:126] /= f[126]
+        f[126:] = 1.0
+    b = _with_factor("AAA", change)
+    hits = grab(run_all(b, universe=UNIVERSE,
+                        expect_dividends={"AAA"}).findings, "dividend_presence")
+    assert [(f.severity, f.ticker) for f in hits] == [("FAIL", "AAA")], hits
+    assert "went silent" in hits[0].detail, hits
+
+
+def test_expected_payer_registry_covers_distributing_funds():
+    # the registry is pinned whole: every name here can raise a FAIL that no
+    # allowlist entry clears, so adding or dropping one is a reviewed change
+    watched = quality.EXPECT_DIVIDENDS
+    assert watched == {
+        "TLT", "IEF", "SHY", "LQD", "HYG", "TIP", "AGG", "EMB",
+        "SPY", "QQQ", "IWM", "DIA", "MDY", "EFA", "EEM", "VGK",
+        "EWA", "EWC", "EWG", "EWH", "EWU", "EWZ", "FXI",
+        "XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY",
+        "SMH", "KRE", "XME", "XOP", "IYR", "VNQ"}
+    assert watched <= set(qdata.ETF_UNIVERSE), "funds only: no single stock"
+    assert not {"GLD", "SLV", "USO", "UNG", "FXY", "EWJ", "GDX"} & watched, \
+        "funds with no payouts, or real multi-year gaps, would FAIL forever"
+    assert quality.DIV_FIRST_PAYOUT_BY == {
+        "QQQ": "2003-12-31", "XLK": "2002-12-31", "SMH": "2012-12-31"}, \
+        "a late first payout is exempt up to a date, never by name alone"
+    assert set(quality.DIV_FIRST_PAYOUT_BY) <= watched
+
+
+def test_implausible_trailing_year_dividend_stream_warns():
+    def change(f):
+        for ex in (300, 360, 420):
+            f[:ex] *= 0.92  # three 8% payouts inside one year
+    hits = grab(run(_with_factor("EEE", change)), "adjustment_factor", "WARN",
+                "EEE")
+    assert any("trailing year" in f.detail for f in hits), hits
+
+
+def test_non_positive_adjustment_factor_fails():
+    b = copy_bundle(CLEAN)
+    c = b.adj_close.columns.get_loc("EEE")
+    b.adj_close.iloc[300, c] = -b.adj_close.iloc[300, c]
+    hits = grab(run(b), "adjustment_factor", "FAIL", "EEE")
+    assert any("non-positive adjustment factor" in f.detail for f in hits), hits
+
+
 def test_volume_unit_break_fails():
     b = copy_bundle(CLEAN)
     b.volume.iloc[300:, b.volume.columns.get_loc("FFF")] *= 1000.0
@@ -346,6 +505,8 @@ def _assert_shift_fails_lead_lag(shift: int, day: str) -> None:
     hits = grab(run(b), "lead_lag", "FAIL", "AAA")
     assert any("shifted" in f.detail and day in f.detail for f in hits), \
         "a whole-history one-day shift is look-ahead poison"
+    assert len(hits) == 1 and hits[0].date == "", \
+        "the whole-history finding is not repeated per window"
 
 
 def test_shifted_series_fails_lead_lag():
@@ -354,6 +515,75 @@ def test_shifted_series_fails_lead_lag():
 
 def test_future_shifted_series_fails_lead_lag():
     _assert_shift_fails_lead_lag(-1, "next")  # leaks tomorrow
+
+
+def test_one_day_shift_confined_to_a_segment_fails_lead_lag():
+    # only the middle calendar year is shifted: the two clean years dominate
+    # the whole-history correlation and the trailing window is clean, so
+    # only that year's own window can see it
+    rows = np.flatnonzero(CLEAN.adj_close.index.year == 2021)
+    for shift, word in ((1, "previous"), (-1, "next")):
+        b = copy_bundle(CLEAN)
+        for f in PriceBundle.FIELDS:
+            df = getattr(b, f)
+            c = df.columns.get_loc("AAA")
+            df.iloc[rows, c] = df.iloc[rows, c].shift(shift).to_numpy()
+        hits = grab(run(b), "lead_lag")
+        assert [(f.severity, f.ticker) for f in hits] == [("FAIL", "AAA")], hits
+        assert "in 1 window(s)" in hits[0].detail, hits
+        assert "segment shifted" in hits[0].detail and word in hits[0].detail
+        first, last = hits[0].date.split("..")
+        assert first.startswith("2021-") and last.startswith("2021-"), hits
+
+
+def test_shift_of_the_latest_rows_is_caught_by_the_trailing_window():
+    # the cache ends mid-year: 2022 is too short to be tested on its own and
+    # 2021 is only half shifted, so the trailing window is what sees it
+    b = PriceBundle(**{f: getattr(CLEAN, f).loc[:"2022-06-30"].copy()
+                       for f in PriceBundle.FIELDS}, raw_split_adjusted=False)
+    tail = quality.LEADLAG_BLOCK_TAIL
+    assert (b.adj_close.index.year == 2022).sum() < quality.LEADLAG_BLOCK_MIN_OBS
+    for f in PriceBundle.FIELDS:
+        df = getattr(b, f)
+        c = df.columns.get_loc("AAA")
+        df.iloc[-tail:, c] = df.iloc[-tail:, c].shift(1).to_numpy()
+    hits = grab(run(b), "lead_lag")
+    assert [(f.severity, f.ticker) for f in hits] == [("FAIL", "AAA")], hits
+    assert "in 1 window(s)" in hits[0].detail and "previous" in hits[0].detail
+    # the shift leaves the window's first bar empty, so its returns start
+    # two rows in
+    assert hits[0].date == f"{day(b, -tail + 2)}..{day(b, -1)}", hits
+
+
+def _reprice(b: PriceBundle, ticker: str, returns: pd.Series) -> None:
+    """Give `ticker` the daily `returns` (same start level) in all five
+    price panels, keeping its bars and adjustment factor consistent."""
+    old = b.adj_close[ticker].pct_change().fillna(0.0)
+    scale = (1.0 + returns.fillna(0.0)).cumprod() / (1.0 + old).cumprod()
+    for f in PRICE_FIELDS:
+        getattr(b, f)[ticker] *= scale
+
+
+def test_instrument_that_partly_trails_the_market_is_not_a_shifted_series():
+    # thin funds really do react to yesterday's market as well as today's;
+    # the lagged correlation then beats the same-day one by a little, in the
+    # whole history and in single years, without the series being misplaced
+    b = copy_bundle(CLEAN)
+    mkt = b.adj_close.pct_change().drop(columns=["EEE"]).median(axis=1)
+    noise = pd.Series(np.random.default_rng(5).normal(0.0, 0.004, len(mkt)),
+                      index=mkt.index)
+    _reprice(b, "EEE", 0.60 * mkt + 0.66 * mkt.shift(1) + noise)
+    r = b.adj_close["EEE"].pct_change()
+    lead = abs(r.corr(mkt.shift(1))) - abs(r.corr(mkt))
+    assert 0.0 < lead < quality.LEADLAG_MARGIN, lead
+    yearly = pd.DataFrame({"r": r, "same": mkt, "previous": mkt.shift(1)})
+    yearly = yearly.groupby(yearly.index.year).apply(
+        lambda g: g.rank().corr()["r"].abs())
+    by_year = yearly["previous"] - yearly["same"]
+    assert (by_year > 0.0).any() \
+        and by_year.max() < quality.LEADLAG_BLOCK_MARGIN, by_year
+    assert not grab(run(b), "lead_lag"), \
+        "a lead inside both margins is behaviour, not misalignment"
 
 
 def test_interpolated_segment_warns():
@@ -388,6 +618,75 @@ def test_sub_gate_glitch_attributed_to_print_day():
     assert any(f.date == glitch_day and "fully reversed by the next day's" in f.detail
                for f in hits), \
         "the FAIL must land on the glitch day, not the bounce day"
+    assert not [f for f in grab(run(b), "extreme_returns", "WARN", t)
+                if f.date == glitch_day], \
+        "a day that already carries the FAIL is not reported a second time"
+
+
+def test_sub_gate_whole_bar_print_that_reverts_warns():
+    # a 10% print is far below both gates (30% idiosyncratic; 15x trailing
+    # vol, about 17% here), so nothing used to examine the day at all
+    pos = 288  # a quiet day for EEE and for the board
+    for mult in (0.90, 1.10):
+        b = copy_bundle(CLEAN)
+        scale_prices(b, "EEE", pos, mult)
+        findings = run(b)
+        hits = grab(findings, "extreme_returns", ticker="EEE")
+        assert [(f.severity, f.date) for f in hits] == \
+            [("WARN", day(b, pos))], (mult, hits)
+        assert "fully reversed next day" in hits[0].detail \
+            and "outside both neighbours' ranges" in hits[0].detail, hits
+        seen = b.adj_close["EEE"].iloc[pos] / b.adj_close["EEE"].iloc[pos - 1] - 1.0
+        assert abs(hits[0].value - seen) < 1e-12, (hits[0].value, seen)
+        assert 0.05 < abs(seen) < 0.15 and (seen > 0) == (mult > 1), seen
+        assert not [f for f in findings if f.severity == "FAIL"], findings
+
+
+def test_sub_gate_move_that_persists_or_trades_through_stays_silent():
+    b = copy_bundle(CLEAN)
+    scale_prices(b, "EEE", slice(600, None), 0.90)  # a repricing that sticks
+    assert not grab(run(b), "extreme_returns", ticker="EEE")
+    # the same reverting print, but one neighbour's low reaches down into
+    # the print bar: the instrument did trade at that level on the way there
+    # or back, which is what a real whipsaw looks like. Either neighbour
+    # clears it.
+    c = CLEAN.low.columns.get_loc("EEE")
+    for neighbour in (599, 601):
+        b = copy_bundle(CLEAN)
+        scale_prices(b, "EEE", 600, 0.90)
+        b.low.iloc[neighbour, c] = b.low.iloc[600, c]
+        assert not grab(run(b), "extreme_returns", ticker="EEE"), neighbour
+
+
+def test_sub_gate_reversal_that_is_mostly_the_market_is_not_flagged():
+    # the same -8% whole-bar print twice. Alone it clears the 6-sigma gate
+    # (about 6.8% here). On a day the whole board lost 2.2% - too little for
+    # a market-wide extreme window - its idiosyncratic part is about 5.5%,
+    # inside the gate: the move is mostly the market's
+    pos = 288
+    alone = copy_bundle(CLEAN)
+    scale_prices(alone, "EEE", pos, 0.92)
+    hits = grab(run(alone), "extreme_returns")
+    assert [(f.severity, f.ticker) for f in hits] == [("WARN", "EEE")], hits
+    b = copy_bundle(CLEAN)
+    _scale_row(b, pos, 0.978)
+    scale_prices(b, "EEE", pos, 0.92 / 0.978)
+    assert abs(b.adj_close.pct_change().median(axis=1).iloc[pos]) < 0.03
+    assert not grab(run(b), "extreme_returns")
+    # and the other way round: a -6% print is inside the gate for this
+    # instrument, although the board's rise pushes its idiosyncratic part
+    # (about -7.7%) beyond it
+    b = copy_bundle(CLEAN)
+    _scale_row(b, pos, 1.02)
+    scale_prices(b, "EEE", pos, 0.94 / 1.02)
+    assert not grab(run(b), "extreme_returns")
+
+
+def test_sub_gate_reversal_inside_a_market_wide_extreme_window_is_not_flagged():
+    b = copy_bundle(CLEAN)
+    _scale_row(b, 600, 0.96)  # the whole board -4%, then back
+    scale_prices(b, "EEE", 600, 0.90 / 0.96)
+    assert not grab(run(b), "extreme_returns", ticker="EEE")
 
 
 def test_premise_mode_missed_split_in_close_fails():
@@ -989,12 +1288,12 @@ def test_finding_value_is_reported_only_when_measured():
 # -------------------------------------------------------------- fundamentals
 def build_clean_fundamentals() -> pd.DataFrame:
     rows = []
-    for t in ["AAA", "BBB", "CCC"]:
+    for size, t in enumerate(["AAA", "BBB", "CCC"], start=1):
         for k, pe in enumerate(pd.date_range("2020-03-31", periods=8,
                                              freq="QE")):
             rows.append({"ticker": t, "period_end": pe,
                          "report_date": pe + pd.Timedelta(45, unit="D"),
-                         "revenue": 1e9 * (1.02 ** k) * (1 + hash(t) % 3),
+                         "revenue": 1e9 * (1.02 ** k) * size,
                          "eps": 1.0 + 0.05 * k})
     return pd.DataFrame(rows)
 
@@ -1133,7 +1432,390 @@ def test_malformed_fundamentals_contained():
         "a malformed fundamentals file must FAIL the report, not crash it"
 
 
+def test_fund_long_filing_lag_and_missing_report_date_warn():
+    df = build_clean_fundamentals()
+    df.loc[2, "report_date"] = df.loc[2, "period_end"] \
+        + pd.Timedelta(200, unit="D")
+    df.loc[10, "report_date"] = pd.NaT
+    hits = grab(check_fundamentals(df), "fund_lookahead")
+    assert sorted((f.severity, f.ticker) for f in hits) == \
+        [("WARN", "AAA"), ("WARN", "BBB")], hits
+    assert any("200d filing lag" in f.detail for f in hits), hits
+    assert any("1 rows missing report_date" in f.detail for f in hits), hits
+
+
+def test_fund_tenfold_jump_warns_below_the_unit_break_ratio():
+    df = build_clean_fundamentals()
+    df.loc[4:7, "revenue"] *= 20  # AAA: a 20x step, held afterwards
+    hits = grab(check_fundamentals(df), "fund_units", ticker="AAA")
+    assert [f.severity for f in hits] == ["WARN"], hits
+    assert "jumped x20" in hits[0].detail, hits
+
+
+# ------------------------------------------------ structure / numeric values
+def test_infinity_in_raw_close_fails_even_with_missing_ohlc():
+    b = copy_bundle(CLEAN)
+    b.close.iloc[20, 0] = np.inf
+    b.open.iloc[20, 0] = np.nan
+    assert grab(run(b), "numeric_values", "FAIL", "AAA")
+
+
+def test_infinite_volume_fails():
+    b = copy_bundle(CLEAN)
+    b.volume.iloc[20, 0] = np.inf
+    assert grab(run(b), "numeric_values", "FAIL", "AAA")
+
+
+def test_non_positive_price_fails():
+    b = copy_bundle(CLEAN)
+    b.close.iloc[20, 0] = -5.0
+    b.open.iloc[30, 1] = 0.0
+    found = run(b)
+    numeric = grab(found, "numeric_values", "FAIL")
+    assert any(f.ticker == "AAA" and f.detail.startswith("close:")
+               for f in numeric), numeric
+    assert any(f.ticker == "BBB" and f.detail.startswith("open:")
+               for f in numeric), numeric
+    assert any("non-positive price" in f.detail
+               for f in grab(found, "ohlc_consistency", "FAIL", "BBB")), found
+
+
+def test_negative_volume_fails_but_zero_volume_is_not_a_numeric_defect():
+    b = copy_bundle(CLEAN)
+    b.volume.iloc[20, 0] = -1.0
+    b.volume.iloc[40, 1] = 0.0
+    found = grab(run(b), "numeric_values", "FAIL")
+    assert [f.ticker for f in found] == ["AAA"], found
+
+
+def test_nonnumeric_column_fails():
+    b = copy_bundle(CLEAN)
+    b.close["AAA"] = b.close["AAA"].astype(object)
+    b.close.iloc[20, 0] = "n/a"
+    found = run_all(b, universe=UNIVERSE).findings
+    hits = grab(found, "numeric_values", "FAIL", "AAA")
+    assert any("close: nonnumeric values" in f.detail for f in hits), hits
+
+
+def test_unsorted_index_fails_and_content_checks_still_see_sorted_data():
+    b = copy_bundle(CLEAN)
+    for f in PriceBundle.FIELDS:
+        setattr(b, f, getattr(b, f).iloc[::-1])
+    bad = [f for f in run(b) if f.severity in ("FAIL", "WARN")]
+    assert bad and {f.check for f in bad} == {"calendar_alignment"}, bad
+    assert all("index not sorted" in f.detail for f in bad), bad
+    assert len(bad) == len(PriceBundle.FIELDS), bad
+
+
+def test_index_mismatch_between_files_fails():
+    b = copy_bundle(CLEAN)
+    b.volume = b.volume.drop(b.volume.index[200])
+    hits = grab(run(b), "calendar_alignment", "FAIL")
+    assert any("volume.csv index != adj_close.csv" in f.detail
+               and "1 missing, 0 extra" in f.detail for f in hits), hits
+
+
+def test_empty_price_index_fails():
+    b = PriceBundle(**{f: getattr(CLEAN, f).iloc[0:0]
+                       for f in PriceBundle.FIELDS})
+    rep = run_all(b, universe=UNIVERSE)
+    hits = grab(rep.findings, "calendar_gaps", "FAIL")
+    assert [f.detail for f in hits] == ["empty price index"], hits
+    assert rep.worst() == "FAIL"
+
+
+def test_holiday_row_warns():
+    b = copy_bundle(CLEAN)
+    hol = pd.Timestamp("2021-07-05")  # Independence Day observed
+    for f in PriceBundle.FIELDS:
+        df = getattr(b, f)
+        row = df.loc[[pd.Timestamp("2021-07-02")]].copy()
+        row.index = [hol]
+        setattr(b, f, pd.concat([df, row]).sort_index())
+    hits = grab(run(b), "calendar_gaps", "WARN")
+    assert [(f.date, "holiday" in f.detail) for f in hits] == \
+        [("2021-07-05", True)], hits
+
+
+def test_short_calendar_year_warns():
+    b = copy_bundle(CLEAN)
+    victims = b.adj_close.index[b.adj_close.index.year == 2021][100:105]
+    for f in PriceBundle.FIELDS:
+        setattr(b, f, getattr(b, f).drop(victims))
+    hits = grab(run(b), "calendar_gaps", "WARN")
+    assert [f.date for f in hits] == ["2021"], hits
+    assert "247 trading days in year" in hits[0].detail, hits
+
+
+def test_scattered_holes_fail_above_one_percent_and_warn_below():
+    few, many = copy_bundle(CLEAN), copy_bundle(CLEAN)
+    blank(few, "AAA", [100, 300], ["close"])
+    blank(many, "AAA", list(range(100, 650, 50)), ["close"])  # 11 of 756
+    assert {f.severity for f in grab(run(few), "missing_prices",
+                                     ticker="AAA")} == {"WARN"}
+    hits = grab(run(many), "missing_prices", "FAIL", "AAA")
+    assert any("longest gap 1 days" in f.detail for f in hits), hits
+
+
+def test_stale_run_warns_from_five_days_and_fails_from_ten():
+    b = copy_bundle(CLEAN)
+    c = b.close.columns.get_loc("EEE")
+    for n, severity in ((4, None), (5, "WARN"), (9, "WARN"), (10, "FAIL")):
+        b = copy_bundle(CLEAN)
+        b.close.iloc[200:200 + n, c] = b.close.iloc[200, c]
+        b.adj_close.iloc[200:200 + n, c] = b.adj_close.iloc[200, c]
+        hits = [f for f in grab(run(b), "stale_prices", ticker="EEE")
+                if "pinned" in f.detail]
+        assert [f.severity for f in hits] == \
+            ([severity] if severity else []), (n, hits)
+        assert not hits or hits[0].value == float(n), hits
+
+
+def test_pinned_close_in_a_treasury_bill_fund_warns_and_never_fails():
+    # A bill fund's close can sit still for weeks when bill yields are near
+    # zero; the same run in any other ticker stays an automatic FAIL.
+    from qcore.quality import CASH_LIKE_FUNDS, check_stale_prices
+
+    assert "SGOV" in CASH_LIKE_FUNDS and "EEE" not in CASH_LIKE_FUNDS
+    b = copy_bundle(CLEAN)
+    c = b.close.columns.get_loc("EEE")
+    b.close.iloc[200:213, c] = b.close.iloc[200, c]
+    b.adj_close.iloc[200:213, c] = b.adj_close.iloc[200, c]
+    ordinary = [f for f in check_stale_prices(b) if f.ticker == "EEE" and "pinned" in f.detail]
+    assert [f.severity for f in ordinary] == ["FAIL"], ordinary
+    for name in PriceBundle.FIELDS:
+        setattr(b, name, getattr(b, name).rename(columns={"EEE": "SGOV"}))
+    cash = [f for f in check_stale_prices(b) if f.ticker == "SGOV" and "pinned" in f.detail]
+    assert [f.severity for f in cash] == ["WARN"], cash
+    assert cash[0].value == 13.0 and "Treasury-bill fund" in cash[0].detail
+
+
+def test_many_zero_volume_days_with_price_moves_fail():
+    b = copy_bundle(CLEAN)
+    b.volume.iloc[450:470, b.volume.columns.get_loc("AAA")] = 0.0
+    hits = grab(run(b), "zero_volume", "FAIL", "AAA")
+    assert len(hits) == 1 and "zero volume but price moved" in hits[0].detail
+    assert 10 < hits[0].value <= 20, "more than ten such days is a FAIL"
+
+
+def test_zero_volume_move_right_after_a_missing_bar_is_counted():
+    # the move across the hole lands on the first bar after it; measured
+    # bar-to-bar it is NaN there and the day would drop out of the count
+    b = copy_bundle(CLEAN)
+    blank(b, "AAA", 449)
+    b.volume.iloc[450:452, b.volume.columns.get_loc("AAA")] = 0.0
+    hits = grab(run(b), "zero_volume", "WARN", "AAA")
+    assert len(hits) == 1 and hits[0].value == 2.0, hits
+    assert hits[0].date == f"{day(b, 450)}..{day(b, 451)}", hits
+    assert "2 days with zero volume but price moved" in hits[0].detail, hits
+
+
+def test_delisting_grace_is_five_rows():
+    n = len(CLEAN.adj_close)
+    inside, outside = copy_bundle(CLEAN), copy_bundle(CLEAN)
+    blank(inside, "CCC", slice(n - 5, n))
+    blank(outside, "CCC", slice(n - 6, n))
+    assert [f.severity for f in grab(run(inside), "delisting",
+                                     ticker="CCC")] == ["WARN"]
+    assert [f.severity for f in grab(run(outside), "delisting",
+                                     ticker="CCC")] == ["FAIL"]
+
+
+def test_partial_split_adjustment_warns():
+    b = copy_bundle(CLEAN)
+    b.close.iloc[400:, b.close.columns.get_loc("FFF")] *= 0.5
+    for f in ["open", "high", "low", "adj_close"]:
+        df = getattr(b, f)
+        df.iloc[400:, df.columns.get_loc("FFF")] *= 0.75
+    hits = grab(run(b), "split_adjustment", "WARN", "FFF")
+    assert any("partial/unclear" in f.detail for f in hits), hits
+
+
+def test_extra_and_duplicate_columns_are_reported():
+    b = copy_bundle(CLEAN)
+    b.volume["ZZZ"] = 1_000.0
+    b.high = pd.concat([b.high, b.high[["AAA"]]], axis=1)
+    found = run_all(b, universe=UNIVERSE).findings
+    assert any(f.severity == "WARN" and f.ticker == "ZZZ"
+               and "column only in volume.csv" in f.detail for f in found), found
+    assert any(f.severity == "FAIL" and f.ticker == "AAA"
+               and "high.csv: duplicate column" in f.detail for f in found), found
+
+
+def test_operational_tickers_are_not_reported_as_unregistered():
+    b = copy_bundle(CLEAN)
+    parked = qdata.OPERATIONAL_UNIVERSE[0]
+    for f in PriceBundle.FIELDS:
+        getattr(b, f)[parked] = getattr(b, f)["FFF"]
+        getattr(b, f)["ZZZ"] = getattr(b, f)["EEE"]
+    hits = grab(run(b), "symbol_mapping")
+    assert [(f.severity, f.ticker) for f in hits] == [("WARN", "ZZZ")], hits
+
+
+def test_crashing_price_check_becomes_fail_finding():
+    def check_boom(_bundle):
+        raise RuntimeError("boom")
+
+    quality.PRICE_CHECKS.insert(0, check_boom)
+    try:
+        rep = run_all(copy_bundle(CLEAN), universe=UNIVERSE)
+    finally:
+        quality.PRICE_CHECKS.remove(check_boom)
+    crash = [f for f in rep.findings if f.check == "check_boom"]
+    assert [f.severity for f in crash] == ["FAIL"] and "boom" in crash[0].detail
+    assert rep.worst() == "FAIL"
+    assert grab(rep.findings, "split_adjustment", "INFO", SPLIT_TICKER), \
+        "the remaining checks must still run"
+
+
+# ------------------------------------------------- history lost since a record
+def _coverage(b: PriceBundle) -> pd.DataFrame:
+    """Each series' first and last valid date and its observation count, in
+    the layout of the coverage.csv the downloader writes beside the price
+    files (which lists the adjusted closes; index series are added here)."""
+    frames = [b.adj_close] + ([b.indices] if b.indices is not None else [])
+    px = pd.concat(frames, axis=1)
+    return pd.DataFrame({
+        "first": px.apply(lambda s: str(s.first_valid_index().date())),
+        "last": px.apply(lambda s: str(s.last_valid_index().date())),
+        "rows": px.count()})
+
+
+def test_coverage_helper_matches_the_documented_layout():
+    cov = _coverage(CLEAN)
+    n = len(CLEAN.adj_close)
+    assert list(cov.columns) == ["first", "last", "rows"]
+    assert cov.loc["AAA"].tolist() == [day(CLEAN, 0), day(CLEAN, -1), n]
+    assert cov.loc[LATE_TICKER].tolist() == \
+        [day(CLEAN, LATE_POS), day(CLEAN, -1), n - LATE_POS]
+
+
+def _history_loss(mutate, reference, indices=False):
+    b = copy_bundle(CLEAN)
+    if indices:
+        b.indices = _indices(b.adj_close.index)
+    mutate(b)
+    found = run_all(b, universe=UNIVERSE, reference_coverage=reference).findings
+    assert not [f for f in found if "crashed" in f.detail], found
+    return grab(found, "history_loss")
+
+
+def test_ticker_that_lost_years_of_history_fails_against_the_record():
+    ref = _coverage(CLEAN)
+    n = len(CLEAN.adj_close)
+
+    def truncate(b):
+        blank(b, "AAA", slice(0, 300))
+    assert not _history_loss(lambda b: None, ref)
+    hits = _history_loss(truncate, ref)
+    assert [(f.severity, f.ticker, f.date) for f in hits] == \
+        [("FAIL", "AAA", day(CLEAN, 300))], hits
+    assert f"300 of the {n} observations" in hits[0].detail \
+        and "history now starts" in hits[0].detail, hits
+    assert hits[0].value == 300.0
+    # without a record the same cache passes as a later inception: the gap
+    b = copy_bundle(CLEAN)
+    truncate(b)
+    found = run(b)
+    assert not grab(found, "history_loss")
+    assert grab(found, "delisting", "INFO", "AAA")
+    assert not [f for f in found if f.severity in ("FAIL", "WARN")], found
+
+
+def test_history_loss_grades_small_losses_and_sees_tail_and_interior_cuts():
+    ref = _coverage(CLEAN)
+    n = len(CLEAN.adj_close)
+    assert [f.severity for f in _history_loss(
+        lambda b: blank(b, "BBB", slice(0, 5)), ref)] == ["WARN"]
+    assert [f.severity for f in _history_loss(
+        lambda b: blank(b, "BBB", slice(0, 6)), ref)] == ["FAIL"]
+    hits = _history_loss(lambda b: blank(b, "CCC", slice(n - 2, n)), ref)
+    assert [(f.severity, f.date) for f in hits] == [("WARN", "")], hits
+    assert "history now ends" in hits[0].detail, hits
+    hits = _history_loss(lambda b: blank(b, "DDD", slice(300, 320)), ref)
+    assert [(f.severity, f.ticker) for f in hits] == [("FAIL", "DDD")], hits
+    assert f"20 of the {n} observations" in hits[0].detail, hits
+
+
+def test_history_loss_ignores_growth_and_series_outside_the_record():
+    older = PriceBundle(**{f: getattr(CLEAN, f).iloc[100:700]
+                           for f in PriceBundle.FIELDS})
+    ref = _coverage(older)  # recorded before the cache grew both ways
+    assert not _history_loss(lambda b: None, ref)
+    # ...and rows gained outside the recorded span never offset rows lost
+    # inside it
+    for rows in (slice(0, 600), slice(150, None)):
+        span = PriceBundle(**{f: getattr(CLEAN, f).iloc[rows]
+                              for f in PriceBundle.FIELDS})
+        hits = _history_loss(lambda b: blank(b, "AAA", slice(300, 320)),
+                             _coverage(span))
+        assert [(f.severity, f.ticker) for f in hits] == [("FAIL", "AAA")], hits
+        assert "20 of the 6" in hits[0].detail, hits
+    assert not _history_loss(lambda b: None, ref.drop(index=["AAA"]))
+    ref.loc["ZZZ"] = ["2020-01-02", "2022-12-30", 700]  # no longer downloaded
+    assert not _history_loss(lambda b: None, ref)
+    assert not _history_loss(lambda b: None, None)
+
+
+def test_truncated_index_series_fails_against_the_record():
+    b = copy_bundle(CLEAN)
+    b.indices = _indices(b.adj_close.index)
+    ref = _coverage(b)
+
+    def truncate(x):
+        x.indices.iloc[:50, x.indices.columns.get_loc("^IRX")] = np.nan
+    hits = _history_loss(truncate, ref, indices=True)
+    assert [(f.severity, f.ticker) for f in hits] == [("FAIL", "^IRX")], hits
+    assert not _history_loss(lambda x: None, ref, indices=True)
+
+
+def test_unreadable_coverage_record_warns_instead_of_passing():
+    for junk in (pd.DataFrame(), pd.DataFrame({"x": [1]}),
+                 pd.DataFrame({"first": ["soon"], "last": ["later"],
+                               "rows": ["many"]}, index=["AAA"])):
+        hits = _history_loss(lambda b: None, junk)
+        assert [(f.severity, f.ticker) for f in hits] == [("WARN", "")], hits
+        assert "unreadable" in hits[0].detail, hits
+    ref = _coverage(CLEAN).astype(str)  # as read back from a CSV
+    assert not _history_loss(lambda b: None, ref)
+    timed = ref.assign(first=ref["first"] + " 00:00:00",
+                       last=ref["last"] + " 00:00:00")
+    assert not _history_loss(lambda b: None, timed), \
+        "a date written with a time of day is still that date"
+    assert [f.severity for f in _history_loss(
+        lambda b: blank(b, "AAA", slice(0, 300)), timed)] == ["FAIL"]
+    ref.loc["BBB", "rows"] = "many"
+    hits = _history_loss(lambda b: blank(b, "AAA", slice(0, 300)), ref)
+    assert sorted((f.severity, f.ticker) for f in hits) == \
+        [("FAIL", "AAA"), ("WARN", "")], hits
+    empty = _coverage(CLEAN).iloc[0:0]
+    assert not _history_loss(lambda b: None, empty), "nothing recorded yet"
+
+
+def test_load_hands_duplicate_dates_to_the_checks_instead_of_refusing():
+    saved = qdata.DATA_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        qdata.DATA_DIR = Path(tmp)
+        try:
+            for f in PriceBundle.FIELDS:
+                df = getattr(CLEAN, f)
+                pd.concat([df, df.iloc[[100]]]).sort_index().to_csv(
+                    Path(tmp) / f"{f}.csv")
+            ind = _indices(CLEAN.adj_close.index)
+            pd.concat([ind, ind.iloc[[100]]]).sort_index().to_csv(
+                Path(tmp) / "indices.csv")
+            rep = run_all(PriceBundle.load(), universe=UNIVERSE)
+        finally:
+            qdata.DATA_DIR = saved
+    hits = grab(rep.findings, "calendar_alignment", "FAIL")
+    assert sorted(f.detail.split(".csv")[0] for f in hits) == \
+        sorted(PriceBundle.FIELDS + ["indices"]), hits
+    assert all(f.date == day(CLEAN, 100) and "duplicate date row" in f.detail
+               for f in hits), hits
+
+
 # --------------------------------------------------------------------- main
+# Keep this block last: main() runs the tests defined above it.
 def main() -> None:
     tests = [(k, v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
@@ -1152,16 +1834,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-def test_infinity_in_raw_close_fails_even_with_missing_ohlc():
-    b = copy_bundle(CLEAN)
-    b.close.iloc[20, 0] = np.inf
-    b.open.iloc[20, 0] = np.nan
-    assert grab(run(b), "numeric_values", "FAIL", "AAA")
-
-
-def test_infinite_volume_fails():
-    b = copy_bundle(CLEAN)
-    b.volume.iloc[20, 0] = np.inf
-    assert grab(run(b), "numeric_values", "FAIL", "AAA")

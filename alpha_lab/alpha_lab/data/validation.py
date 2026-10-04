@@ -111,7 +111,8 @@ def validate_market(
         of that size is flagged as well; the warning asks for a look.
       - ``member_without_price``: universe True but close NaN (warning).
       - ``ohlc_inconsistent``: high below low, or open/close outside the
-        day's high-low range (warning).
+        day's high-low range (warning, one per ticker and kind with the
+        number of bars, dated at the first one).
       - ``missing_field``: an optional price/volume field has no value at all
         for a ticker that has close prices, as happens when an optional file
         is keyed by other tickers or dates (warning, one per ticker and field).
@@ -211,41 +212,42 @@ def validate_market(
                 )
             )
 
-    # (g) price bars that contradict themselves
+    # (g) price bars that contradict themselves. One warning per ticker and
+    # kind, dated at the first such bar: a panel that pairs an adjusted close
+    # with raw highs and lows breaks most bars of most tickers, and a line
+    # per bar would bury the rest of the report.
+    bar_checks = []
     if data.high is not None and data.low is not None:
-        for date, ticker in _true_cells(data.high < data.low):
+        bar_checks.append(("high", data.high, "below", "low", data.low, data.high < data.low))
+    for name in ("open", "close"):
+        price = getattr(data, name)
+        if price is None:
+            continue
+        if data.high is not None:
+            above = price > data.high * (1.0 + _BAR_TOLERANCE)
+            bar_checks.append((name, price, "above", "high", data.high, above))
+        if data.low is not None:
+            below = price < data.low * (1.0 - _BAR_TOLERANCE)
+            bar_checks.append((name, price, "below", "low", data.low, below))
+    for name, price, side, bound, limit, broken in bar_checks:
+        broken_bars = broken.sum()
+        bars = (price.notna() & limit.notna()).sum()
+        for ticker in data.tickers:
+            count = int(broken_bars[ticker])
+            if not count:
+                continue
+            first = broken.index[int(broken[ticker].to_numpy().argmax())]
             issues.append(
                 Issue(
                     "warning",
                     "ohlc_inconsistent",
                     ticker,
-                    date,
-                    f"high {float(data.high.at[date, ticker]):g}"
-                    f" below low {float(data.low.at[date, ticker]):g}",
+                    first,
+                    f"{name} {side} {bound} on {count} of {int(bars[ticker])} bars;"
+                    f" first: {name} {float(price.at[first, ticker]):g}"
+                    f" {side} {bound} {float(limit.at[first, ticker]):g}",
                 )
             )
-    for name in ("open", "close"):
-        price = getattr(data, name)
-        if price is None:
-            continue
-        for bound, limit, outside in (
-            ("high", data.high, lambda p, lim: p > lim * (1.0 + _BAR_TOLERANCE)),
-            ("low", data.low, lambda p, lim: p < lim * (1.0 - _BAR_TOLERANCE)),
-        ):
-            if limit is None:
-                continue
-            side = "above" if bound == "high" else "below"
-            for date, ticker in _true_cells(outside(price, limit)):
-                issues.append(
-                    Issue(
-                        "warning",
-                        "ohlc_inconsistent",
-                        ticker,
-                        date,
-                        f"{name} {float(price.at[date, ticker]):g}"
-                        f" {side} {bound} {float(limit.at[date, ticker]):g}",
-                    )
-                )
 
     # (h) optional fields that are absent or zero for a priced ticker
     priced = data.close.notna()

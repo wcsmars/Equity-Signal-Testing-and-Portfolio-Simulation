@@ -410,6 +410,59 @@ def test_csv_accepts_iso_dates_in_both_layouts(tmp_path, date_cells):
         assert close["B"].tolist() == [52.0, 51.0, 50.0]
 
 
+def test_csv_date_cells_may_be_padded_with_whitespace(tmp_path):
+    # padding is not a question of format (fixed-width exports have it); the
+    # cell is read just as strictly once the padding is dropped
+    wide, long = _write_csv_layouts(tmp_path, ["2024-01-10 ", " 2024-01-11", "20240112\t"])
+    expected = pd.DatetimeIndex(["2024-01-10", "2024-01-11", "2024-01-12"])
+    for source in (CSVSource(wide), CSVSource(long, format="long")):
+        close = source.load().close
+        assert close.index.equals(expected)
+        assert close["A"].tolist() == [100.0, 101.0, 102.0]
+    wide, long = _write_csv_layouts(tmp_path, ["2024-01-10", "10/01/2024 "])
+    with pytest.raises(DataError) as caught:
+        CSVSource(wide).load()
+    # the whole message: file, row, the cell as written, and what is accepted
+    assert str(caught.value) == (
+        f"{wide / 'close.csv'}: date in data row 2 '10/01/2024 ' is not an ISO date; "
+        "use YYYY-MM-DD (optionally with a time, no UTC offset) or YYYYMMDD"
+    )
+    wide, long = _write_csv_layouts(tmp_path, ["2024-01-10", "   "])
+    with pytest.raises(DataError, match=r"long\.csv: date in data row 3 '   ' is not an ISO date"):
+        CSVSource(long, format="long").load()
+
+
+def test_iso_date_pattern_keeps_both_alternatives_inside_added_anchors():
+    # pandas matches Arrow-backed strings by wrapping the pattern in ^...$,
+    # in some releases without grouping it first. A bare top-level `a|b`
+    # would then accept "<ISO date><anything>" and "<anything><8 digits>".
+    import re
+
+    from alpha_lab.core.types import ISO_DATE_PATTERN
+
+    anchored = re.compile("^" + ISO_DATE_PATTERN + "$")
+    for good in ("2024-01-10", "2024-01-10 16:00", "2024-01-10T16:00:00.5", "20240110"):
+        assert anchored.match(good) and re.fullmatch(ISO_DATE_PATTERN, good), good
+    for bad in ("2024-01-10T00:00:00+00:00", "2024-01-10Z", "2024-01-10 x", "x20240110", "10/01/20240110"):
+        assert not anchored.match(bad) and not re.fullmatch(ISO_DATE_PATTERN, bad), bad
+
+
+def test_csv_dates_stay_strict_with_arrow_backed_strings(tmp_path):
+    # the string type pandas 3 uses when pyarrow is installed; on pandas 2 the
+    # same type is switched on by the option below
+    pytest.importorskip("pyarrow")
+    with pd.option_context("future.infer_string", True):
+        wide, long = _write_csv_layouts(tmp_path, ["2024-01-10T00:00:00+00:00", "2024-01-11T00:00:00+00:00"])
+        with pytest.raises(DataError, match=r"close\.csv: date in data row 1 .* is not an ISO date"):
+            CSVSource(wide).load()
+        with pytest.raises(DataError, match=r"long\.csv: date in data row 1 .* is not an ISO date"):
+            CSVSource(long, format="long").load()
+        wide, long = _write_csv_layouts(tmp_path, ["2024-01-10", "20240111"])
+        expected = pd.DatetimeIndex(["2024-01-10", "2024-01-11"])
+        assert CSVSource(wide).load().close.index.equals(expected)
+        assert CSVSource(long, format="long").load().close.index.equals(expected)
+
+
 @pytest.mark.parametrize(
     "header, message",
     [
@@ -798,21 +851,37 @@ def test_contradictory_price_bars_are_reported():
     high.iloc[10, 0] = low.iat[10, 0] * 0.9          # high below low
     open_.iloc[20, 1] = high.iat[20, 1] * 1.05       # open above high
     low.iloc[30, 2] = base.close.iat[30, 2] * 1.01   # low above close
+    low.iloc[40, 2] = base.close.iat[40, 2] * 1.01   # and once more, later
+    high.iloc[50:, 1] = np.nan                       # no high: not a bar to judge
     data = MarketData.from_frames(base.close, open=open_, high=high, low=low)
     report = validate_market(data)
-    found = {(i.ticker, i.date, i.message.split(" ")[0], i.message.split(" ")[2], i.message.split(" ")[3])
-             for i in _issues(report, "ohlc_inconsistent")}
-    assert (tickers[0], dates[10], "high", "below", "low") in found
-    assert (tickers[1], dates[20], "open", "above", "high") in found
-    assert (tickers[2], dates[30], "close", "below", "low") in found
-    assert {(t, d) for t, d, *_ in found} == {(tickers[0], dates[10]), (tickers[1], dates[20]), (tickers[2], dates[30])}
+    bars = _issues(report, "ohlc_inconsistent")
+    # one warning per ticker and kind, dated at the first such bar
+    found = {(i.ticker, i.date, i.message.split(";")[0]) for i in bars}
+    assert len(found) == len(bars)
+    assert (tickers[0], dates[10], "high below low on 1 of 60 bars") in found
+    assert (tickers[1], dates[20], "open above high on 1 of 50 bars") in found
+    assert (tickers[2], dates[30], "close below low on 2 of 60 bars") in found
+    assert {(t, d) for t, d, _ in found} == {(tickers[0], dates[10]), (tickers[1], dates[20]), (tickers[2], dates[30])}
+    # the message carries the first bar's two prices
+    first = next(i for i in bars if i.ticker == tickers[2] and i.message.startswith("close below low"))
+    assert first.message == (
+        f"close below low on 2 of 60 bars; first: close {base.close.iat[30, 2]:g}"
+        f" below low {low.iat[30, 2]:g}"
+    )
     assert report.ok  # warnings only
     # a flat bar (open = high = low = close) is consistent
     flat = MarketData.from_frames(base.close, open=base.close, high=base.close, low=base.close)
     assert validate_market(flat).issues == []
-    # the finding's case: every bar inverted
+    # every bar inverted: each ticker is reported once per kind with the full
+    # count (12 lines here), not once per bar (720 lines)
     inverted = MarketData.from_frames(base.close, high=base.close * 0.5, low=base.close * 2.0)
-    assert len(_issues(validate_market(inverted), "ohlc_inconsistent")) >= base.close.size
+    flood = _issues(validate_market(inverted), "ohlc_inconsistent")
+    assert sorted((i.ticker, i.date, i.message.split(";")[0]) for i in flood) == sorted(
+        (ticker, dates[0], f"{kind} on 60 of 60 bars")
+        for ticker in tickers
+        for kind in ("high below low", "close above high", "close below low")
+    )
 
 
 def test_missing_field_and_zero_volume_are_reported_per_ticker():
@@ -839,7 +908,7 @@ def test_missing_field_and_zero_volume_are_reported_per_ticker():
     ]
     assert report.ok
     assert len(report.summary().splitlines()) == len(report.issues) + 1
-    # all-zero volume, the finding's case, is reported for every ticker
+    # all-zero volume is reported for every ticker
     silent = MarketData.from_frames(base.close, volume=base.volume * 0.0)
     assert [i.ticker for i in _issues(validate_market(silent), "zero_volume")] == tickers
 

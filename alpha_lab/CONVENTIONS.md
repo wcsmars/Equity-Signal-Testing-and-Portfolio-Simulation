@@ -18,6 +18,11 @@ an arbitrary dataset or custom signal is free of bias.
   historical completeness of a real investment universe.
 - Price adjustment quality, historical constituents, delisting returns, and
   vendor revisions remain the data provider's responsibility.
+- Dates in CSV files and in config values (`data.start`, `data.end`,
+  `data.synthetic.start`) must be ISO 8601: `YYYY-MM-DD`, optionally with a
+  time of day and no UTC offset, or compact `YYYYMMDD` (quoted in YAML,
+  where a bare `20240102` is a number). Any other spelling, such as
+  `10/01/2024`, is rejected: the day/month order is never guessed.
 
 ## Timing
 
@@ -74,6 +79,31 @@ For `r_t = close_t / close_{t-1} - 1`:
   review. A run warns and records `meta.missing_held_return_cells`
   whenever a held return is missing.
 
+## Scores and portfolio construction
+
+- Cross-sectional z-scores leave a date unscored when it has no dispersion:
+  a standard deviation of at most 1e-12 times the date's largest absolute
+  value, which is the rounding residue of equal values.
+- A date whose valid scores are all equal gets zero target weights, in
+  long-short and long-only books alike. Otherwise each bucket has
+  `k = max(1, floor(n * quantile))` slots for the date's `n` valid scores.
+- Ties never depend on column order. When the score at a bucket's edge is
+  shared by names on both sides of the edge, all of them join the bucket.
+  With `weighting: equal` they share the slots they straddle equally (`m`
+  names over `j` slots get `j/m` of a slot each). With `weighting: score`
+  they carry the bucket's least extreme score, which gets a near-zero
+  weight (an equal split when the whole bucket is tied). A group tied
+  across both edges is long and short at once and nets out, so that date
+  can hold less than `gross_leverage`.
+- `gross_leverage` is the gross of the book before vol targeting. With
+  `vol_target` set, each date's book is multiplied by `target / estimate`
+  clipped to [0, 3] and the per-name cap is applied again, so gross can
+  fall below `gross_leverage` or reach three times it. The estimate uses
+  each name's trailing volatility through the decision date and ignores
+  correlations. A held name with fewer than `vol_lookback // 2` returns of
+  its own is given the largest trailing volatility known that day. Dates
+  before any name has an estimate keep the unscaled book.
+
 ## Paths and outputs
 
 Paths in a YAML config (`data.path`, `experiment.runs_dir`, and
@@ -82,22 +112,49 @@ Dotted `--override` values use the same rule. The separate `--runs-dir` CLI
 flag is relative to the shell's current directory. Absolute paths work in
 all three cases. `config_from_dict` leaves paths as supplied.
 
+A config file is one YAML mapping. An empty file means all defaults; any
+other document (a list, a scalar) is an error. Unknown keys are errors, so
+a YAML anchor must be declared on a value inside a schema section, not
+under a scratch top-level key. Each alias gets its own copy of the anchored
+value: an override applied through one path does not change the other.
+
 The base example writes tracked results and HTML/Markdown reports to
 `alpha_lab/runs/` relative to the project root. Synthetic results exercise
 the software and are not evidence of investment performance.
 
-Feature cache identities cover every input date and value. Clear the cache
-after changing a feature's implementation: data identity does not version
-code. Market-data snapshots are published only after all fields are written,
+Feature cache identities cover every input date and value. A disk entry is
+also keyed by the feature's parameters and by its implementation: the
+module-qualified name of the feature's class, the source text of that
+class and of its base classes other than the `Feature` interface, and the
+functions those classes define as loaded in the running process (their
+bytecode, names and constants). Editing a feature class, or registering a
+different class under the same name, is therefore a cache miss, also for a
+class whose source cannot be read, such as one defined in an interactive
+session. A session that imported a feature before its file was edited
+writes under its own key, and entries are specific to the Python version
+that compiled the code. Not covered: code the class only calls
+(module-level helpers and constants, `MarketData` methods, pandas and
+NumPy), and class attributes of a class without readable source. Clear the
+cache after changing those. The in-memory memo of a `FeatureStore` is
+keyed by parameters and data only. Cache files are written to a temporary
+name and renamed into place; a file that cannot be read is reported with a
+warning, recomputed and replaced.
+
+Market-data snapshots are published only after all fields are written,
 reject an existing snapshot id, and verify each recorded field checksum on
-load. Older snapshots without manifests remain readable but cannot offer
-checksum verification.
+load. An empty panel cannot be snapshotted. A published snapshot directory
+takes the permission bits of its dataset directory. Older snapshots without
+manifests remain readable but cannot offer checksum verification. The
+snapshot store is a standalone utility: no config key selects a snapshot,
+and a run does not record a snapshot id.
 
 For walk-forward runs, report charts, monthly returns, and headline metrics
 start at the first test-window date. The training and purge warm-up remains
 in the persisted result tables but is excluded from those summaries. The
 window table still shows the training dates for context. Full-sample
-diagnostic runs retain their complete date range.
+diagnostic runs retain their complete date range: the report states how
+many leading days precede the first position (signal warm-up and execution
+lag), and those days count as flat days in every metric.
 
 ## Leakage checks
 
@@ -106,8 +163,13 @@ the same computation on the panel cut at a sampled date. Without explicit
 `dates` the sample is eight dates spread from one sixth of the index to the
 second-to-last date (cutting at the final date returns the whole panel and
 cannot fail), plus the warm-up: the first two dates, the middle of the
-first sixth, and the first date on which the full-panel output holds a
-value. The warm-up rows are where a backfill would place future values.
+first sixth, the first date on which the full-panel output holds a value,
+and the first date on which it holds a non-zero value (target weights are
+0.0, not missing, before the first position). The warm-up rows are where a
+backfill would place future values.
+The feature, signal and constructor checks raise `DataError` when the
+full-panel output is blank (missing or 0.0) on every checked date, as on a
+panel shorter than the lookback: no value would have been compared.
 The cost check samples dates that carry a trade and raises `DataError`
 when none of the checked dates does, because a date without a trade costs
 nothing whatever the model reads. These are sampled probes, not proofs.

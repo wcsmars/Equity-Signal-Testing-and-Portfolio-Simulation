@@ -34,6 +34,10 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Al
         raise ConfigError(f"{p}: invalid YAML ({exc})") from exc
     except (OSError, UnicodeError) as exc:
         raise ConfigError(f"{p}: cannot read config file ({exc})") from exc
+    except ValueError as exc:
+        # PyYAML builds unquoted dates itself, so `start: 2024-02-30` leaves
+        # the parser as a bare ValueError, not as a YAMLError
+        raise ConfigError(f"{p}: invalid value in YAML ({exc})") from exc
     except ConfigError as exc:
         raise ConfigError(f"{p}: {exc}") from exc
     # Only an empty document stands for "all defaults". `raw or {}` would

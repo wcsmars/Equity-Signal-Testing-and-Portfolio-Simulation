@@ -24,8 +24,13 @@ signal:
 portfolio:
   method: quantile_long_short
   quantile: 0.2
+  # `score` weights each name by its distance from the bucket's worst score,
+  # so the least extreme name of each bucket gets almost no weight.
   weighting: equal
   dollar_neutral: true
+  # Gross BEFORE vol targeting: with vol_target set, each row is then scaled
+  # by clip(target / estimate, 0, 3), so gross can fall below this or reach
+  # 3x this figure.
   gross_leverage: 2.0
   # Must satisfy names_per_side * max_weight >= gross_leverage / 2, or the
   # cap is infeasible: every name pins to the cap, gross shrinks,

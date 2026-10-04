@@ -1,23 +1,72 @@
-"""ETF pairs spread-reversion example with rolling hedge ratios.
+"""ETF pairs spread reversion. Rejected: negative out of sample after costs.
 
-A trailing 90-day log-price regression defines the hedge ratio; a 60-day
-consistent-beta spread z-score triggers entries outside +/-2. Entry leg
-weights remain fixed until |z| < 0.5 or a 20-day holding limit. Re-entry
-requires the spread to return inside the entry band. Included pairs are
-screened by standalone pre-2018 net Sharpe and share a 1.5 gross budget.
+Hypothesis
+    Two ETFs that hold closely related assets (gold and gold miners, energy
+    and oil producers, 7-10 and 20+ year Treasuries) are tied together by
+    common fundamentals. A gap between them is often caused by flow in one
+    leg, not by news, and should close. Selling the rich leg and buying the
+    cheap one supplies liquidity to whoever pushed the spread, and is paid
+    when the gap closes. The risk is that the gap is information.
 
-The fixed quantity is the portfolio weight, not the share count, so the
-engine trades both legs back to target on every holding day. A desk holding
-shares would order only at entry and exit; the reported cost drag is
-therefore on the high side (qcore.backtest.drift_weights is the
-share-holding expansion used by the monthly strategies).
+Rule
+    Pairs considered (7): GLD/GDX, XLE/XOP, EWA/EWC, SPY/MDY, QQQ/XLK,
+    KRE/XLF, IEF/TLT, from dividend-adjusted closes.
+    Hedge ratio: beta = slope of log(A) on log(B) over the trailing H=90
+    days.
+    Signal: z-score of the spread log(A) - beta*log(B) over the trailing
+    Z=60 days, with the current beta applied to the whole window.
+    Entry at a close, if beta > 0: z > +2, short A and long B; z < -2, long
+    A and short B. Leg weights are fixed at entry: sign*G/(1+beta) for A and
+    -sign*beta*G/(1+beta) for B, G being the gross weight of the pair.
+    Exit: |z| < 0.5, or 20 trading days. Re-entry requires the spread to
+    return inside the entry band first.
+    Portfolio: the pairs whose standalone in-sample net Sharpe is positive
+    (XLE/XOP, EWA/EWC and QQQ/XLK, 3 of 7) share a gross budget of 1.5
+    equally.
+    The engine assumes execution at the decision close. Costs are modelling
+    assumptions: the commissions and fees of qcore.costs, 3 bps of slippage
+    per side, and 1% a year of borrow cost on short positions. Borrow
+    availability, variable lending fees and margin calls are not modelled.
 
-Costs include 3 bps per-side slippage and a fixed annual stock-borrow proxy.
-Borrow availability, variable lending fees and margin calls are not modeled.
-Signals assume same-close execution. This is an exploratory example; run
-the module to calculate metrics on the locally obtained cache and save them
-to results/pairs_statarb.json. A saved file that differs from the new run
-is kept and the new output goes to results/recomputed/ instead; pass
+    The fixed quantity is the portfolio weight, not the share count, so the
+    engine trades both legs back to target on every holding day. A desk
+    holding shares would order only at entry and exit; the reported cost is
+    therefore on the high side (see Result).
+
+Variants tried
+    9: H {60, 90, 120} x Z {20, 40, 60}. Entry, exit and time limit were
+    fixed. scripts/research_pairs_statarb.py runs the grid through
+    pair_weights.
+
+Selection
+    In-sample Sharpe of the combined pairs (data before 2018-01-01).
+    H=90, Z=60 was the in-sample best when the study was run and is the
+    variant recorded here; on the current engine H=120, Z=20 ranks first
+    (0.51 against 0.48). Out-of-sample results (2018-01-01 onwards) are
+    reported, not selected on, and here the choice changes nothing: all nine
+    variants are negative out of sample.
+
+Result
+    This code on data ending 2026-07-01, net of the modelled costs, Sharpe
+    ratios in excess of the cash rate, from 2000-06-30:
+    Sharpe 0.18 full sample / 0.48 in sample / -0.54 out of sample;
+    CAGR 2.37%, volatility 3.90%, maximum drawdown -9.98%.
+    Before costs the full-sample Sharpe is 0.59. Turnover is 18.4x a year
+    (buys plus sells); trading costs take 1.26% a year and borrow 0.22%.
+    Out-of-sample Sharpe across the nine variants: -0.54 to -1.00.
+    Holding shares instead of constant weights (entry and exit rows expanded
+    with qcore.backtest.drift_weights) gives 0.26 full sample / 0.54 in
+    sample / -0.44 out of sample, with trading costs of 0.92% a year, so the
+    verdict does not depend on that convention.
+
+Verdict
+    Rejected; not part of the combined portfolio. Costs take the full-sample
+    Sharpe from 0.59 to 0.18, and from 2018 no variant earns more than cash.
+    The file is kept as the record of a negative result.
+
+Run the module to calculate metrics on the locally obtained cache and save
+them to results/pairs_statarb.json. A saved file that differs from the new
+run is kept and the new output goes to results/recomputed/ instead; pass
 --rebase to replace the saved file.
 """
 import argparse
@@ -41,7 +90,7 @@ PAIRS = [
     ("GLD", "GDX"), ("XLE", "XOP"), ("EWA", "EWC"), ("SPY", "MDY"),
     ("QQQ", "XLK"), ("KRE", "XLF"), ("IEF", "TLT"),
 ]
-H, Z = 90, 60                    # hedge and spread lookback lengths
+H, Z = 90, 60                    # hedge and spread lookbacks, recorded variant
 ENTRY, EXIT_Z, TIMEOUT = 2.0, 0.5, 20
 GROSS_CAP, BORROW_RATE, SLIPPAGE_BPS = 1.5, 0.01, 3.0
 
@@ -51,7 +100,8 @@ def pair_weights(px: pd.DataFrame, a: str, b: str, H: int = H, Z: int = Z,
     """Daily target weights for one pair, unit gross while in a trade.
 
     H and Z are the hedge-ratio and z-score windows; they default to the
-    module's retained example lengths."""
+    recorded variant and are arguments so the nine-variant grid can be run
+    through this same function."""
     for window in (H, Z):
         if isinstance(window, bool) or not isinstance(window, (int, np.integer)) or window < 2:
             raise ValueError("H and Z must be integer windows of at least 2 sessions")
@@ -161,7 +211,9 @@ def main():
 
 
 def _parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # allow_abbrev=False: a shortened flag such as --reb is refused, not accepted
+    # by the parser and then missed by the exact-name checks that act on it
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--rebase", action="store_true",
                         help="replace results/pairs_statarb.json when this run differs from it")
     return parser.parse_args(argv)
@@ -169,4 +221,7 @@ def _parse_args(argv=None):
 
 if __name__ == "__main__":
     _parse_args()
-    main()
+    try:
+        main()
+    except FileNotFoundError as exc:  # no data cache: the loader's one line, no traceback
+        sys.exit(str(exc))

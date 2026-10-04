@@ -58,6 +58,8 @@ REGISTRY_COLUMNS = ("run_id", "ts", "name", "config_hash") + _REGISTRY_METRICS
 _PATH_KEYS = (("data", "path"), ("experiment", "runs_dir"), ("experiment", "feature_cache_dir"))
 
 _SLUG_RE = re.compile(r"[^a-z0-9\-_]+")
+#: a full commit id (SHA-1 or SHA-256), the only thing kept from git's output
+_COMMIT_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
 def _utcnow() -> datetime:
@@ -143,22 +145,29 @@ def _git_revision(package_dir: Path) -> str | None:
     package's own ``__init__.py`` is not tracked there (an installed copy that
     merely sits inside some unrelated repository). '+dirty' is appended when
     tracked files under the package differ from that commit.
+
+    Only the commit id is kept: no remote, author, branch or path. git is
+    asked three read-only questions, each with a time limit and no access to
+    the terminal, and any failure at all gives None: a run must never be lost
+    because its provenance could not be looked up.
     """
     def git(*args: str) -> str | None:
         proc = subprocess.run(
             ["git", "--no-optional-locks", "-C", str(package_dir), *args],
-            capture_output=True, text=True, timeout=10,
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
         )
-        return proc.stdout.strip() if proc.returncode == 0 else None
+        return proc.stdout.decode("utf-8", "replace").strip() if proc.returncode == 0 else None
 
     try:
         if git("ls-files", "--error-unmatch", "__init__.py") is None:
             return None
         head = git("rev-parse", "HEAD")
-        if not head:
+        if not head or not _COMMIT_RE.fullmatch(head):
             return None
         dirty = git("status", "--porcelain", "--untracked-files=no", "--", ".")
-    except (OSError, subprocess.SubprocessError):
+        if dirty is None:  # unknown state: a bare commit id would claim "clean"
+            return None
+    except Exception:  # no git, a timeout, an unusable path
         return None
     return f"{head}+dirty" if dirty else head
 

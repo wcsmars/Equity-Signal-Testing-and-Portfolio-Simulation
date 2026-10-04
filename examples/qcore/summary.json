@@ -1,0 +1,377 @@
+{
+  "written_by": "scripts/make_results_summary.py",
+  "synthetic_sample_data": false,
+  "price_cache": {
+    "first_session": "2000-01-03",
+    "last_session": "2026-07-01",
+    "sessions": 6663
+  },
+  "conventions": {
+    "in_sample_before": "2018-01-01",
+    "sharpe": "annualised, on daily returns in excess of the cash rate",
+    "cash_rate": "13-week bill yield less 10 bps, previous close",
+    "dividend_withholding": 0.3,
+    "turnover": "yearly sum of absolute weight changes, buys plus sells",
+    "cost_drag": "yearly return lost to modelled commissions, fees and slippage",
+    "capital": 100000.0
+  },
+  "strategies": [
+    {
+      "key": "mean_reversion",
+      "module": "src/strategies/mean_reversion.py",
+      "label": "Dip buying",
+      "description": "Short-horizon dip buying on a fixed universe of liquid US equity ETFs.",
+      "status": "kept",
+      "run": "mean_reversion_e5_x70_h10",
+      "start": "2000-11-10",
+      "end": "2026-07-01",
+      "full": {
+        "cagr": 0.0497,
+        "vol": 0.0681,
+        "sharpe": 0.5,
+        "maxdd": -0.1442
+      },
+      "in_sample": {
+        "cagr": 0.0542,
+        "vol": 0.0614,
+        "sharpe": 0.69,
+        "maxdd": -0.1442
+      },
+      "out_of_sample": {
+        "cagr": 0.0405,
+        "vol": 0.0801,
+        "sharpe": 0.23,
+        "maxdd": -0.1342
+      },
+      "gross_sharpe_full": 0.66,
+      "ann_turnover_buys_plus_sells": 20.3,
+      "ann_cost_drag": 0.0105,
+      "ann_withholding_drag": 0.0008,
+      "ann_cash_income": 0.0137
+    },
+    {
+      "key": "seasonality_flows",
+      "module": "src/strategies/seasonality_flows.py",
+      "label": "Turn of month",
+      "description": "Turn-of-month seasonality on SPY.",
+      "status": "kept",
+      "run": "tom_spy_N4_M2_nofilt",
+      "start": "2000-01-03",
+      "end": "2026-07-01",
+      "full": {
+        "cagr": 0.0735,
+        "vol": 0.1008,
+        "sharpe": 0.58,
+        "maxdd": -0.1347
+      },
+      "in_sample": {
+        "cagr": 0.0716,
+        "vol": 0.1036,
+        "sharpe": 0.58,
+        "maxdd": -0.1347
+      },
+      "out_of_sample": {
+        "cagr": 0.0776,
+        "vol": 0.0947,
+        "sharpe": 0.58,
+        "maxdd": -0.1149
+      },
+      "gross_sharpe_full": 0.63,
+      "ann_turnover_buys_plus_sells": 24.1,
+      "ann_cost_drag": 0.0059,
+      "ann_withholding_drag": 0.0,
+      "ann_cash_income": 0.0127
+    },
+    {
+      "key": "tsmom_trend",
+      "module": "src/strategies/tsmom_trend.py",
+      "label": "Trend following",
+      "description": "Monthly multi-asset trend following (time-series momentum) on 14 ETFs.",
+      "status": "kept",
+      "run": "blend_iv_cash",
+      "start": "2001-02-28",
+      "end": "2026-07-01",
+      "full": {
+        "cagr": 0.0558,
+        "vol": 0.0625,
+        "sharpe": 0.64,
+        "maxdd": -0.1467
+      },
+      "in_sample": {
+        "cagr": 0.058,
+        "vol": 0.0602,
+        "sharpe": 0.77,
+        "maxdd": -0.078
+      },
+      "out_of_sample": {
+        "cagr": 0.0515,
+        "vol": 0.0667,
+        "sharpe": 0.42,
+        "maxdd": -0.1467
+      },
+      "gross_sharpe_full": 0.72,
+      "ann_turnover_buys_plus_sells": 2.0,
+      "ann_cost_drag": 0.0018,
+      "ann_withholding_drag": 0.0034,
+      "ann_cash_income": 0.0053
+    },
+    {
+      "key": "xsec_etf_mom",
+      "module": "src/strategies/xsec_etf_mom.py",
+      "label": "ETF momentum rotation",
+      "description": "Monthly cross-sectional momentum rotation across 34 equity ETFs.",
+      "status": "kept",
+      "run": "b3612_K3_brkOn_B9_drift",
+      "start": "2002-03-28",
+      "end": "2026-07-01",
+      "full": {
+        "cagr": 0.1374,
+        "vol": 0.2086,
+        "sharpe": 0.65,
+        "maxdd": -0.2785
+      },
+      "in_sample": {
+        "cagr": 0.1504,
+        "vol": 0.2016,
+        "sharpe": 0.74,
+        "maxdd": -0.2744
+      },
+      "out_of_sample": {
+        "cagr": 0.1135,
+        "vol": 0.221,
+        "sharpe": 0.49,
+        "maxdd": -0.2785
+      },
+      "gross_sharpe_full": 0.68,
+      "ann_turnover_buys_plus_sells": 5.7,
+      "ann_cost_drag": 0.0026,
+      "ann_withholding_drag": 0.0042,
+      "ann_cash_income": 0.0002
+    },
+    {
+      "key": "xsec_stock_mom",
+      "module": "src/strategies/xsec_stock_mom.py",
+      "label": "Stock momentum (biased universe)",
+      "description": "Monthly stock momentum with a reversal tilt. Rejected: biased universe.",
+      "status": "rejected",
+      "run": "xsec_stock_mom_K5_lam0.25",
+      "start": "2001-01-31",
+      "end": "2026-07-01",
+      "full": {
+        "cagr": 0.2025,
+        "vol": 0.2618,
+        "sharpe": 0.77,
+        "maxdd": -0.4179
+      },
+      "in_sample": {
+        "cagr": 0.1803,
+        "vol": 0.2449,
+        "sharpe": 0.75,
+        "maxdd": -0.4179
+      },
+      "out_of_sample": {
+        "cagr": 0.2481,
+        "vol": 0.2928,
+        "sharpe": 0.82,
+        "maxdd": -0.3481
+      },
+      "gross_sharpe_full": 0.88,
+      "ann_turnover_buys_plus_sells": 13.7,
+      "ann_cost_drag": 0.0251,
+      "ann_withholding_drag": 0.0032,
+      "ann_cash_income": 0.0
+    },
+    {
+      "key": "vol_regime",
+      "module": "src/strategies/vol_regime.py",
+      "label": "VIX regime switch",
+      "description": "VIX term-structure regime switch, QQQ or IEF. Rejected: no timing value.",
+      "status": "rejected",
+      "run": "vol_regime_TS_QQQ_IEF_s5_lo0.95_hi1.05",
+      "start": "2006-07-24",
+      "end": "2026-07-01",
+      "full": {
+        "cagr": 0.1195,
+        "vol": 0.1579,
+        "sharpe": 0.7,
+        "maxdd": -0.4095
+      },
+      "in_sample": {
+        "cagr": 0.113,
+        "vol": 0.1372,
+        "sharpe": 0.79,
+        "maxdd": -0.2399
+      },
+      "out_of_sample": {
+        "cagr": 0.1283,
+        "vol": 0.1821,
+        "sharpe": 0.62,
+        "maxdd": -0.4095
+      },
+      "gross_sharpe_full": 0.74,
+      "ann_turnover_buys_plus_sells": 12.0,
+      "ann_cost_drag": 0.0041,
+      "ann_withholding_drag": 0.002,
+      "ann_cash_income": 0.0
+    },
+    {
+      "key": "pairs_statarb",
+      "module": "src/strategies/pairs_statarb.py",
+      "label": "ETF pairs",
+      "description": "ETF pairs spread reversion. Rejected: negative out of sample after costs.",
+      "status": "rejected",
+      "run": "pairs_statarb_H90_Z60",
+      "start": "2000-06-30",
+      "end": "2026-07-01",
+      "full": {
+        "cagr": 0.0237,
+        "vol": 0.039,
+        "sharpe": 0.18,
+        "maxdd": -0.0998
+      },
+      "in_sample": {
+        "cagr": 0.0328,
+        "vol": 0.0409,
+        "sharpe": 0.48,
+        "maxdd": -0.0784
+      },
+      "out_of_sample": {
+        "cagr": 0.0053,
+        "vol": 0.0346,
+        "sharpe": -0.54,
+        "maxdd": -0.0904
+      },
+      "gross_sharpe_full": 0.59,
+      "ann_turnover_buys_plus_sells": 18.4,
+      "ann_cost_drag": 0.0126,
+      "ann_withholding_drag": 0.0012,
+      "ann_cash_income": 0.0137,
+      "ann_borrow_drag": 0.0022
+    },
+    {
+      "key": "tsmom_voltarget",
+      "module": "src/strategies/tsmom_voltarget.py",
+      "label": "Trend at 1.64x leverage",
+      "description": "Volatility-target and concentration study on the trend rule. Rejected.",
+      "status": "rejected",
+      "run": "dilute_klev164",
+      "start": "2001-02-28",
+      "end": "2026-07-01",
+      "full": {
+        "cagr": 0.0772,
+        "vol": 0.1029,
+        "sharpe": 0.62,
+        "maxdd": -0.2347
+      },
+      "in_sample": {
+        "cagr": 0.0854,
+        "vol": 0.099,
+        "sharpe": 0.76,
+        "maxdd": -0.1259
+      },
+      "out_of_sample": {
+        "cagr": 0.061,
+        "vol": 0.1103,
+        "sharpe": 0.37,
+        "maxdd": -0.2347
+      },
+      "gross_sharpe_full": 0.69,
+      "ann_turnover_buys_plus_sells": 3.7,
+      "ann_cost_drag": 0.0025,
+      "ann_withholding_drag": 0.0055,
+      "ann_cash_income": 0.001,
+      "ann_financing_drag": 0.0078
+    }
+  ],
+  "ensemble": {
+    "module": "src/ensemble.py",
+    "label": "Blend of the four kept strategies",
+    "status": "kept",
+    "run": "ensemble",
+    "start": "2000-01-03",
+    "end": "2026-07-01",
+    "full": {
+      "cagr": 0.0659,
+      "vol": 0.0635,
+      "sharpe": 0.76,
+      "maxdd": -0.1133
+    },
+    "in_sample": {
+      "cagr": 0.0687,
+      "vol": 0.0598,
+      "sharpe": 0.9,
+      "maxdd": -0.1132
+    },
+    "out_of_sample": {
+      "cagr": 0.06,
+      "vol": 0.0706,
+      "sharpe": 0.51,
+      "maxdd": -0.1133
+    },
+    "gross_sharpe_full": 0.9,
+    "ann_turnover_buys_plus_sells": 12.7,
+    "ann_cost_drag": 0.0072,
+    "ann_withholding_drag": 0.0018,
+    "ann_cash_income": 0.0107,
+    "sleeve_weights": {
+      "mean_reversion": 0.342095,
+      "seasonality_flows": 0.197801,
+      "tsmom_trend": 0.351571,
+      "xsec_etf_mom": 0.108533
+    },
+    "sleeve_correlations": {
+      "mean_reversion": {
+        "mean_reversion": 1.0,
+        "seasonality_flows": 0.24,
+        "tsmom_trend": 0.44,
+        "xsec_etf_mom": 0.45
+      },
+      "seasonality_flows": {
+        "mean_reversion": 0.24,
+        "seasonality_flows": 1.0,
+        "tsmom_trend": 0.27,
+        "xsec_etf_mom": 0.23
+      },
+      "tsmom_trend": {
+        "mean_reversion": 0.44,
+        "seasonality_flows": 0.27,
+        "tsmom_trend": 1.0,
+        "xsec_etf_mom": 0.68
+      },
+      "xsec_etf_mom": {
+        "mean_reversion": 0.45,
+        "seasonality_flows": 0.23,
+        "tsmom_trend": 0.68,
+        "xsec_etf_mom": 1.0
+      }
+    },
+    "ann_drag_from_sleeve_share_capital": 0.0018,
+    "blend_convention": "constant-mix: sleeve shares reset to the in-sample weights at every close; the re-split between sleeves is not costed",
+    "rebalance_sensitivity": {
+      "daily": {
+        "full_sharpe": 0.76,
+        "is_sharpe": 0.9,
+        "oos_sharpe": 0.51,
+        "full_cagr": 0.0659,
+        "full_maxdd": -0.1133,
+        "ann_intersleeve_turnover_oneside": 0.318
+      },
+      "monthly": {
+        "full_sharpe": 0.75,
+        "is_sharpe": 0.89,
+        "oos_sharpe": 0.5,
+        "full_cagr": 0.0653,
+        "full_maxdd": -0.1133,
+        "ann_intersleeve_turnover_oneside": 0.072
+      },
+      "never": {
+        "full_sharpe": 0.66,
+        "is_sharpe": 0.79,
+        "oos_sharpe": 0.49,
+        "full_cagr": 0.0728,
+        "full_maxdd": -0.133,
+        "ann_intersleeve_turnover_oneside": 0.0
+      }
+    }
+  }
+}

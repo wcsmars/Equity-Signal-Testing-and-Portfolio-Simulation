@@ -371,6 +371,31 @@ def test_scripts_exit_1_with_a_one_line_error(tmp_path):
         assert proc.stderr.startswith(text) and "Traceback" not in proc.stderr
 
 
+def test_scripts_report_a_file_system_error_in_one_line(tracked_run, tmp_path):
+    """A runs or report directory that cannot be created used to end in a
+    traceback; it is reported like a configuration error."""
+    base, _, _ = tracked_run
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file where a directory is needed")
+    run_dir = _copy_run(tracked_run, tmp_path)
+    shutil.rmtree(run_dir / "report")
+    (run_dir / "report").write_text("a file where the report directory is needed")
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    for script, args, path in (
+        ("run_backtest.py", ["--config", str(base / "run.yaml"), "--runs-dir", str(blocker / "runs")], blocker),
+        ("make_report.py", ["--run", str(run_dir)], run_dir / "report"),
+    ):
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / script), *args], capture_output=True, text=True, env=env
+        )
+        assert proc.returncode == 1, proc.stderr
+        assert "Traceback" not in proc.stderr
+        [line] = [text for text in proc.stderr.splitlines() if text.startswith("error: ")]
+        assert line == proc.stderr.splitlines()[-1] and path.name in line
+        assert "run_id" not in proc.stdout and "report [" not in proc.stdout
+        assert path.read_text().startswith("a file where")     # nothing was replaced
+
+
 # --------------------------------------------------------------------------
 # what the scripts depend on
 # --------------------------------------------------------------------------

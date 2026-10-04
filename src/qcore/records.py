@@ -10,7 +10,9 @@ Policy implemented by save_record():
   - the target exists and differs        -> keep it, write this run's output to
     <target dir>/recomputed/<name> and say so.
 Replacing a record is an explicit act: pass --rebase on the command line or
-set QCORE_REBASE=1.
+set QCORE_REBASE=1. When a run matches or replaces the record, a scratch copy
+left under recomputed/ by an earlier differing run is removed, so that folder
+only ever holds output that still disagrees with the record.
 """
 
 import io
@@ -42,6 +44,16 @@ def _write_atomic(path: Path, data: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _drop_stale_copy(path: Path) -> None:
+    alt = path.parent / RECOMPUTED_DIR / path.name
+    if alt.is_file() and not alt.is_symlink():
+        alt.unlink()
+        try:
+            alt.parent.rmdir()  # only succeeds when the folder is now empty
+        except OSError:
+            pass
+
+
 def save_record(path, content: str | bytes, *, rebase: bool | None = None,
                 quiet: bool = False) -> Path:
     """Write `content` to `path` without silently replacing a different
@@ -58,11 +70,13 @@ def save_record(path, content: str | bytes, *, rebase: bool | None = None,
             print(f"saved {path}")
         return path
     if path.read_bytes() == data:
+        _drop_stale_copy(path)
         if not quiet:
             print(f"unchanged {path}")
         return path
     if rebase:
         _write_atomic(path, data)
+        _drop_stale_copy(path)
         if not quiet:
             print(f"REBASED {path} (previous record replaced)")
         return path
