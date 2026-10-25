@@ -40,7 +40,7 @@ Result
     Sharpe 0.50 full sample / 0.69 in sample / 0.23 out of sample;
     CAGR 4.97%, volatility 6.81%, maximum drawdown -14.42%.
     Before costs the full-sample Sharpe is 0.66. Turnover is 20.3x a year
-    (buys plus sells) and costs take 1.05% a year; at double slippage the
+    (buys plus sells) and costs take 1.04% a year; at double slippage the
     out-of-sample Sharpe falls to 0.14. About one sixth of capital is
     invested on average.
 

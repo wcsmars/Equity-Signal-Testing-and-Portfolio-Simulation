@@ -1,6 +1,7 @@
 """The made-up example inputs in examples/ work with the scripts they illustrate.
 
 examples/live_returns.example.csv  ->  scripts/monitor.py
+examples/nav.example.csv           ->  scripts/nav_to_returns.py  ->  scripts/monitor.py
 examples/fills.example.csv         ->  scripts/reconcile.py
 examples/ledger.example.csv        ->  scripts/live_targets.py
 
@@ -36,8 +37,34 @@ def _main(mod, monkeypatch, capsys, name, *argv):
 
 
 def test_example_files_are_present():
-    for name in ("live_returns.example.csv", "fills.example.csv", "ledger.example.csv"):
+    for name in ("live_returns.example.csv", "nav.example.csv", "fills.example.csv",
+                 "ledger.example.csv"):
         assert (EXAMPLES / name).is_file(), name
+
+
+def test_example_nav_log_becomes_a_returns_file_the_monitor_judges(monkeypatch, capsys, tmp_path):
+    nav = module("scripts/nav_to_returns.py")
+    path = EXAMPLES / "nav.example.csv"
+    assert path.read_text().splitlines()[0] == "date,nav,flow"
+    log = nav.read_nav_log(path)
+    assert (log["flow"] > 0).sum() == 1 and (log["flow"] < 0).sum() == 1   # a deposit, a withdrawal
+    out = tmp_path / "live_returns.csv"
+    assert nav.main([str(path), "--out", str(out)]) == 0
+    assert "1 deposit(s) $2,000.00, 1 withdrawal(s) $1,500.00" in capsys.readouterr().out
+    monitor = module("scripts/monitor.py")
+
+    def no_cache(*args, **kwargs):
+        raise AssertionError("the cash rate was read for a file shorter than two years")
+
+    monkeypatch.setattr(monitor, "_irx_series", no_cache)
+    frame = monitor.read_returns(out)
+    assert list(frame.columns) == ["ENSEMBLE"] and len(frame) == len(log) - 1
+    # flows are taken out: the deposit and withdrawal sessions show ordinary returns
+    assert frame["ENSEMBLE"].abs().max() < 0.01
+    last = str(log.index[-1].date())
+    code, shown = _main(monitor, monkeypatch, capsys, "monitor.py", out, "--as-of", last)
+    assert code == 0 and f"pending: {len(frame)}/504 observations" in shown
+    assert shown.rstrip().endswith("overall: ok")
 
 
 def test_example_live_returns_reach_a_verdict_without_a_data_cache(monkeypatch, capsys):

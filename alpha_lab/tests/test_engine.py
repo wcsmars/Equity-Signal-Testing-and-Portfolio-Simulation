@@ -1,5 +1,7 @@
 """BacktestEngine: timing law, drift/turnover math, isolation, determinism."""
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -10,6 +12,7 @@ from alpha_lab.config.schema import BacktestConfig, WalkForwardConfig
 from alpha_lab.core.errors import DataError, LookaheadError
 from alpha_lab.core.interfaces import CostModel, PortfolioConstructor, Signal, ZeroCost
 from alpha_lab.core.types import MarketData
+from alpha_lab.testing.checks import assert_truncation_invariant
 
 
 # -- in-test dummies ------------------------------------------------------
@@ -437,10 +440,165 @@ def test_missing_held_returns_are_counted_and_warned():
     dates = pd.bdate_range("2024-01-01", periods=3)
     data = MarketData(pd.DataFrame({"A": [100.0, np.nan, 101.0]}, index=dates))
     weights = pd.DataFrame({"A": 0.5}, index=dates)
-    with pytest.warns(UserWarning, match="2 held asset-return cells"):
+    with pytest.warns(UserWarning, match="2 held asset-return cells are missing; 1 of them"):
         result = _engine(FixedWeights(weights), _insample_cfg()).run(data, {})
+    # Both one-day returns are missing (the gap day and the day the price
+    # returns), so the count is unchanged; the move from 100 to 101 is now
+    # booked on the day the price returns instead of being dropped.
     assert result.meta["missing_held_return_cells"] == 2
-    assert result.net_returns.eq(0.0).all()
+    assert result.meta["bridged_held_return_cells"] == 1
+    assert result.net_returns.tolist() == pytest.approx([0.0, 0.0, 0.5 * 0.01])
+
+
+# -- interior price gaps: the move is booked when the price returns ----------
+
+
+def _gap_run(closes, weights, lag=1):
+    """Run a one-asset panel (or a dict of columns) with fixed weights."""
+    columns = closes if isinstance(closes, dict) else {"A": closes}
+    n = len(next(iter(columns.values())))
+    dates = pd.bdate_range("2024-01-01", periods=n)
+    data = MarketData(pd.DataFrame(columns, index=dates, dtype=float))
+    if not isinstance(weights, dict):
+        weights = {"A": weights}
+    w = pd.DataFrame(weights, index=dates, dtype=float)
+    return _engine(FixedWeights(w), _insample_cfg(lag=lag)).run(data, {}), data
+
+
+@pytest.mark.parametrize("lag", [1, 2])
+def test_move_across_a_one_day_gap_is_booked_when_the_price_returns(lag):
+    # Held at weight 1.0 from 100 to 133.1, with the 110 -> 121 move spanning
+    # a missing close: the position earned 33.1%. Dropping both missing
+    # returns booked 21.0% (1.1 * 1.1 - 1).
+    with pytest.warns(UserWarning, match="2 held asset-return cells are missing; 1 of them"):
+        result, _ = _gap_run([100.0, 100.0, 110.0, np.nan, 121.0, 133.1], 1.0, lag=lag)
+    assert (1.0 + result.net_returns).prod() - 1.0 == pytest.approx(0.331, abs=1e-12)
+    assert result.gross_returns.iloc[3] == 0.0                         # gap day books zero
+    assert result.gross_returns.iloc[4] == pytest.approx(121.0 / 110.0 - 1.0)  # whole move
+    assert result.meta["missing_held_return_cells"] == 2
+    assert result.meta["bridged_held_return_cells"] == 1
+
+
+def test_move_across_a_two_day_gap_is_booked_once():
+    with pytest.warns(UserWarning, match="3 held asset-return cells are missing; 1 of them"):
+        result, _ = _gap_run([100.0, 100.0, np.nan, np.nan, 121.0, 133.1], 1.0)
+    assert result.gross_returns.tolist() == pytest.approx([0.0, 0.0, 0.0, 0.0, 0.21, 0.1])
+    assert (1.0 + result.net_returns).prod() - 1.0 == pytest.approx(0.331, abs=1e-12)
+    assert result.meta["missing_held_return_cells"] == 3
+    assert result.meta["bridged_held_return_cells"] == 1
+
+
+def test_first_price_has_nothing_to_bridge_and_a_gap_after_it_bridges_from_it():
+    # Held before the asset's first price: day 1 is its first observation,
+    # with no earlier close to measure a move from, so it books zero. The gap
+    # on day 2 is bridged from that first price on day 3.
+    with pytest.warns(UserWarning, match="3 held asset-return cells are missing; 1 of them"):
+        result, _ = _gap_run([np.nan, 100.0, np.nan, 110.0], 1.0)
+    assert result.gross_returns.tolist() == pytest.approx([0.0, 0.0, 0.0, 0.1])
+    assert result.meta["missing_held_return_cells"] == 3
+    assert result.meta["bridged_held_return_cells"] == 1
+
+
+def test_position_whose_price_never_returns_books_zero():
+    # A trailing gap (a delisting, or the end of the data) has no price to
+    # bridge to: the held cells contribute zero, as before, and are counted.
+    with pytest.warns(UserWarning, match="2 held asset-return cells are missing and contribute zero"):
+        result, _ = _gap_run([100.0, 110.0, np.nan, np.nan], 1.0)
+    assert result.gross_returns.tolist() == pytest.approx([0.0, 0.1, 0.0, 0.0])
+    assert result.meta["missing_held_return_cells"] == 2
+    assert result.meta["bridged_held_return_cells"] == 0
+
+
+@pytest.mark.parametrize(
+    "before_gap, during_gap, booked",
+    [
+        (1.0, 1.0, 0.1),     # held through the gap: the whole move
+        (-1.0, -1.0, -0.1),  # a short held through the gap
+        (0.0, 1.0, 0.0),     # opened at the stale price during the gap: nothing
+        (0.5, 1.0, 0.05),    # added during the gap: only the half held through it
+        (1.0, 0.5, 0.05),    # cut during the gap: the half still held
+        (1.0, -1.0, 0.0),    # flipped during the gap: not held through it
+    ],
+)
+def test_only_exposure_held_through_the_gap_earns_the_move(before_gap, during_gap, booked):
+    # Close 1 (100) is the last price before the gap on day 2; day 3 prints
+    # 110. With lag 1, H_2 = W_1 was set at close 1 and H_3 = W_2 at the
+    # missing close 2, a stale fill.
+    weights = [0.0, before_gap, during_gap, 0.0, 0.0]
+    with pytest.warns(UserWarning, match="held asset-return cells are missing"):
+        result, _ = _gap_run([100.0, 100.0, np.nan, 110.0, 110.0], weights)
+    assert result.gross_returns.iloc[2] == 0.0
+    assert result.gross_returns.iloc[3] == pytest.approx(booked, abs=1e-15)
+    assert result.meta["bridged_held_return_cells"] == int(booked != 0.0)
+
+
+def test_gross_is_the_sum_of_booked_contributions_each_day():
+    # Three held names: A has a one-day gap, B a two-day gap and C stops
+    # pricing (never returns). With constant holdings the booked return is
+    # the return of the last available price, an independent oracle here.
+    closes = {
+        "A": [50.0, 51.0, 52.0, np.nan, 49.0, 50.0, 53.0, 54.0],
+        "B": [20.0, 21.0, np.nan, np.nan, 23.0, 22.0, 22.5, 23.0],
+        "C": [10.0, 10.5, 11.0, 11.5, 12.0, np.nan, np.nan, np.nan],
+    }
+    weights = {"A": 0.6, "B": -0.3, "C": 0.4}
+    with pytest.warns(UserWarning, match="held asset-return cells are missing; 2 of them"):
+        result, data = _gap_run(closes, weights, lag=1)
+    marked = data.close.ffill().pct_change(fill_method=None).fillna(0.0)
+    contributions = result.holdings * marked
+    pd.testing.assert_series_equal(
+        result.gross_returns, contributions.sum(axis=1), check_names=False, rtol=1e-12
+    )
+    # day 4: A and B both reopen (bridged from days 2 and 1), C prints normally
+    assert result.gross_returns.iloc[4] == pytest.approx(
+        0.6 * (49 / 52 - 1) - 0.3 * (23 / 21 - 1) + 0.4 * (12 / 11.5 - 1)
+    )
+    pd.testing.assert_series_equal(result.net_returns, result.gross_returns, check_names=False)
+
+
+def test_turnover_after_a_gap_drifts_with_the_bridged_move():
+    # A gains 10% across its gap; the trade back to 50/50 executes at the
+    # close the price returns (dated the next day), sized by that drift.
+    closes = {"A": [100.0, np.nan, 110.0, 110.0], "B": [100.0, 100.0, 100.0, 100.0]}
+    with pytest.warns(UserWarning, match="held asset-return cells are missing; 1 of them"):
+        result, _ = _gap_run(closes, {"A": 0.5, "B": 0.5}, lag=1)
+    assert result.gross_returns.tolist() == pytest.approx([0.0, 0.0, 0.05, 0.0])
+    # drift(H_2) = [0.55, 0.50] / 1.05, so the trade dated 3 moves 0.05/1.05 of NAV
+    assert result.turnover.tolist() == pytest.approx([0.0, 1.0, 0.0, 0.05 / 1.05])
+
+
+def test_bridged_returns_are_point_in_time(market_simple):
+    # Equal weights in every name whether or not it has a price, so the
+    # gapped names are held through their gaps. Every booked series row t
+    # must be the same on data cut at t: the bridged move reads only prices
+    # through t. Probe the gap days, the reopening days and the day after.
+    close = market_simple.close.copy()
+    a, b = market_simple.tickers[:2]
+    close.iloc[100, 0] = np.nan
+    close.iloc[200:203, 1] = np.nan
+    gapped = MarketData(close)
+    engine = _engine(ScoreProportional(), _insample_cfg(lag=2))
+    probe = [gapped.dates[i] for i in (100, 101, 102, 200, 201, 202, 203, 204)]
+
+    def booked(data, fill=None):
+        if fill is not None:
+            data = MarketData(fill(data.close))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            res = engine.run(data, {})
+        return pd.DataFrame(
+            {"gross": res.gross_returns, "turnover": res.turnover, "net": res.net_returns}
+        )
+
+    full = booked(gapped)
+    assert full["gross"].iloc[101] != 0.0 and full["gross"].iloc[203] != 0.0
+    assert_truncation_invariant(booked, gapped, dates=probe, label="engine")
+    # The same probe catches a gap filled from a later price (a backfill
+    # books the move on the gap day, before it is known).
+    with pytest.raises(LookaheadError, match="change under truncation"):
+        assert_truncation_invariant(
+            lambda d: booked(d, fill=lambda c: c.bfill()), gapped, dates=probe, label="engine"
+        )
 
 
 def test_precomputed_features_require_exact_alignment():

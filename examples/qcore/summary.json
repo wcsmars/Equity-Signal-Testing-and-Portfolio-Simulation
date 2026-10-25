@@ -32,20 +32,20 @@
         "maxdd": -0.1442
       },
       "in_sample": {
-        "cagr": 0.0542,
+        "cagr": 0.0543,
         "vol": 0.0614,
         "sharpe": 0.69,
         "maxdd": -0.1442
       },
       "out_of_sample": {
-        "cagr": 0.0405,
+        "cagr": 0.0406,
         "vol": 0.0801,
         "sharpe": 0.23,
-        "maxdd": -0.1342
+        "maxdd": -0.134
       },
       "gross_sharpe_full": 0.66,
       "ann_turnover_buys_plus_sells": 20.3,
-      "ann_cost_drag": 0.0105,
+      "ann_cost_drag": 0.0104,
       "ann_withholding_drag": 0.0008,
       "ann_cash_income": 0.0137
     },
@@ -59,26 +59,26 @@
       "start": "2000-01-03",
       "end": "2026-07-01",
       "full": {
-        "cagr": 0.0735,
+        "cagr": 0.0736,
         "vol": 0.1008,
         "sharpe": 0.58,
         "maxdd": -0.1347
       },
       "in_sample": {
-        "cagr": 0.0716,
+        "cagr": 0.0717,
         "vol": 0.1036,
         "sharpe": 0.58,
         "maxdd": -0.1347
       },
       "out_of_sample": {
-        "cagr": 0.0776,
+        "cagr": 0.0777,
         "vol": 0.0947,
         "sharpe": 0.58,
-        "maxdd": -0.1149
+        "maxdd": -0.1148
       },
       "gross_sharpe_full": 0.63,
       "ann_turnover_buys_plus_sells": 24.1,
-      "ann_cost_drag": 0.0059,
+      "ann_cost_drag": 0.0058,
       "ann_withholding_drag": 0.0,
       "ann_cash_income": 0.0127
     },
@@ -101,7 +101,7 @@
         "cagr": 0.058,
         "vol": 0.0602,
         "sharpe": 0.77,
-        "maxdd": -0.078
+        "maxdd": -0.0779
       },
       "out_of_sample": {
         "cagr": 0.0515,
@@ -191,13 +191,13 @@
       "start": "2006-07-24",
       "end": "2026-07-01",
       "full": {
-        "cagr": 0.1195,
+        "cagr": 0.1196,
         "vol": 0.1579,
         "sharpe": 0.7,
         "maxdd": -0.4095
       },
       "in_sample": {
-        "cagr": 0.113,
+        "cagr": 0.1131,
         "vol": 0.1372,
         "sharpe": 0.79,
         "maxdd": -0.2399
@@ -224,22 +224,22 @@
       "start": "2000-06-30",
       "end": "2026-07-01",
       "full": {
-        "cagr": 0.0237,
+        "cagr": 0.0238,
         "vol": 0.039,
         "sharpe": 0.18,
-        "maxdd": -0.0998
+        "maxdd": -0.0995
       },
       "in_sample": {
-        "cagr": 0.0328,
+        "cagr": 0.0329,
         "vol": 0.0409,
         "sharpe": 0.48,
-        "maxdd": -0.0784
+        "maxdd": -0.0783
       },
       "out_of_sample": {
-        "cagr": 0.0053,
+        "cagr": 0.0054,
         "vol": 0.0346,
         "sharpe": -0.54,
-        "maxdd": -0.0904
+        "maxdd": -0.0903
       },
       "gross_sharpe_full": 0.59,
       "ann_turnover_buys_plus_sells": 18.4,
@@ -267,7 +267,7 @@
         "cagr": 0.0854,
         "vol": 0.099,
         "sharpe": 0.76,
-        "maxdd": -0.1259
+        "maxdd": -0.1258
       },
       "out_of_sample": {
         "cagr": 0.061,
@@ -294,7 +294,7 @@
       "cagr": 0.0659,
       "vol": 0.0635,
       "sharpe": 0.76,
-      "maxdd": -0.1133
+      "maxdd": -0.1132
     },
     "in_sample": {
       "cagr": 0.0687,
@@ -303,10 +303,10 @@
       "maxdd": -0.1132
     },
     "out_of_sample": {
-      "cagr": 0.06,
+      "cagr": 0.0601,
       "vol": 0.0706,
       "sharpe": 0.51,
-      "maxdd": -0.1133
+      "maxdd": -0.1132
     },
     "gross_sharpe_full": 0.9,
     "ann_turnover_buys_plus_sells": 12.7,
@@ -314,10 +314,10 @@
     "ann_withholding_drag": 0.0018,
     "ann_cash_income": 0.0107,
     "sleeve_weights": {
-      "mean_reversion": 0.342095,
-      "seasonality_flows": 0.197801,
-      "tsmom_trend": 0.351571,
-      "xsec_etf_mom": 0.108533
+      "mean_reversion": 0.342088,
+      "seasonality_flows": 0.197803,
+      "tsmom_trend": 0.351574,
+      "xsec_etf_mom": 0.108534
     },
     "sleeve_correlations": {
       "mean_reversion": {
@@ -353,14 +353,14 @@
         "is_sharpe": 0.9,
         "oos_sharpe": 0.51,
         "full_cagr": 0.0659,
-        "full_maxdd": -0.1133,
+        "full_maxdd": -0.1132,
         "ann_intersleeve_turnover_oneside": 0.318
       },
       "monthly": {
         "full_sharpe": 0.75,
         "is_sharpe": 0.89,
         "oos_sharpe": 0.5,
-        "full_cagr": 0.0653,
+        "full_cagr": 0.0654,
         "full_maxdd": -0.1133,
         "ann_intersleeve_turnover_oneside": 0.072
       },
@@ -368,7 +368,7 @@
         "full_sharpe": 0.66,
         "is_sharpe": 0.79,
         "oos_sharpe": 0.49,
-        "full_cagr": 0.0728,
+        "full_cagr": 0.0729,
         "full_maxdd": -0.133,
         "ann_intersleeve_turnover_oneside": 0.0
       }

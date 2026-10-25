@@ -8,8 +8,9 @@ the sample:
   the data-quality gate; the default entry point of each of the eight
   strategy modules; the four sleeve records and the ensemble; the kill-rule
   monitor on the ensemble's returns; the offline order sheet for the sample's
-  last session with the example ledger; the fills check on the example fills;
-  the five selection sweeps and the trial registry that reads them.
+  last session with the example ledger, which prints only because the gate's
+  report on the same cache exists; the fills check on the example fills; the
+  five selection sweeps and the trial registry that reads them.
 
 Where the commands run. pairs_statarb.py, tsmom_voltarget.py, the sweeps,
 ensemble.py and trial_registry.py save under results/ beside the code and
@@ -424,6 +425,11 @@ def test_live_targets_prints_an_offline_order_sheet_for_the_last_session(pipelin
     done = _done(pipeline, "live_targets")
     out = done.stdout
     assert "OFFLINE historical simulation" in out and "cash $5,000.00 (as given)" in out
+    # the gate ran first, on the same cache: the sheet names its report and reading
+    report = json.loads((pipeline.cache / "data_quality.json").read_text())
+    assert (f"data-quality gate: sample_data/data_quality.json judged this cache "
+            f"({pipeline.last}): {report['worst']}") in out
+    assert "NOT CHECKED" not in out
     assert f"decision close: {pipeline.last}" in out
     assert out.count("MONTH-END rebalance") == 2           # the final row is a month-end
     for key in SLEEVES:

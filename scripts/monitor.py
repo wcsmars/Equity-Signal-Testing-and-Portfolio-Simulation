@@ -12,7 +12,9 @@ the ENSEMBLE column of a daily-returns file:
 
 One further review trigger is not computed here: fill slippage against the
 backtest's assumption left unreconciled for three months. scripts/reconcile.py
-measures that slippage from a fills file.
+measures that slippage from a fills file; the registered statistic is
+notional-weighted slippage, and a breach is that figure above the modeled
+slippage + 2 bps.
 
 Changing a threshold after going live is itself treated as a KILL-level
 event: the response to "the rule feels wrong now" is to stop trading, redo
@@ -30,10 +32,12 @@ are shown here as registered; whether to register them again is an open
 question that this script does not settle.
 
 Source. The returns file must be named; there is no default. A live check
-reads a hand-kept CSV of the account's own daily returns (no script writes
-it): a Date column written YYYY-MM-DD and an ENSEMBLE column holding each
-session's net return as a fraction (0.0012 = +0.12%), deposits and
-withdrawals excluded. examples/live_returns.example.csv is a made-up file in
+reads a CSV of the account's own daily returns: a Date column written
+YYYY-MM-DD and an ENSEMBLE column holding each session's net return as a
+fraction (0.0012 = +0.12%), deposits and withdrawals excluded.
+scripts/nav_to_returns.py writes that file (state/live_returns.csv) from a
+NAV log of date, nav and flow; a file kept by hand in the same format is
+judged the same way. examples/live_returns.example.csv is a made-up file in
 that format. --backtest judges results/sleeve_returns.csv instead, the
 blended backtest stream that src/ensemble.py saves; that says nothing about
 an account and is a calibration run only. Only the ENSEMBLE column sets the
@@ -53,12 +57,14 @@ Two readings. Every run prints both, because they differ whenever a breach
 has reverted:
   at the last session     the three rules at the final row alone;
   on any judged session   the worst status over the judged window.
-The verdict (the "overall:" line) and the exit status follow the second, so
-a breach that later reverted stays KILL or REVIEW until --since moves past
-it, and its rule row is tagged "(last session <status>)". Judging every
-session trips more often than judging one row per weekly run, at the same
-thresholds. Passing the last row's date to --since gives the last-row-only
-verdict.
+The verdict is the second: the "overall:" line and the exit status are the
+worst status on any judged session since --since (since the first row when
+--since is not given), and the last-row reading is printed beside it, never
+instead of it. A breach that later reverted therefore stays KILL or REVIEW
+until --since moves past it, and its rule row is tagged "(last session
+<status>)". Judging every session trips more often than judging one row per
+weekly run, at the same thresholds. Passing the last row's date to --since
+gives the last-row-only reading as the verdict.
 
 Input rules. No verdict is issued (exit 3) when
   - a date is not a plain YYYY-MM-DD day, or dates repeat or are unordered;
@@ -73,7 +79,7 @@ Input rules. No verdict is issued (exit 3) when
   - the two-year rule is in force (504 observations) and the cash benchmark
     cannot price it: ^IRX missing from data/indices.csv, or a return date in
     a judged window with no ^IRX print in the previous MAX_RATE_AGE_DAYS
-    calendar days. Without this check the engine would credit 0% or carry
+    (10) calendar days. Without this check the engine would credit 0% or carry
     the last cached yield forward, and the "excess" Sharpe would silently
     become something else;
   - --backtest is asked for and results/sleeve_returns.csv does not exist
@@ -81,6 +87,7 @@ Input rules. No verdict is issued (exit 3) when
 
 Usage:
   python scripts/monitor.py examples/live_returns.example.csv --as-of 2025-03-31
+  python scripts/nav_to_returns.py state/nav.csv        # NAV log -> state/live_returns.csv
   python scripts/monitor.py state/live_returns.csv      # live check, whole file
   python scripts/monitor.py state/live_returns.csv --since YYYY-MM-DD
   python scripts/monitor.py old.csv --as-of YYYY-MM-DD   # offline replay
@@ -94,13 +101,18 @@ Exit status (0-2 match scripts/data_quality.py):
   1  REVIEW
   2  KILL
   3  no verdict: invalid, stale or unreadable input, or a usage error
-  4  no verdict: unexpected internal error (traceback on stderr)
+  4  no verdict: unexpected internal error (traceback on stderr), or a
+     dependency or qcore that cannot be imported at start-up (one line,
+     no traceback)
 0-2 report the judged-window reading, the same status as the "overall:" line.
-Only an "overall:" line is a verdict. A Python start-up failure (for example
-a missing dependency) exits 1 before the monitor runs and prints none.
+Only an "overall:" line is a verdict: read 1 as REVIEW only beside an
+"overall: REVIEW" line (a failure of the Python interpreter itself, before
+this script runs, still exits 1 and prints none).
 
 Limits: three rules on one return series. The monitor reads returns, not
-positions or account value, and no script here writes the live returns file.
+positions or account value; scripts/nav_to_returns.py derives the returns
+from account values, and the result is only as good as the NAV log and its
+flow column.
 Session dates are checked against the rule-based NYSE calendar in
 qcore.quality, which cannot anticipate an unscheduled closure. A new live file
 leaves the two-year rule pending for its first 504 sessions.
@@ -113,15 +125,26 @@ import traceback
 import warnings
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from qcore.backtest import (TBILL_HAIRCUT_BPS, TRADING_DAYS, _irx_series,  # noqa: E402
-                            cash_daily_return)
-from qcore.quality import nyse_bdays  # noqa: E402
+EXIT_OK = 0
+EXIT_REVIEW = 1
+EXIT_KILL = 2
+EXIT_INVALID_INPUT = 3  # distinct from KILL
+EXIT_CRASH = 4          # distinct from REVIEW, which shares 1 with a Python traceback
+
+try:  # an uncaught import error would exit 1, the REVIEW status
+    import numpy as np
+    import pandas as pd
+
+    from qcore.backtest import (TBILL_HAIRCUT_BPS, TRADING_DAYS, _irx_series,
+                                cash_daily_return)
+    from qcore.quality import nyse_bdays
+except Exception as exc:  # noqa: BLE001 - a missing or broken install, not a verdict
+    print(f"monitor not evaluated, no verdict: start-up failed, cannot import a dependency "
+          f"({type(exc).__name__}: {exc}); install the packages in requirements.txt")
+    sys.exit(EXIT_CRASH)
 
 KILL_MAX_DRAWDOWN = -0.15
 KILL_SHARPE_2Y = -0.30
@@ -133,14 +156,12 @@ BACKTEST_RETURNS = ROOT / "results" / "sleeve_returns.csv"
 MAX_STALE_SESSIONS = 5  # one trading week, the check cadence
 # Oldest ^IRX print allowed to price a return date. The longest gap in the
 # 2000-2026 cache is 7 calendar days (2001-09-10 -> 2001-09-17); ordinary
-# long weekends and bond-market holidays leave 4-5.
-MAX_RATE_AGE_DAYS = 7
-
-EXIT_OK = 0
-EXIT_REVIEW = 1
-EXIT_KILL = 2
-EXIT_INVALID_INPUT = 3  # distinct from KILL
-EXIT_CRASH = 4          # distinct from REVIEW, which shares 1 with a Python traceback
+# long weekends and bond-market holidays leave 4-5. A limit equal to the
+# worst historical gap would leave no margin: one or two late vendor prints
+# beside a long weekend would refuse the whole check. 10 days keeps three
+# days of margin over that gap, and a rate series that has stopped updating
+# is still refused within two weeks.
+MAX_RATE_AGE_DAYS = 10
 
 
 def current_ny_date() -> pd.Timestamp:

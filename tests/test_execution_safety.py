@@ -39,7 +39,9 @@ def test_sell_side_fees_are_not_averaged_away_for_funding():
     buy = live.execution_reserve({"SPY": 10.0}, prices, 0.0)
     sell = live.execution_reserve({"SPY": -10.0}, prices, 0.0)
     assert buy == 1.0
-    assert sell == pytest.approx(1.0 + 1000 * 0.0000278 + 10 * 0.000166)
+    # $1 minimum + SEC $1,000 x 0.0000206 = $0.0206 + TAF 10 x $0.000195 = $0.00195
+    assert sell == pytest.approx(1.0 + 1000 * 0.0000206 + 10 * 0.000195)
+    assert sell == pytest.approx(1.02255)
 
 
 def test_minimum_order_filter_cannot_hide_a_funding_sale():

@@ -1,18 +1,23 @@
 """Download a local daily market-data cache using yfinance.
 
-Run: python src/download_data.py [--allow-shrink]. Re-running refreshes the
-cache from 2000 onward and may change previously observed history after
-vendor revisions. The cache is data/ beside src/, or the directory named by
-the QCORE_DATA_DIR environment variable, which keeps a new download apart
-from a cache that earlier results were computed from. A refresh is refused,
-and the cache left untouched, when the response lacks observations the
-existing cache holds (a ticker that starts later, stops earlier or has a new
-hole; a withdrawn index bar counts too), when an existing file cannot be read
-for that comparison, or when the index panel ends more than
-INDEX_MAX_LAG_SESSIONS sessions before prices. The error lists what is
-missing. --allow-shrink is the way through in each case: use it when the loss
-is a genuine vendor correction, to replace a damaged file, or to take the
-price refresh while the index series lag.
+Run: python src/download_data.py [--refresh] [--allow-shrink]. Re-running
+refreshes the cache from 2000 onward and may change previously observed
+history after vendor revisions. The cache is data/ beside src/, or the
+directory named by the QCORE_DATA_DIR environment variable, which keeps a new
+download apart from a cache that earlier results were computed from. Once
+data/ holds any of the files a download writes, replacing it needs --refresh:
+without it the run stops before any network request (exit 1, one line on
+stderr). A first download into data/, and any download into a directory named
+by QCORE_DATA_DIR, need no flag. A refresh is refused, and the cache left
+untouched, when the response lacks observations the existing cache holds (a
+ticker that starts later, stops earlier or has a new hole; a withdrawn index
+bar on a session date counts too, one on a date the exchange was closed does
+not), when an existing file cannot be read for that comparison, or when the
+index panel ends more than INDEX_MAX_LAG_SESSIONS sessions before prices. The
+error lists what is missing. --allow-shrink is the way through in each case,
+and --refresh does not imply it: use it when the loss is a genuine vendor
+correction, to replace a damaged file, or to take the price refresh while the
+index series lag.
 The public project includes no downloaded prices; users must obtain data
 under terms permitting their intended use. Run the data-quality check after
 refreshing and before using the cache in research.
@@ -30,9 +35,14 @@ import pandas as pd
 import yfinance as yf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from qcore.data import DATA_DIR, ETF_UNIVERSE, INDEX_UNIVERSE, OPERATIONAL_UNIVERSE, STOCK_UNIVERSE
+from qcore.data import (DATA_DIR, DEFAULT_DATA_DIR, ETF_UNIVERSE, INDEX_UNIVERSE,
+                        OPERATIONAL_UNIVERSE, STOCK_UNIVERSE)
+from qcore.quality import nyse_bdays
 
 START = "2000-01-01"
+# The files a download writes. Any of them in the default directory means a
+# cache is there, and a run without --refresh must not replace it.
+CACHE_FILES = ("adj_close", "close", "open", "high", "low", "volume", "indices", "coverage")
 # Price sessions the newest index row may trail the newest price row. A
 # longer lag is a partial index response and does not replace the cache
 # unless --allow-shrink is passed.
@@ -103,9 +113,11 @@ def _lost_history(frames: dict[str, pd.DataFrame]) -> list[str]:
     replacement, so a ticker that starts later, stops earlier or gains a hole
     is reported even when its row count grows. Changed values on dates both
     generations hold are vendor revisions, not losses, and are not reported.
-    An existing file whose dates cannot be read is reported as well: a
-    refresh that cannot be compared is not known to be safe. coverage.csv is
-    derived from adj_close and is not compared.
+    Index rows dated when the exchange was closed are not compared: a vendor
+    may withdraw such a print (^VIX had one on Memorial Day 2026); index
+    history on sessions is. An existing file whose dates cannot be read is
+    reported as well: a refresh that cannot be compared is not known to be
+    safe. coverage.csv is derived from adj_close and is not compared.
     """
     problems = []
     for name, new in frames.items():
@@ -120,6 +132,9 @@ def _lost_history(frames: dict[str, pd.DataFrame]) -> list[str]:
         except Exception as error:  # noqa: BLE001 - unreadable is not "nothing lost"
             problems.append(f"{name}.csv: existing file cannot be compared ({error})")
             continue
+        if name == "indices" and len(old.index):
+            sessions = nyse_bdays(old.index.min(), old.index.max())
+            old = old[old.index.isna() | old.index.isin(sessions)]
         common = old.columns.intersection(new.columns)
         held = old[common].notna()
         gone = held & new.reindex(index=old.index, columns=common).isna()
@@ -192,7 +207,21 @@ def _write_cache(frames: dict[str, pd.DataFrame]) -> None:
             shutil.rmtree(stage, ignore_errors=True)
 
 
-def main(allow_shrink: bool = False) -> None:
+def _default_cache_held() -> list[str]:
+    """The cache files already in the default data directory: none for a
+    directory named by QCORE_DATA_DIR, or before the first download."""
+    if DATA_DIR.resolve() != DEFAULT_DATA_DIR.resolve():
+        return []
+    return [f"{name}.csv" for name in CACHE_FILES if (DATA_DIR / f"{name}.csv").exists()]
+
+
+def main(allow_shrink: bool = False, refresh: bool = False) -> None:
+    held = _default_cache_held()
+    if held and not refresh:
+        sys.exit(f"download refused: {DATA_DIR} already holds a cache ({', '.join(held)}). "
+                 "It is the frozen research cache every saved result depends on. Pass "
+                 "--refresh to replace it deliberately, or set QCORE_DATA_DIR to download "
+                 "into another directory.")
     tickers = list(dict.fromkeys(ETF_UNIVERSE + STOCK_UNIVERSE + OPERATIONAL_UNIVERSE))
     print(f"downloading {len(tickers)} tickers from {START} into {DATA_DIR} ...")
     data = download_batch(tickers)
@@ -251,12 +280,18 @@ def main(allow_shrink: bool = False) -> None:
 
 def _cli(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(allow_abbrev=False, description="Refresh the local market-data cache.")
+    parser.add_argument("--refresh", action="store_true",
+                        help="replace the cache already in the default data/ "
+                             "directory, which saved results were computed from "
+                             "(not needed for a first download, or for a directory "
+                             "named by QCORE_DATA_DIR)")
     parser.add_argument("--allow-shrink", action="store_true",
                         help="replace the cache even though the response lacks "
                              "observations the existing cache holds, or its index "
                              f"panel ends more than {INDEX_MAX_LAG_SESSIONS} sessions "
                              "before prices")
-    main(allow_shrink=parser.parse_args(argv).allow_shrink)
+    args = parser.parse_args(argv)
+    main(allow_shrink=args.allow_shrink, refresh=args.refresh)
 
 
 if __name__ == "__main__":

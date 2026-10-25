@@ -72,12 +72,12 @@ INDEX_UNIVERSE = ["^VIX", "^VIX3M", "^IRX", "^GSPC", "^TNX"]
 
 # Smallest adj_close-vs-close return difference dividend_yields() keeps as a
 # payout. Vendor adjusted closes carry symmetric rounding noise of up to
-# about 2.3e-6 on non-ex-dates, so at 1e-6 the positive half of that noise
-# survives as spurious entries (the negative half is clipped). 5e-6 would
-# separate noise from the smallest real payouts (about 8e-6), but it moves a
-# rounded statistic of saved results, so the value is changed only together
+# about 2.3e-6 on non-ex-dates; a floor of 1e-6 let the positive half of that
+# noise through as spurious entries (the negative half is clipped). 5e-6
+# separates the noise from the smallest real payouts (about 8e-6). The value
+# moves rounded statistics of saved results, so it is changed only together
 # with a deliberate regeneration of those results.
-DIVIDEND_NOISE_FLOOR = 1e-6
+DIVIDEND_NOISE_FLOOR = 5e-6
 
 
 def load(name: str, *, strict: bool = True) -> pd.DataFrame:
@@ -150,13 +150,12 @@ def require_listed_closes(closes, consequence: str, *, what: str = "close") -> N
 
 
 def dividend_yields() -> pd.DataFrame:
-    """Per-ticker dividend yield on each ex-date (0 elsewhere, up to the
-    noise described below), derived from the cached raw closes: total-return
-    factor (adj_close) minus price-return factor (close) isolates the payout;
-    splits cancel in the difference.
-    Differences at or below DIVIDEND_NOISE_FLOOR are zeroed; vendor rounding
-    noise just above it (up to about 2.3e-6) remains as small spurious
-    entries, so a nonzero value is not by itself proof of an ex-date.
+    """Per-ticker dividend yield on each ex-date (0 elsewhere), derived from
+    the cached raw closes: total-return factor (adj_close) minus price-return
+    factor (close) isolates the payout; splits cancel in the difference.
+    Differences at or below DIVIDEND_NOISE_FLOOR are zeroed: that removes the
+    vendor rounding noise seen on non-ex-dates (up to about 2.3e-6) and would
+    also remove a real payout smaller than the floor.
     This is an approximation inferred from adjusted return differences.
     Requires data/close.csv with matching split adjustment."""
     ac, c = load("adj_close"), load("close")

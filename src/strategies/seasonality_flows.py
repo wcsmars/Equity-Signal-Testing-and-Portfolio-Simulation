@@ -43,10 +43,10 @@ Selection
 Result
     This code on data ending 2026-07-01, net of the modelled costs, Sharpe
     ratios in excess of the cash rate, from 2000-01-03:
-    Sharpe 0.58 full sample / 0.58 in sample / 0.58 out of sample (0.52 at
-    double slippage); CAGR 7.35%, volatility 10.08%, maximum drawdown
+    Sharpe 0.58 full sample / 0.58 in sample / 0.58 out of sample (0.53 at
+    double slippage); CAGR 7.36%, volatility 10.08%, maximum drawdown
     -13.47%. Turnover is 24.1x a year (12 buys and 12 sells of the whole
-    portfolio) and costs take 0.59% a year. Interest on the idle cash
+    portfolio) and costs take 0.58% a year. Interest on the idle cash
     contributes 1.27% a year.
     SPY held throughout, same engine and period: Sharpe 0.39 full sample /
     0.26 in sample / 0.66 out of sample, CAGR 7.70%, maximum drawdown

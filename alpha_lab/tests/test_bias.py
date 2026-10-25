@@ -53,6 +53,7 @@ def wf_result(market):
         result = engine.run(market)
     assert len(caught) == 1
     assert result.meta["missing_held_return_cells"] == 1
+    assert result.meta["bridged_held_return_cells"] == 0  # its price never returns
     return result
 
 

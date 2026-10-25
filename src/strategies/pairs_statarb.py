@@ -50,13 +50,13 @@ Result
     This code on data ending 2026-07-01, net of the modelled costs, Sharpe
     ratios in excess of the cash rate, from 2000-06-30:
     Sharpe 0.18 full sample / 0.48 in sample / -0.54 out of sample;
-    CAGR 2.37%, volatility 3.90%, maximum drawdown -9.98%.
+    CAGR 2.38%, volatility 3.90%, maximum drawdown -9.95%.
     Before costs the full-sample Sharpe is 0.59. Turnover is 18.4x a year
     (buys plus sells); trading costs take 1.26% a year and borrow 0.22%.
     Out-of-sample Sharpe across the nine variants: -0.54 to -1.00.
     Holding shares instead of constant weights (entry and exit rows expanded
-    with qcore.backtest.drift_weights) gives 0.26 full sample / 0.54 in
-    sample / -0.44 out of sample, with trading costs of 0.92% a year, so the
+    with qcore.backtest.drift_weights) gives 0.26 full sample / 0.55 in
+    sample / -0.43 out of sample, with trading costs of 0.92% a year, so the
     verdict does not depend on that convention.
 
 Verdict

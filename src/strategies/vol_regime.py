@@ -41,7 +41,7 @@ Result
     This code on data ending 2026-07-01, net of the modelled costs, Sharpe
     ratios in excess of the cash rate, from 2006-07-24:
     Sharpe 0.70 full sample / 0.79 in sample / 0.62 out of sample;
-    CAGR 11.95%, volatility 15.79%, maximum drawdown -40.95%. Turnover is
+    CAGR 11.96%, volatility 15.79%, maximum drawdown -40.95%. Turnover is
     12.0x a year (buys plus sells) and costs take 0.41% a year.
     Same engine, costs and period, Sharpe full / in / out of sample:
       QQQ held throughout                        0.75 / 0.71 / 0.80

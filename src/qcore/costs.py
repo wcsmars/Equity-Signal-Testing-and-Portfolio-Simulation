@@ -3,6 +3,9 @@
 Defaults model fixed per-share commissions with an order minimum and cap,
 averaged buy/sell regulatory fees, and configurable slippage. The numerical
 rates are retained research assumptions, not verified current broker prices.
+The regulatory fees (an SEC fee on sale proceeds and a FINRA trading activity
+fee per share sold, capped per trade) are modelling assumptions, as published
+for 2026. One rate is applied to the whole history; it is not a fee history.
 
 Dividend withholding and Treasury-fund exemptions are simplified model
 parameters. They do not implement fund/year-specific tax treatment and are
@@ -19,8 +22,9 @@ class IBKRHKCostModel:
     commission_per_share: float = 0.005
     min_commission: float = 1.00
     max_commission_pct: float = 0.01
-    sec_fee_rate: float = 0.0000278     # sells only, on notional
-    finra_taf_per_share: float = 0.000166
+    sec_fee_rate: float = 0.0000206     # sells only, on sale proceeds
+    finra_taf_per_share: float = 0.000195   # sells only
+    finra_taf_cap: float = 9.79         # USD, most TAF charged on one trade
     slippage_bps: float = 3.0           # per side; override per universe
 
     def __post_init__(self) -> None:
@@ -60,7 +64,7 @@ class IBKRHKCostModel:
         # halve sell-only fees to spread them across both sides
         regulatory = 0.5 * (
             self.sec_fee_rate * trade_notional
-            + min(self.finra_taf_per_share * shares, 8.30)
+            + min(self.finra_taf_per_share * shares, self.finra_taf_cap)
         )
         return (commission + regulatory) / trade_notional * 1e4 + self.slippage_bps
 

@@ -27,11 +27,16 @@ For each fill it reports:
     and side are one order: the $1 minimum applies once and the modeled
     cost is split across its partial fills by shares. Sells include the
     modeled SEC and FINRA fees, as the engine and the order sizing do;
-and summarizes per ticker and overall vs the modeled assumptions. Slippage
-is judged NOTIONAL-WEIGHTED (dollars lost over dollars traded), the unit in
-which the engine charges it: a large bad fill is not diluted by small good
-ones, one odd lot cannot breach on its own, and the verdict does not depend
-on how the broker split an order into partial fills.
+and summarizes per ticker and overall vs the modeled assumptions.
+
+The registered slippage statistic is NOTIONAL-WEIGHTED slippage: dollars
+lost against the official close over dollars traded. It is the unit in
+which the engine charges slippage: a large bad fill is not diluted by small
+good ones, one odd lot cannot breach on its own, and the verdict does not
+depend on how the broker split an order into partial fills. A breach is
+notional-weighted slippage above the modeled assumption + 2 bps. The
+unweighted mean of the per-fill bps is printed beside it for information
+and decides nothing.
 
 Exit codes:
   0  slippage and commissions within the modeled assumptions (a REVIEW
@@ -116,7 +121,7 @@ def modeled_cost(cm: IBKRHKCostModel, side: str, shares: float, notional: float)
     """Modeled commission for one order, plus sell-side SEC and FINRA fees."""
     commission = min(max(cm.min_commission, cm.commission_per_share * shares),
                      cm.max_commission_pct * notional)
-    fees = (cm.sec_fee_rate * notional + min(cm.finra_taf_per_share * shares, 8.30)
+    fees = (cm.sec_fee_rate * notional + min(cm.finra_taf_per_share * shares, cm.finra_taf_cap)
             if side == "SELL" else 0.0)
     return commission + fees
 

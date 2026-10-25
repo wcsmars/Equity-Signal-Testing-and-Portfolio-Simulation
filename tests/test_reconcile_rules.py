@@ -63,12 +63,34 @@ def test_modeled_commission_minimum_rate_cap_and_sell_fees():
         ['2024-01-02', 'PNY', 'BUY', 1000., 0.20, 2., 0.20],      # $5 capped at 1% of $200
         ['2024-01-02', 'IWM', 'SELL', 100., 100., 1., 100.],      # $1 + SEC and FINRA sell fees
     ]))
+    # the sale: $1 minimum + SEC $10,000 x 0.0000206 = $0.206 + TAF 100 x $0.000195 = $0.0195
     assert out.comm_model.tolist() == pytest.approx(
-        [1.0, 5.0, 2.0, 1.0 + 10_000 * 0.0000278 + 100 * 0.000166])
+        [1.0, 5.0, 2.0, 1.0 + 10_000 * 0.0000206 + 100 * 0.000195])
+    assert out.comm_model.iloc[3] == pytest.approx(1.2255)
     # the reserve used for live sizing models a sale the same way
     live = module('scripts/live_targets.py')
     assert out.comm_model.iloc[3] == pytest.approx(
         live.execution_reserve({'IWM': -100.0}, pd.Series({'IWM': 100.0}), 0.0))
+
+
+def test_modeled_sell_fee_cap_is_the_cost_model_field():
+    mod = module()
+    live = module('scripts/live_targets.py')
+    cm = mod.IBKRHKCostModel()
+    # 100,000 shares sold at $1: commission 100,000 x $0.005 = $500 (under the
+    # 1% cap of $1,000); SEC $100,000 x 0.0000206 = $2.06; TAF 100,000 x
+    # $0.000195 = $19.50, capped at the model's $9.79: $511.85
+    assert cm.finra_taf_cap == 9.79
+    assert mod.modeled_cost(cm, 'SELL', 100_000.0, 100_000.0) == pytest.approx(511.85)
+    assert mod.modeled_cost(cm, 'BUY', 100_000.0, 100_000.0) == pytest.approx(500.0)
+    sale = ({'PNY': -100_000.0}, pd.Series({'PNY': 1.0}), 0.0)
+    assert live.execution_reserve(*sale) == pytest.approx(511.85)
+    # the cap is read from the model, not repeated as a number: at $5.00 the
+    # same sale is modeled at $500 + $2.06 + $5.00 = $507.06 in both scripts
+    lower = mod.IBKRHKCostModel(finra_taf_cap=5.0)
+    assert mod.modeled_cost(lower, 'SELL', 100_000.0, 100_000.0) == pytest.approx(507.06)
+    live.IBKRHKCostModel = lambda **kwargs: mod.IBKRHKCostModel(finra_taf_cap=5.0, **kwargs)
+    assert live.execution_reserve(*sale) == pytest.approx(507.06)
 
 
 def test_partial_fills_of_one_order_share_one_minimum_commission():
@@ -83,7 +105,9 @@ def test_partial_fills_of_one_order_share_one_minimum_commission():
     assert out.comm_model.iloc[3] == pytest.approx(1.0)
     summary = mod.summarize(out, 3.0)
     assert summary['orders'] == 3 and summary['fills'] == 4
-    assert summary['comm_gap'] == pytest.approx(-(1000 * 0.0000278 + 10 * 0.000166))
+    # the sale's modeled fees: SEC $1,000 x 0.0000206 = $0.0206, TAF 10 x $0.000195 = $0.00195
+    assert summary['comm_gap'] == pytest.approx(-(1000 * 0.0000206 + 10 * 0.000195))
+    assert summary['comm_gap'] == pytest.approx(-0.02255)
     assert not summary['commission_excess'] and not summary['commission_review_trigger']
 
 
@@ -197,6 +221,11 @@ def test_commission_trigger_is_labelled_and_separate_from_the_registered_slippag
     out = capsys.readouterr().out
     assert 'BREACH: notional-weighted slippage' in out and 'COMMISSION REVIEW TRIGGER' not in out
     assert 'review trigger' in mod.__doc__ and 'not a pre-registered' in mod.__doc__
+    # the registered slippage statistic is the notional-weighted one, the mean only shown
+    doc = ' '.join(mod.__doc__.split())
+    assert 'registered slippage statistic is NOTIONAL-WEIGHTED slippage' in doc
+    assert 'above the modeled assumption + 2 bps' in doc
+    assert 'unweighted mean of the per-fill bps' in doc and 'decides nothing' in doc
     # each gate has its own constant: moving one never moves the other
     monkeypatch.setattr(mod, 'COMMISSION_REVIEW_BPS', 50.0)
     assert _run(mod, monkeypatch, costly) == 0

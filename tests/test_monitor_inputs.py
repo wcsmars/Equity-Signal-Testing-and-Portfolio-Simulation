@@ -1,8 +1,10 @@
 """Monitor inputs: an unusable file, source or date is a refusal (exit 3),
+and an installation that cannot be imported is an internal error (exit 4),
 never an ok, a REVIEW (1), a KILL (2) or a bare traceback."""
 import importlib.util
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import warnings
@@ -225,3 +227,32 @@ def test_process_exit_status_separates_refusal_from_verdicts(tmp_path):
     live.write_text("Date,ENSEMBLE\n2024-01-02,-0.2\n2024-01-03,0\n")
     done = _process(live, "--as-of", "2024-01-03")
     assert done.returncode == 2 and done.stdout.rstrip().endswith("overall: KILL")
+
+
+@pytest.mark.parametrize("broken", ["pandas", "qcore"])
+def test_a_failed_import_at_start_up_is_an_internal_error_not_review(tmp_path, broken):
+    # Python's own status for an uncaught import error is 1, which means REVIEW here
+    project = tmp_path / "project"
+    (project / "scripts").mkdir(parents=True)
+    shutil.copy(SCRIPT, project / "scripts")
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    if broken == "pandas":       # a broken third-party install, ahead of the real one on the path
+        shutil.copytree(ROOT / "src", project / "src", ignore=shutil.ignore_patterns("__pycache__"))
+        (tmp_path / "site" / "pandas").mkdir(parents=True)
+        (tmp_path / "site" / "pandas" / "__init__.py").write_text(
+            "raise ImportError('pandas is broken here')\n")
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(tmp_path / "site"),
+                                                          env.get("PYTHONPATH")]))
+    # broken == "qcore": the copy has no src/ folder, so qcore cannot be found
+    live = tmp_path / "live.csv"
+    live.write_text("Date,ENSEMBLE\n2024-01-02,-0.2\n2024-01-03,0\n")    # a KILL if it were judged
+    done = subprocess.run([sys.executable, str(project / "scripts" / "monitor.py"), str(live),
+                           "--as-of", "2024-01-03"], capture_output=True, text=True, env=env)
+    assert done.returncode == 4
+    assert "Traceback" not in done.stderr and "overall" not in done.stdout
+    lines = done.stdout.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("monitor not evaluated, no verdict: start-up failed, cannot import "
+                               "a dependency (")
+    assert ("ImportError: pandas is broken here" if broken == "pandas"
+            else "ModuleNotFoundError: No module named 'qcore'") in lines[0]

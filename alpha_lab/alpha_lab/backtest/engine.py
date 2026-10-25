@@ -4,7 +4,11 @@ The law, restated (clauses 4-8):
 
 - Holdings ``H_t = W_{t-lag}`` with ``lag >= 1`` — the engine raises
   LookaheadError for anything less, independently of config validation.
-- ``gross_t = sum_i H_{t,i} * r_{t,i}``.
+- ``gross_t = sum_i H_{t,i} * r_{t,i}``, with ``r`` the booked return:
+  the one-day return where it exists; on the day a price returns after an
+  interior gap, the move since the last available close, booked on the part
+  of the position held through the whole gap; zero for any other missing
+  return (see ``_booked_returns``).
 - ``trades_t = H_t - drift(H_{t-1})`` where
   ``drift(H_{t-1})_i = H_{t-1,i} * (1 + r_{t-1,i}) / (1 + gross_{t-1})``:
   the trade dated t executes at close t-1 (clause 7), when the prior book
@@ -130,19 +134,30 @@ class BacktestEngine:
         holdings = weights.shift(lag).fillna(0.0)
 
         returns = data.returns()
-        if np.isinf(returns.to_numpy(dtype=float)).any():
+        # A held asset with a missing one-day return contributes zero that
+        # day. When its price returns after an interior gap, the move since
+        # the last available close is booked that day on the part of the
+        # position held through the gap. A gap that never closes is not
+        # modelled as a delisting payout or a liquidation at the last valid
+        # price; see CONVENTIONS.md. The price panel is never forward-filled.
+        rr, bridged = self._booked_returns(data.close, returns, holdings)
+        if np.isinf(rr.to_numpy(dtype=float)).any():
             raise DataError("non-finite asset returns; check extreme price ratios")
         missing_held = int(((holdings != 0.0) & returns.isna()).to_numpy().sum())
         if missing_held:
+            if bridged:
+                detail = (
+                    f"; {bridged} of them, on the day a price returned after a gap, book the "
+                    "move since the last available price on the position held through the "
+                    f"gap, the other {missing_held - bridged} contribute zero; "
+                )
+            else:
+                detail = " and contribute zero; "
             warnings.warn(
-                f"{missing_held} held asset-return cells are missing and contribute zero; "
+                f"{missing_held} held asset-return cells are missing{detail}"
                 "review price gaps and delisting assumptions before using these results",
                 UserWarning, stacklevel=2,
             )
-        # A held asset with a missing return contributes zero. This does not
-        # model a delisting payout or a liquidation at the last valid price;
-        # see CONVENTIONS.md. Prices are never forward-filled.
-        rr = returns.fillna(0.0)
         gross = (holdings * rr).sum(axis=1)
         if not np.isfinite(gross.to_numpy()).all():
             raise DataError("non-finite portfolio returns; check prices and weights")
@@ -199,8 +214,61 @@ class BacktestEngine:
                 "execution_lag": lag,
                 "portfolio_value": self.portfolio_value,
                 "missing_held_return_cells": missing_held,
+                "bridged_held_return_cells": bridged,
             },
         )
+
+    # -- booked returns ----------------------------------------------------
+
+    @staticmethod
+    def _booked_returns(
+        close: pd.DataFrame, returns: pd.DataFrame, holdings: pd.DataFrame
+    ) -> tuple[pd.DataFrame, int]:
+        """Per-cell returns booked against ``holdings``, and how many bridge a gap.
+
+        The one-day return where it exists and zero where it is missing,
+        except on the day ``t`` an asset's price returns after an interior
+        gap (last available close at ``s < t - 1``). There the move since
+        that close, ``close_t / close_s - 1``, is booked on the part of the
+        holding carried through the whole gap: the smallest holding over
+        days ``s+1 .. t`` when all of them have the same sign, else nothing.
+        ``H_{s+1}`` was set at close ``s``, the last close at which the asset
+        had a price, so only exposure fixed before the move began earns it.
+        Exposure opened or added during the gap could only trade at a stale
+        price and books nothing for that move: a target decided at close
+        ``s`` or later would otherwise earn a move from close ``s``, a fill
+        its execution lag rules out. Exposure cut during the gap is treated
+        as sold at the last available price, like any trade dated in a gap.
+        Only prices through ``t`` are read. A gap that never closes (a
+        delisting, the end of the panel) and an asset's first price have no
+        move to bridge and book zero, as before. Returns the booked panel and
+        the number of held cells that booked a bridged move.
+        """
+        booked = returns.fillna(0.0)
+        prices = close.to_numpy(dtype=float, na_value=np.nan)
+        valid = ~np.isnan(prices)
+        rows = np.arange(len(prices))[:, None]
+        # row of the last available close strictly before each date (-1: none)
+        last = np.maximum.accumulate(np.where(valid, rows, -1), axis=0)
+        before = np.vstack([np.full((1, prices.shape[1]), -1), last[:-1]])
+        held = holdings.to_numpy(dtype=float)
+        reopened = valid & (before >= 0) & (before < rows - 1) & (held != 0.0)
+        if not reopened.any():
+            return booked, 0
+        values = booked.to_numpy(dtype=float, copy=True)
+        bridged = 0
+        for t, i in zip(*np.nonzero(reopened)):
+            s = before[t, i]
+            span = held[s + 1 : t + 1, i]
+            if (span > 0.0).all():
+                carried = span.min()
+            elif (span < 0.0).all():
+                carried = span.max()
+            else:
+                continue  # not held through the whole gap: the move is not booked
+            values[t, i] = carried / held[t, i] * (prices[t, i] / prices[s, i] - 1.0)
+            bridged += 1
+        return pd.DataFrame(values, index=returns.index, columns=returns.columns), bridged
 
     # -- scoring ----------------------------------------------------------
 

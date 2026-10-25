@@ -11,6 +11,7 @@ time; the NYSE MOC cutoff is 10 minutes before the close):
 
               export QCORE_DATA_DIR="$PWD/state/live_cache"
   ~3:40pm ET  python src/download_data.py       # in-progress day = near-close
+  ~3:41pm ET  python scripts/data_quality.py    # the gate this script requires
   ~3:42pm ET  python scripts/live_targets.py --cash <broker cash balance> \
                   --ledger state/ledger.csv
   ~3:45pm ET  submit the printed MOC orders (NYSE cutoff 3:50, Nasdaq 3:55)
@@ -39,6 +40,16 @@ Old decisions therefore cannot generate catch-up orders. Use
 --as-of YYYY-MM-DD for an explicit offline inspection at any time of day;
 the supplied date must equal the cache's last row.
 
+Data-quality gate. Live and --as-of runs alike print nothing unless
+scripts/data_quality.py has judged the cache this run reads. Its report -
+results/data_quality.json for the default cache, data_quality.json beside a
+cache named by QCORE_DATA_DIR - must exist, be for the cache's last date
+(and, when it records one, for this cache's directory), be written no
+earlier than any of the cache's price files (adj_close, close, open, high,
+low, volume and indices .csv) and hold no FAIL; WARN is allowed and
+printed. Otherwise the run is refused with the command to run.
+--no-gate-check skips the check and says so loudly on the sheet.
+
 Signal paths are the strategy modules' own builders (src/strategies/*),
 including the live-edge calendar guards: on a mid-month decision close the
 monthly sleeves (tsmom_trend, xsec_etf_mom) emit HOLD, never a phantom
@@ -64,27 +75,37 @@ Sleeve targets are never cut to force an unfunded order list through;
 funded.
 
 Ledger (optional, --ledger): per-sleeve share positions CSV with columns
-sleeve,ticker,shares and an optional as_of column (the session whose fills
-it reflects). examples/ledger.example.csv is a made-up ledger in that
-format. With a ledger, the output is per-sleeve share DELTAS netted into one
-order per ticker; without it, target shares only. A dated ledger must be as
-of the previous NYSE session (--ignore-ledger-date overrides), so a ledger
-that already contains today's fills cannot print the same orders twice.
+sleeve,ticker,shares,as_of. as_of is the NYSE session whose fills the
+ledger reflects, one YYYY-MM-DD date on every row.
+examples/ledger.example.csv is a made-up ledger in that format. With a
+ledger, the output is per-sleeve share DELTAS netted into one order per
+ticker; without it, target shares only. The ledger must be as of the
+previous NYSE session, so a ledger that already contains today's fills
+cannot print the same orders twice. An undated ledger (no as_of column, or
+the column left blank) is refused for the same reason: a ledger with no
+positions yet carries its date on a zero-share row, for example
+cash,SGOV,0,<previous session>. --ignore-ledger-date is the explicit
+override for both: it accepts an undated ledger (flagged with !! on the
+sheet) or one dated another session.
 This script never changes the input ledger and no other script maintains
 it: --write-ledger PATH writes the per-sleeve ledger that results IF every
-printed order fills in full; correct it from the broker's confirmed fills
-before the next run.
+printed order fills in full, dated as of the decision close (a book with no
+position keeps the date on a zero-share cash row); correct it from the
+broker's confirmed fills before the next run.
 
 Inputs: the price cache (adj_close.csv and close.csv, built by
-python src/download_data.py), results/ensemble.json (built by
+python src/download_data.py), the data-quality gate's report on it (written
+by python scripts/data_quality.py), results/ensemble.json (built by
 python src/ensemble.py; without it the run is refused with that command)
-and, optionally, a ledger. Offline example on any cache:
+and, optionally, a ledger. Offline example on any cache, after the gate:
+  python scripts/data_quality.py
   python scripts/live_targets.py --as-of <last date in the cache> \
       --cash 5000 --ledger examples/ledger.example.csv --ignore-ledger-date
 
-Exit codes: 0 = order sheet printed; 2 = refused (failed gate, invalid or
-missing input, unfunded orders) - nothing printed above the message may be
-traded; 3 = unexpected crash.
+Exit codes: 0 = order sheet printed; 2 = refused (failed gate, including
+the data-quality gate; invalid or missing input, including an undated
+ledger; unfunded orders) - nothing printed above the message may be traded;
+3 = unexpected crash.
 
 Limits: orders are whole shares, floored per sleeve, and the rounding gap is
 printed; an unfunded book is refused as a whole rather than trimmed; early
@@ -112,7 +133,7 @@ sys.path.insert(0, str(ROOT / "src" / "strategies"))
 
 from qcore.calendar import confirmed_month_ends  # noqa: E402
 from qcore.costs import IBKRHKCostModel  # noqa: E402
-from qcore.data import DATA_DIR, load, load_prices  # noqa: E402
+from qcore.data import DATA_DIR, DEFAULT_DATA_DIR, load, load_prices  # noqa: E402
 from qcore.quality import nyse_bdays  # noqa: E402
 
 CASH_ETF = "SGOV"  # 0-3m T-bills; the engine's ^IRX-10bp credit made real
@@ -122,6 +143,14 @@ SUBMIT_WINDOW_MINUTES = 30  # snapshot and order sheet no earlier than this befo
 MOC_CUTOFF_MINUTES = 10     # NYSE market-on-close cutoff before the close
 SNAPSHOT_CLOCK_SKEW_SECONDS = 60  # a cache stamped later than "now" by more than this is refused
 DEFAULT_EQUITY = 100_000.0  # ledger-less target display only; never an order list
+GATE_COMMAND = "python scripts/data_quality.py"
+GATE_REPORT = "data_quality.json"  # the report's name, in results/ or beside a QCORE_DATA_DIR cache
+# The price files the gate reads (qcore.quality.PriceBundle): its report must not be older.
+GATE_PRICE_FILES = ("adj_close", "close", "open", "high", "low", "volume", "indices")
+GATE_PASSES = ("ok", "INFO", "WARN")  # anything else, FAIL included, refuses the sheet
+NO_GATE_LINE = ("!! DATA-QUALITY GATE NOT CHECKED (--no-gate-check): nothing confirms that "
+                "scripts/data_quality.py passed this cache; check the prices before entering "
+                "any order")
 EXIT_REFUSED = 2
 EXIT_CRASH = 3
 
@@ -192,6 +221,76 @@ def _local_label(moment: pd.Timestamp) -> str:
     return moment.to_pydatetime().astimezone().strftime("%a %H:%M %Z").strip()
 
 
+def _shown(path: Path) -> str:
+    """`path` relative to the project root when it lies inside it."""
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def quality_report_path() -> Path:
+    """Where scripts/data_quality.py writes its report for the cache this run
+    reads: results/ for the default cache, beside a cache named by
+    QCORE_DATA_DIR."""
+    if DATA_DIR == DEFAULT_DATA_DIR:
+        return ROOT / "results" / GATE_REPORT
+    return DATA_DIR / GATE_REPORT
+
+
+def quality_gate(t: pd.Timestamp) -> str:
+    """The data-quality gate's verdict on this cache, as the line to print.
+
+    Raises ValueError (a refusal) unless the report of scripts/data_quality.py
+    for this cache exists, is for its last date `t` (and, when the report
+    records a cache directory, for this one), was written no earlier than any
+    price file the gate reads, and holds no FAIL.
+    """
+    path = quality_report_path()
+    shown = _shown(path)
+    gate = GATE_COMMAND + ("" if DATA_DIR == DEFAULT_DATA_DIR
+                           else f" (with QCORE_DATA_DIR={DATA_DIR}, as for this run)")
+    rerun = f"run the gate on this cache first: {gate}; --no-gate-check prints the sheet without it"
+    if not path.is_file():
+        raise ValueError(f"the data-quality gate has not judged this cache: no report at {shown}; "
+                         f"{rerun}")
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:  # JSON and decoding errors are ValueErrors
+        raise ValueError(f"data-quality report {shown} cannot be read ({exc}); {rerun}") from None
+    if not isinstance(report, dict):
+        raise ValueError(f"data-quality report {shown} is not a report object; {rerun}")
+    worst, as_of = report.get("worst"), report.get("as_of")
+    if as_of is None and worst == "FAIL":
+        raise ValueError(f"data-quality report {shown} records a failed gate run (FAIL before "
+                         f"the cache was judged); {rerun}")
+    if as_of != str(t.date()):
+        raise ValueError(f"data-quality report {shown} is for a cache ending {as_of}, not for "
+                         f"this cache's last date {t.date()}; {rerun}")
+    recorded = report.get("data_dir")
+    if recorded is not None:
+        judged = Path(str(recorded))
+        judged = judged if judged.is_absolute() else ROOT / judged
+        if judged.resolve() != DATA_DIR.resolve():
+            raise ValueError(f"data-quality report {shown} judged the cache in {recorded}, not "
+                             f"this run's cache {_shown(DATA_DIR)}; {rerun}")
+    written = path.stat().st_mtime_ns
+    newer = [f"{name}.csv" for name in GATE_PRICE_FILES
+             if (DATA_DIR / f"{name}.csv").is_file()
+             and (DATA_DIR / f"{name}.csv").stat().st_mtime_ns > written]
+    if newer:
+        raise ValueError(f"data-quality report {shown} is older than the cache's "
+                         f"{', '.join(newer)}: the prices changed after the gate ran; {rerun}")
+    if worst not in GATE_PASSES:
+        raise ValueError(f"the data-quality gate reports {worst} for this cache ({shown}): no "
+                         f"order sheet from a cache with FAIL findings. {gate} lists them; "
+                         "repair the cache (download it again) and run the gate again; "
+                         "--no-gate-check prints the sheet regardless")
+    findings = report.get("n_findings")
+    count = f", {findings} finding(s)" if isinstance(findings, int) else ""
+    return f"data-quality gate: {shown} judged this cache ({as_of}): {worst}{count}"
+
+
 def ensemble_weights() -> dict[str, float]:
     path = ROOT / "results" / "ensemble.json"
     if not path.is_file():
@@ -255,8 +354,10 @@ def sleeve_seasonality(px: pd.DataFrame) -> tuple[pd.Series, str]:
 def read_ledger(path: Path) -> pd.Series:
     """An explicit ledger is a complete position snapshot; omitted rows are zero.
 
-    The optional as_of column (one date on every row) is returned in
-    ``.attrs["as_of"]``; None when the ledger is undated or has no rows.
+    The as_of column (one date on every row) is returned in
+    ``.attrs["as_of"]``; None when the ledger is undated - no as_of column,
+    the column blank on every row, or no rows. main() refuses an undated
+    ledger unless --ignore-ledger-date is given.
     """
     with path.open(newline="", encoding="utf-8-sig") as stream:
         header = [name.strip() for name in next(csv.reader(stream), [])]
@@ -282,9 +383,11 @@ def read_ledger(path: Path) -> pd.Series:
     if df.duplicated(["sleeve", "ticker"]).any():
         raise ValueError("ledger has duplicate sleeve/ticker positions")
     as_of = None
-    if "as_of" in df.columns and len(df):
+    text = ["" if pd.isna(value) else str(value).strip()
+            for value in (df["as_of"] if "as_of" in df.columns else [])]
+    if any(text):  # blank on every row is undated; blank on some rows is malformed
         try:
-            dates = pd.to_datetime(df["as_of"].astype(str).str.strip(), format="%Y-%m-%d")
+            dates = pd.to_datetime(pd.Series(text), format="%Y-%m-%d")
         except (ValueError, TypeError) as exc:
             raise ValueError("ledger as_of must be one YYYY-MM-DD session date on every row") from exc
         if dates.isna().any() or dates.nunique() != 1:
@@ -331,7 +434,8 @@ def execution_reserve(deltas: dict[str, float], prices: pd.Series,
         notional = abs(shares) * float(prices[ticker])
         commission = min(max(cm.min_commission, cm.commission_per_share * abs(shares)),
                          cm.max_commission_pct * notional)
-        fees = (cm.sec_fee_rate * notional + min(cm.finra_taf_per_share * abs(shares), 8.30)
+        fees = (cm.sec_fee_rate * notional
+                + min(cm.finra_taf_per_share * abs(shares), cm.finra_taf_cap)
                 if shares < 0 else 0.0)
         reserve += commission + fees + notional * price_buffer_bps / 1e4
     return reserve
@@ -425,6 +529,8 @@ def post_trade_ledger(sleeve_shares: dict[str, dict[str, float]], ledger: pd.Ser
             book[ticker] = float(prior.get(ticker, 0.0))
         rows += [{"sleeve": sleeve, "ticker": ticker, "shares": int(round(book[ticker])),
                   "as_of": str(as_of.date())} for ticker in sorted(book) if book[ticker]]
+    if not rows:  # no position at all: a zero-share row still carries the date
+        rows.append({"sleeve": "cash", "ticker": CASH_ETF, "shares": 0, "as_of": str(as_of.date())})
     return pd.DataFrame(rows, columns=["sleeve", "ticker", "shares", "as_of"])
 
 
@@ -441,12 +547,16 @@ def main() -> None:
     ap.add_argument("--allow-margin", action="store_true",
                     help="accept a negative cash balance (ledger worth more than equity)")
     ap.add_argument("--ledger", type=Path, default=None,
-                    help="per-sleeve positions CSV (sleeve,ticker,shares[,as_of])")
+                    help="per-sleeve positions CSV (sleeve,ticker,shares,as_of)")
     ap.add_argument("--write-ledger", type=Path, default=None,
                     help="write the per-sleeve ledger that results if every printed order "
                          "fills in full to this NEW file (never overwrites)")
     ap.add_argument("--ignore-ledger-date", action="store_true",
-                    help="accept a ledger whose as_of is not the previous NYSE session")
+                    help="accept an undated ledger, or one whose as_of is not the previous "
+                         "NYSE session")
+    ap.add_argument("--no-gate-check", action="store_true",
+                    help="print the sheet without checking the data-quality gate's report "
+                         "for this cache (said loudly on the sheet)")
     ap.add_argument("--min-order", type=float, default=0.0,
                     help="suppress orders below this notional (USD)")
     ap.add_argument("--price-buffer-bps", type=float, default=25.0,
@@ -519,6 +629,7 @@ def main() -> None:
         print(f"LIVE session {today.date()}: New York time {now:%H:%M}, MOC cutoff "
               f"{cutoff:%H:%M} ET ({_local_label(cutoff)} local), close {session_close:%H:%M} ET; "
               f"price cache written {snapshot:%H:%M} ET")
+    print(NO_GATE_LINE if args.no_gate_check else quality_gate(t))
 
     ledger = None
     equity = args.equity
@@ -527,9 +638,16 @@ def main() -> None:
         require_prices(last_px, ledger[ledger != 0].index.get_level_values("ticker").unique())
         dated = ledger.attrs.get("as_of")
         if dated is None:
-            if (ledger != 0).any():
-                print("ledger has no as_of date: cannot check that it reflects the previous "
-                      "session's fills")
+            if not args.ignore_ledger_date:
+                raise ValueError(
+                    "the ledger has no as_of date. as_of is the NYSE session whose fills the "
+                    "ledger reflects (one YYYY-MM-DD date on every row); without it nothing "
+                    "stops a ledger that already holds today's fills from printing the same "
+                    "orders twice. Add the column (a ledger with no positions yet can carry it "
+                    "on a zero-share row: cash,SGOV,0,<previous session>), or pass "
+                    "--ignore-ledger-date to accept this ledger as it stands")
+            print("  !! ledger has no as_of date, accepted under --ignore-ledger-date: nothing "
+                  "checks that it reflects the previous session's fills")
         elif not args.ignore_ledger_date:
             if reason := ledger_date_error(dated, t):
                 raise ValueError(f"{reason} (--ignore-ledger-date overrides)")
@@ -690,7 +808,8 @@ def main() -> None:
         if args.write_ledger is not None:
             with args.write_ledger.open("x", newline="", encoding="utf-8") as stream:
                 proposed.to_csv(stream, index=False)
-        print("\n== MOC ORDERS (target - ledger)")
+        print("\n== MOC ORDERS (target - ledger)"
+              + ("   !! DATA-QUALITY GATE NOT CHECKED" if args.no_gate_check else ""))
         for line in skipped:
             print(line)
         for tkr, delta, notional in orders:

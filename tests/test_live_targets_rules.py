@@ -2,10 +2,12 @@
 
 Synthetic prices and ledgers only. These pin what the live order generator
 decides: when a live sheet may be printed at all (New York date, time of
-day, early closes, cache age), that a missing decision-close quote stops the
-run, how the account size is tied to the ledger, sizing and cash parking,
-the exact order lines, the minimum-order filter, the ledger date guard, the
-proposed post-trade ledger, the operator alert channel and the exit codes.
+day, early closes, cache age, the data-quality gate's report on the cache),
+that a missing decision-close quote stops the run, how the account size is
+tied to the ledger, sizing and cash parking, the exact order lines, the
+minimum-order filter, the ledger date guard (an undated ledger is refused),
+the proposed post-trade ledger, the operator alert channel and the exit
+codes.
 """
 import importlib.util
 import json
@@ -24,6 +26,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SLEEVES = ['mean_reversion', 'seasonality_flows', 'tsmom_trend', 'xsec_etf_mom']
 DAY = '2024-01-02'
+PREVIOUS = '2023-12-29'   # the NYSE session before DAY (weekend, then New Year's Day)
 NY = 'America/New_York'
 
 
@@ -36,10 +39,13 @@ def module(relative):
 
 
 def _live(monkeypatch, px, weights=None, raw=None):
+    """The script over injected prices and weights. The data-quality gate is
+    taken as passed here; its own rules are pinned in the gate section."""
     mod = module('scripts/live_targets.py')
     monkeypatch.setattr(mod, 'load_prices', lambda: px)
     monkeypatch.setattr(mod, 'load', lambda _: px if raw is None else raw)
     monkeypatch.setattr(mod, 'ensemble_weights', lambda: weights or dict.fromkeys(SLEEVES, .25))
+    monkeypatch.setattr(mod, 'quality_gate', lambda t: f'data-quality gate: passed for {t.date()}')
     return mod
 
 
@@ -64,7 +70,14 @@ def _prices(day=DAY, **quotes):
     return pd.DataFrame({k: [float(v)] for k, v in quotes.items()}, index=pd.to_datetime([day]))
 
 
-def _ledger(tmp_path, rows, header='sleeve,ticker,shares', name='ledger.csv'):
+def _ledger(tmp_path, rows, header=None, name='ledger.csv', as_of=PREVIOUS):
+    """A ledger file. Without an explicit header every row is dated `as_of`
+    (by default the session before DAY), and a ledger with no position
+    carries that date on a zero-share cash row. An explicit header writes the
+    rows exactly as given."""
+    if header is None:
+        header = 'sleeve,ticker,shares,as_of'
+        rows = [f'{row},{as_of}' for row in (rows or ['cash,SGOV,0'])]
     path = tmp_path / name
     path.write_text(header + '\n' + ''.join(row + '\n' for row in rows))
     return path
@@ -194,7 +207,8 @@ def test_live_run_inside_the_window_prints_the_cutoff_and_the_orders(monkeypatch
     out = capsys.readouterr().out
     assert 'LIVE session 2024-01-02: New York time 15:42, MOC cutoff 15:50 ET' in out
     assert 'close 16:00 ET; price cache written 15:40 ET' in out
-    assert 'OFFLINE' not in out and 'no as_of date' not in out   # an empty ledger has nothing to date
+    assert 'data-quality gate: passed for 2024-01-02' in out      # live runs are gated too
+    assert 'OFFLINE' not in out and 'no as_of date' not in out   # dated on a zero-share row
     assert 'BUY       2 SPY' in _orders(out)
 
 
@@ -234,7 +248,8 @@ def test_live_run_needs_todays_scheduled_session_before_any_time_check(monkeypat
 
 def test_half_day_run_inside_its_own_window_is_accepted(monkeypatch, tmp_path, capsys):
     mod = _live_session(monkeypatch, '12:42', '12:40', '2025-11-28')
-    assert _run(mod, monkeypatch, '--equity', '1000', '--ledger', str(_ledger(tmp_path, []))) == 0
+    ledger = _ledger(tmp_path, [], as_of='2025-11-26')            # Thanksgiving is closed
+    assert _run(mod, monkeypatch, '--equity', '1000', '--ledger', str(ledger)) == 0
     assert 'MOC cutoff 12:50 ET' in capsys.readouterr().out
 
 
@@ -249,7 +264,8 @@ def test_documented_live_flow_selects_the_live_cache_before_the_download():
     doc = module('scripts/live_targets.py').__doc__
     assert 'export QCORE_DATA_DIR=' in doc
     assert doc.index('export QCORE_DATA_DIR=') < doc.index(' src/download_data.py')
-    assert doc.index(' src/download_data.py') < doc.index(' scripts/live_targets.py')
+    assert doc.index(' src/download_data.py') < doc.index(' scripts/data_quality.py')
+    assert doc.index(' scripts/data_quality.py') < doc.index(' scripts/live_targets.py')
 
 
 def _project_copy(tmp_path, weights=True):
@@ -267,14 +283,23 @@ def _project_copy(tmp_path, weights=True):
     return project
 
 
-def _cache(tmp_path, end):
+def _cache(tmp_path, end, gate=True):
+    """A QCORE_DATA_DIR cache of the two files the script reads, and (gate)
+    a passing data-quality report for it, written after them."""
     probe = module('scripts/live_targets.py')
     px = _panel(probe, end).round(4)
     cache = tmp_path / 'live_cache'
     cache.mkdir()
     for name in ('adj_close', 'close'):
         px.to_csv(cache / f'{name}.csv')
+    if gate:
+        _gate_report(cache, end)
     return cache
+
+
+def _gate_report(cache, end, **changes):
+    report = {'as_of': end, 'data_dir': str(cache), 'worst': 'ok', 'n_findings': 0, **changes}
+    (cache / 'data_quality.json').write_text(json.dumps(report))
 
 
 def test_script_reads_the_cache_named_by_qcore_data_dir(tmp_path):
@@ -334,6 +359,158 @@ def test_unparseable_as_of_is_a_usage_error_not_a_traceback(monkeypatch, capsys)
     mod = _live(monkeypatch, _prices(SPY=100))
     assert _run(mod, monkeypatch, '--as-of', 'banana') == 2
     assert "--as-of must be a date YYYY-MM-DD, got 'banana'" in capsys.readouterr().err
+
+
+# ===================================================== data-quality gate
+def _gated(monkeypatch, tmp_path, default=False, report=None):
+    """The script over a cache of two price files: the default cache of a
+    project folder, or a QCORE_DATA_DIR cache outside it. `report` (an
+    object, or raw text) is written as the gate's report after the prices."""
+    mod = module('scripts/live_targets.py')
+    project = tmp_path.resolve() / 'project'
+    cache = project / 'data' if default else tmp_path.resolve() / 'live_cache'
+    for folder in (cache, project / 'results'):
+        folder.mkdir(parents=True, exist_ok=True)
+    for name in ('adj_close', 'close'):
+        (cache / f'{name}.csv').write_text(f'Date,SPY\n{DAY},100.0\n')
+    monkeypatch.setattr(mod, 'ROOT', project)
+    monkeypatch.setattr(mod, 'DEFAULT_DATA_DIR', project / 'data')
+    monkeypatch.setattr(mod, 'DATA_DIR', cache)
+    path = mod.quality_report_path()
+    if report is not None:
+        path.write_text(report if isinstance(report, str) else json.dumps(report))
+    return mod, path
+
+
+def _report(**changes):
+    return {'as_of': DAY, 'worst': 'ok', 'n_findings': 0, **changes}
+
+
+def test_gate_report_is_where_the_data_quality_script_writes_it(monkeypatch, tmp_path):
+    import qcore.data as qdata
+    gate = module('scripts/data_quality.py')
+    live = module('scripts/live_targets.py')
+    assert live.DEFAULT_DATA_DIR == qdata.DEFAULT_DATA_DIR
+    for cache, expected in ((qdata.DEFAULT_DATA_DIR, ROOT / 'results' / 'data_quality.json'),
+                            (tmp_path / 'live_cache', tmp_path / 'live_cache' / 'data_quality.json')):
+        monkeypatch.setattr(qdata, 'DATA_DIR', cache)
+        monkeypatch.setattr(live, 'DATA_DIR', cache)
+        assert gate._default_out() == live.quality_report_path() == expected
+
+
+@pytest.mark.parametrize('default', [False, True])
+def test_gate_passes_a_fresh_report_for_this_cache_and_prints_its_reading(monkeypatch, tmp_path,
+                                                                          default):
+    mod, path = _gated(monkeypatch, tmp_path, default, report=None)
+    shown = 'results/data_quality.json' if default else str(path)
+    recorded = 'data' if default else str(mod.DATA_DIR)     # as scripts/data_quality.py records it
+    for worst, count in (('ok', 0), ('INFO', 4), ('WARN', 3)):
+        path.write_text(json.dumps(_report(worst=worst, n_findings=count, data_dir=recorded)))
+        assert mod.quality_gate(pd.Timestamp(DAY)) == (
+            f'data-quality gate: {shown} judged this cache ({DAY}): {worst}, {count} finding(s)')
+    # a report from before the data_dir field: its location alone ties it to the cache
+    path.write_text(json.dumps(_report(worst='WARN', n_findings=3)))
+    assert mod.quality_gate(pd.Timestamp(DAY)).endswith('WARN, 3 finding(s)')
+
+
+@pytest.mark.parametrize('default', [False, True])
+@pytest.mark.parametrize('report,text', [
+    (None, 'the data-quality gate has not judged this cache: no report at '),
+    ('{"as_of": "2024-01-02", "worst"', 'cannot be read'),
+    ([DAY, 'ok'], 'is not a report object'),
+    ({'worst': 'FAIL', 'n_findings': 1, 'findings': []}, 'records a failed gate run'),
+    (_report(as_of='2023-12-29'), "is for a cache ending 2023-12-29, not for this cache's last "
+                                  'date 2024-01-02'),
+    (_report(as_of=None), 'is for a cache ending None'),
+    (_report(data_dir='/another/cache'), 'judged the cache in /another/cache, not this run'),
+    (_report(worst='FAIL', n_findings=2), 'the data-quality gate reports FAIL for this cache'),
+    (_report(worst=None), 'the data-quality gate reports None for this cache'),
+])
+def test_gate_refuses_unless_its_report_judged_this_cache(monkeypatch, tmp_path, default, report, text):
+    mod, path = _gated(monkeypatch, tmp_path, default, report)
+    with pytest.raises(ValueError) as refusal:
+        mod.quality_gate(pd.Timestamp(DAY))
+    message = str(refusal.value)
+    assert text in message
+    assert 'python scripts/data_quality.py' in message and '--no-gate-check' in message
+    assert (f'QCORE_DATA_DIR={mod.DATA_DIR}' in message) is (not default)
+
+
+def test_gate_report_must_not_be_older_than_any_price_file(monkeypatch, tmp_path):
+    mod, path = _gated(monkeypatch, tmp_path, report=_report())
+    written = path.stat().st_mtime_ns
+    for name in ('indices', 'volume', 'dq_known_events'):
+        (mod.DATA_DIR / f'{name}.csv').write_text('Date,X\n')
+        os.utime(mod.DATA_DIR / f'{name}.csv', ns=(written, written))   # as new as the report
+    assert mod.quality_gate(pd.Timestamp(DAY)).startswith('data-quality gate:')
+    later = written + 2_000_000_000
+    # the allowlist beside the prices is not a price file: editing it does not stale the report
+    os.utime(mod.DATA_DIR / 'dq_known_events.csv', ns=(later, later))
+    assert mod.quality_gate(pd.Timestamp(DAY)).startswith('data-quality gate:')
+    for name in ('volume', 'close'):
+        os.utime(mod.DATA_DIR / f'{name}.csv', ns=(later, later))
+    with pytest.raises(ValueError, match=r"older than the cache's close\.csv, volume\.csv: the "
+                                         'prices changed after the gate ran'):
+        mod.quality_gate(pd.Timestamp(DAY))
+
+
+@pytest.mark.parametrize('live', [False, True])
+def test_no_order_sheet_without_the_gate_unless_explicitly_overridden(monkeypatch, tmp_path, capsys,
+                                                                      live):
+    mod = _live_session(monkeypatch, '15:42', '15:40')
+    asked = []
+
+    def refuse(t):
+        asked.append(t)
+        raise ValueError('the data-quality gate has not judged this cache: no report at x')
+
+    monkeypatch.setattr(mod, 'quality_gate', refuse)
+    argv = [*([] if live else ['--as-of', DAY]), '--equity', '1000', '--ledger', str(_ledger(tmp_path, []))]
+    monkeypatch.setattr(sys, 'argv', ['live_targets.py', *argv])
+    with pytest.raises(ValueError, match='has not judged this cache'):
+        mod.main()
+    assert asked == [pd.Timestamp(DAY)]                 # about this cache's last date
+    out = capsys.readouterr().out
+    assert 'decision close' not in out and 'MOC ORDERS' not in out
+    monkeypatch.setattr(mod, 'quality_gate', lambda t: pytest.fail('the report was read'))
+    assert _run(mod, monkeypatch, *argv, '--no-gate-check') == 0
+    out = capsys.readouterr().out
+    assert mod.NO_GATE_LINE in out and out.index(mod.NO_GATE_LINE) < out.index('decision close')
+    assert '== MOC ORDERS (target - ledger)   !! DATA-QUALITY GATE NOT CHECKED' in out
+    assert 'BUY       2 SPY' in _orders(out)
+
+
+def test_the_script_refuses_a_cache_the_gate_has_not_judged_and_names_the_command(tmp_path):
+    cache = _cache(tmp_path, '2024-04-15', gate=False)
+    env = {**os.environ, 'QCORE_DATA_DIR': str(cache), 'PYTHONDONTWRITEBYTECODE': '1'}
+    script = str(_project_copy(tmp_path) / 'scripts' / 'live_targets.py')
+    report = cache.resolve() / 'data_quality.json'
+
+    def run(*extra):
+        return subprocess.run([sys.executable, script, '--as-of', '2024-04-15', '--equity', '100000',
+                               *extra], env=env, capture_output=True, text=True)
+
+    done = run()
+    assert done.returncode == 2 and 'Traceback' not in done.stderr
+    assert ('LIVE TARGETS REFUSED: the data-quality gate has not judged this cache: no report at '
+            f'{report}; run the gate on this cache first: python scripts/data_quality.py (with '
+            f'QCORE_DATA_DIR={cache.resolve()}, as for this run); --no-gate-check prints the sheet '
+            'without it') in done.stderr
+    assert 'decision close' not in done.stdout and 'NET PORTFOLIO TARGET' not in done.stdout
+    _gate_report(cache, '2024-04-15', worst='WARN', n_findings=2)
+    done = run()
+    assert done.returncode == 0, done.stderr
+    assert (f'data-quality gate: {report} judged this cache (2024-04-15): WARN, 2 finding(s)'
+            in done.stdout)
+    # prices rewritten after the gate ran: the report no longer speaks for them
+    later = report.stat().st_mtime + 5
+    os.utime(cache / 'close.csv', (later, later))
+    done = run()
+    assert done.returncode == 2 and "older than the cache's close.csv" in done.stderr
+    done = run('--no-gate-check')
+    assert done.returncode == 0 and 'DATA-QUALITY GATE NOT CHECKED (--no-gate-check)' in done.stdout
+    done = run('--no-gate')                              # no abbreviated flags
+    assert done.returncode == 2 and 'unrecognized arguments: --no-gate' in done.stderr
 
 
 # ===================================================== decision-row quotes
@@ -408,7 +585,7 @@ def test_missing_quote_at_month_end_prints_no_order_sheet(monkeypatch, tmp_path,
     px.loc[px.index[-1], 'EWY'] = np.nan
     mod = _live(monkeypatch, px)
     monkeypatch.setattr(sys, 'argv', ['live_targets.py', '--equity', '100000', '--as-of', '2024-04-30',
-                                      '--ledger', str(_ledger(tmp_path, []))])
+                                      '--ledger', str(_ledger(tmp_path, [], as_of='2024-04-29'))])
     with pytest.raises(ValueError, match='xsec_etf_mom: no valid decision-close quote .* EWY'):
         mod.main()
     out = capsys.readouterr().out
@@ -512,7 +689,10 @@ def test_ledger_as_of_is_one_session_date(tmp_path):
     header = 'sleeve,ticker,shares,as_of'
     good = _ledger(tmp_path, ['cash,SGOV,3,2024-01-02', 'mean_reversion,SPY,1,2024-01-02'], header)
     assert mod.read_ledger(good).attrs['as_of'] == pd.Timestamp('2024-01-02')
+    # undated: no rows, or the column blank on every row (main() refuses both)
     assert mod.read_ledger(_ledger(tmp_path, [], header)).attrs['as_of'] is None
+    blank = _ledger(tmp_path, ['cash,SGOV,3,', 'mean_reversion,SPY,1, '], header)
+    assert mod.read_ledger(blank).attrs['as_of'] is None
     for rows in (['cash,SGOV,3,2024-01-02', 'mean_reversion,SPY,1,2024-01-03'],
                  ['cash,SGOV,3,2024-01-02', 'mean_reversion,SPY,1,'],
                  ['cash,SGOV,3,yesterday'], ['cash,SGOV,3,20240102']):
@@ -557,9 +737,47 @@ def test_ledger_that_already_holds_todays_fills_cannot_repeat_the_orders(monkeyp
     assert _run(mod, monkeypatch, '--as-of', DAY, '--equity', '1000', '--ledger', str(previous)) == 0
     out = capsys.readouterr().out
     assert 'no as_of date' not in out and 'SELL      3 SPY' in _orders(out)
-    undated = _ledger(tmp_path, ['mean_reversion,SPY,5'], name='undated.csv')
-    assert _run(mod, monkeypatch, '--as-of', DAY, '--equity', '1000', '--ledger', str(undated)) == 0
-    assert 'ledger has no as_of date' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('header,row', [
+    ('sleeve,ticker,shares', 'mean_reversion,SPY,5'),              # no as_of column
+    ('sleeve,ticker,shares,as_of', 'mean_reversion,SPY,5,'),       # the column left blank
+    ('sleeve,ticker,shares,as_of', None),                          # no row to carry a date
+])
+def test_an_undated_ledger_is_refused_unless_explicitly_accepted(monkeypatch, tmp_path, capsys,
+                                                                  header, row):
+    # without a date nothing stops a ledger that already holds today's fills
+    # from printing the same orders a second time
+    mod = _live(monkeypatch, _prices(SPY=100))
+    _sleeves(monkeypatch, mod, {'SPY': 0.4})
+    undated = _ledger(tmp_path, [] if row is None else [row], header, name='undated.csv')
+    argv = ['--as-of', DAY, '--equity', '1000', '--ledger', str(undated)]
+    monkeypatch.setattr(sys, 'argv', ['live_targets.py', *argv])
+    with pytest.raises(ValueError) as refusal:
+        mod.main()
+    message = str(refusal.value)
+    assert message.startswith('the ledger has no as_of date')
+    assert 'the NYSE session whose fills the ledger reflects' in message     # what the column means
+    assert 'cash,SGOV,0,<previous session>' in message and '--ignore-ledger-date' in message
+    out = capsys.readouterr().out
+    assert 'MOC ORDERS' not in out and 'NET PORTFOLIO TARGET' not in out
+    # the explicit override prints the sheet, flagged
+    assert _run(mod, monkeypatch, *argv, '--ignore-ledger-date') == 0
+    out = capsys.readouterr().out
+    assert ('  !! ledger has no as_of date, accepted under --ignore-ledger-date: nothing checks '
+            "that it reflects the previous session's fills") in out
+    assert 'MOC ORDERS' in out
+
+
+def test_a_ledger_with_no_position_is_dated_on_a_zero_share_row(monkeypatch, tmp_path, capsys):
+    mod = _live(monkeypatch, _prices(SPY=100, SGOV=100))
+    _sleeves(monkeypatch, mod, {'SPY': 0.4})
+    # the first session: no position yet, and still a date
+    first = _ledger(tmp_path, [f'cash,SGOV,0,{PREVIOUS}'], 'sleeve,ticker,shares,as_of')
+    assert mod.read_ledger(first).attrs['as_of'] == pd.Timestamp(PREVIOUS)
+    assert _run(mod, monkeypatch, '--as-of', DAY, '--equity', '1000', '--ledger', str(first)) == 0
+    out = capsys.readouterr().out
+    assert '!!' not in out and 'BUY       2 SPY' in _orders(out)
 
 
 def test_a_ledger_older_than_the_previous_session_needs_the_explicit_override(monkeypatch, tmp_path, capsys):
@@ -865,6 +1083,26 @@ def test_post_trade_ledger_keeps_unsent_tickers_at_their_current_per_sleeve_shar
     unsent = mod.post_trade_ledger(targets, ledger, {'SPY'}, pd.Timestamp(DAY))
     assert unsent.values.tolist() == [['mean_reversion', 'SPY', 4, DAY], ['seasonality_flows', 'SPY', 6, DAY],
                                       ['cash', 'SGOV', 9, DAY]]
+    # a book with no position left still carries its date, on a zero-share cash row
+    empty = mod.post_trade_ledger({'mean_reversion': {}, 'cash': {}}, ledger, set(), pd.Timestamp(DAY))
+    assert empty.values.tolist() == [['cash', 'SGOV', 0, DAY]]
+
+
+def test_written_ledger_stays_dated_when_every_position_is_sold(monkeypatch, tmp_path, capsys):
+    mod = _live(monkeypatch, _prices(SPY=100))          # no cash ETF quote: nothing is parked
+    _sleeves(monkeypatch, mod, {'SPY': 0.})
+    ledger = _ledger(tmp_path, ['mean_reversion,SPY,3'])
+    out_path = tmp_path / 'after.csv'
+    assert _run(mod, monkeypatch, '--equity', '1000', '--as-of', DAY, '--ledger', str(ledger),
+                '--write-ledger', str(out_path)) == 0
+    assert 'SELL      3 SPY' in _orders(capsys.readouterr().out)
+    assert out_path.read_text().splitlines() == ['sleeve,ticker,shares,as_of', f'cash,SGOV,0,{DAY}']
+    assert mod.read_ledger(out_path).attrs['as_of'] == pd.Timestamp(DAY)
+    # and the next session accepts it without any override
+    nxt = _live(monkeypatch, _prices('2024-01-03', SPY=100))
+    _sleeves(monkeypatch, nxt, {'SPY': 0.})
+    assert _run(nxt, monkeypatch, '--equity', '1000', '--as-of', '2024-01-03', '--ledger', str(out_path)) == 0
+    assert _orders(capsys.readouterr().out).strip().endswith('none')
 
 
 # ========================================================== alert channel

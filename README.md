@@ -19,14 +19,14 @@ tests) for testing new signals.
 
 | Strategy | Status | Sample | CAGR | Volatility | Sharpe full / in sample / out of sample | Max drawdown | Turnover | Cost drag |
 | --- | --- | --- | ---: | ---: | :---: | ---: | ---: | ---: |
-| Dip buying ([`mean_reversion`](src/strategies/mean_reversion.py)) | kept | 2000-11-10 to 2026-07-01 | 4.97% | 6.81% | 0.50 / 0.69 / 0.23 | -14.42% | 20.3x | 1.05% |
-| Turn of month ([`seasonality_flows`](src/strategies/seasonality_flows.py)) | kept | 2000-01-03 to 2026-07-01 | 7.35% | 10.08% | 0.58 / 0.58 / 0.58 | -13.47% | 24.1x | 0.59% |
+| Dip buying ([`mean_reversion`](src/strategies/mean_reversion.py)) | kept | 2000-11-10 to 2026-07-01 | 4.97% | 6.81% | 0.50 / 0.69 / 0.23 | -14.42% | 20.3x | 1.04% |
+| Turn of month ([`seasonality_flows`](src/strategies/seasonality_flows.py)) | kept | 2000-01-03 to 2026-07-01 | 7.36% | 10.08% | 0.58 / 0.58 / 0.58 | -13.47% | 24.1x | 0.58% |
 | Trend following ([`tsmom_trend`](src/strategies/tsmom_trend.py)) | kept | 2001-02-28 to 2026-07-01 | 5.58% | 6.25% | 0.64 / 0.77 / 0.42 | -14.67% | 2.0x | 0.18% |
 | ETF momentum rotation ([`xsec_etf_mom`](src/strategies/xsec_etf_mom.py)) | kept | 2002-03-28 to 2026-07-01 | 13.74% | 20.86% | 0.65 / 0.74 / 0.49 | -27.85% | 5.7x | 0.26% |
-| **Blend of the four kept strategies** ([`ensemble`](src/ensemble.py)) | kept | 2000-01-03 to 2026-07-01 | 6.59% | 6.35% | 0.76 / 0.90 / 0.51 | -11.33% | 12.7x | 0.72% |
+| **Blend of the four kept strategies** ([`ensemble`](src/ensemble.py)) | kept | 2000-01-03 to 2026-07-01 | 6.59% | 6.35% | 0.76 / 0.90 / 0.51 | -11.32% | 12.7x | 0.72% |
 | Stock momentum ([`xsec_stock_mom`](src/strategies/xsec_stock_mom.py)) | rejected | 2001-01-31 to 2026-07-01 | 20.25% | 26.18% | 0.77 / 0.75 / 0.82 | -41.79% | 13.7x | 2.51% |
-| VIX regime switch ([`vol_regime`](src/strategies/vol_regime.py)) | rejected | 2006-07-24 to 2026-07-01 | 11.95% | 15.79% | 0.70 / 0.79 / 0.62 | -40.95% | 12.0x | 0.41% |
-| ETF pairs ([`pairs_statarb`](src/strategies/pairs_statarb.py)) | rejected | 2000-06-30 to 2026-07-01 | 2.37% | 3.90% | 0.18 / 0.48 / -0.54 | -9.98% | 18.4x | 1.26% |
+| VIX regime switch ([`vol_regime`](src/strategies/vol_regime.py)) | rejected | 2006-07-24 to 2026-07-01 | 11.96% | 15.79% | 0.70 / 0.79 / 0.62 | -40.95% | 12.0x | 0.41% |
+| ETF pairs ([`pairs_statarb`](src/strategies/pairs_statarb.py)) | rejected | 2000-06-30 to 2026-07-01 | 2.38% | 3.90% | 0.18 / 0.48 / -0.54 | -9.95% | 18.4x | 1.26% |
 | Trend at 1.64x leverage ([`tsmom_voltarget`](src/strategies/tsmom_voltarget.py)) | rejected | 2001-02-28 to 2026-07-01 | 7.72% | 10.29% | 0.62 / 0.76 / 0.37 | -23.47% | 3.7x | 0.25% |
 
 How to read this:
@@ -103,8 +103,13 @@ Rejection is a normal outcome and gets the same write-up as a success.
   US stocks, one Treasury-bill fund and five index series (VIX, VIX3M, the
   13-week bill yield, the 10-year yield, the S&P 500), through `yfinance`.
   Adjusted and unadjusted closes come from one response, so each ex-date
-  dividend can be recovered. A refresh that would lose history the cache
-  already holds is refused unless `--allow-shrink` is passed.
+  dividend can be recovered. Once `data/` holds a cache, replacing it needs
+  `--refresh`, so the cache behind earlier results is not overwritten by
+  accident; a first download, or one into a directory named by
+  `QCORE_DATA_DIR`, needs no flag. A refresh that would lose history the
+  cache already holds is refused unless `--allow-shrink` is passed; index
+  rows dated on days the exchange was closed are left out of that
+  comparison.
 - [`src/qcore/quality.py`](src/qcore/quality.py) and
   [`scripts/data_quality.py`](scripts/data_quality.py) are the gate: 20
   checks covering the trading calendar, missing and duplicated rows, stale
@@ -113,7 +118,9 @@ Rejection is a normal outcome and gets the same write-up as a success.
   series. The exit code is 0 (nothing to review), 1 (warnings) or 2
   (failures), so a pipeline can stop on it. A warning that has been verified
   as a real event can be listed in a file passed with `--known`, which
-  records it as acknowledged.
+  records it as acknowledged. An entry can also carry the value measured
+  when it was checked; if the data later move away from that value, the
+  warning is reported again.
 - On the cache behind the results above (101 tickers, the ETFs and stocks
   without the Treasury-bill fund; 6,663 sessions) the gate reports no
   failure and 36 warnings. 32 of them were checked one by one and are real
@@ -177,13 +184,17 @@ assumption, not a verified broker schedule.
   stock momentum re-trades to its monthly target every day.
 - **Costs.** $0.005 a share with a $1 minimum and a cap of 1% of the trade,
   sell-side regulatory fees, and slippage of 2, 3 or 5 bps per side by
-  liquidity tier, on $100,000 of capital.
+  liquidity tier, on $100,000 of capital. The regulatory fees are the rates
+  as published for 2026: an SEC fee of $20.60 per million dollars of sale
+  proceeds and a FINRA fee of $0.000195 per share sold, capped at $9.79 a
+  trade. One rate is applied to the whole history; it is not a fee history.
 - **Cash.** Idle cash earns the previous day's 13-week bill yield less 10
   bps. Short proceeds earn nothing. Margin interest and stock borrow are not
   charged by the engine; the two modules that need them add their own.
 - **Withholding.** 30% of the dividend on each long position is charged on
   its ex-date, with Treasury funds exempt. Dividends are inferred from the
-  gap between adjusted and unadjusted prices.
+  gap between adjusted and unadjusted prices; a gap of five millionths of
+  the price or less is rounding in the vendor's data and is ignored.
 - **Metrics.** Sharpe ratios use returns in excess of the credited cash
   rate. Turnover counts buys plus sells. The in-sample and out-of-sample
   split is 2018-01-01.
@@ -200,6 +211,15 @@ Nothing here places an order or connects to a broker.
   today's session and the clock is between 30 and 10 minutes before the
   close. Earlier, the snapshot is not a near-close price; later, the order
   would fill at the next close.
+- **Input gates.** The sheet is not printed unless the data-quality gate
+  has judged the same cache: its report must be for the cache's last date,
+  no older than any price file in it, and free of failures
+  (`--no-gate-check` skips this and says so loudly on the sheet). A ledger
+  of current positions must carry the date of the session whose fills it
+  reflects, and that must be the previous session, so a ledger that already
+  holds today's fills cannot print the same orders twice. An undated ledger,
+  or one dated another session, is refused unless `--ignore-ledger-date` is
+  passed.
 - **Funding and rounding.** Each strategy gets the account's equity times
   its blend weight. Orders are whole shares, rounded down per strategy, and
   the rounding gap is printed. Idle cash is parked in a Treasury-bill fund
@@ -209,10 +229,16 @@ Nothing here places an order or connects to a broker.
   the official close and with the modelled commissions. Slippage is judged
   in dollars lost over dollars traded; more than 2 bps above the assumption
   is a breach.
+- [`scripts/nav_to_returns.py`](scripts/nav_to_returns.py) turns a daily
+  log of the account's net asset value, with deposits and withdrawals, into
+  the returns file the monitor below reads. A deposit or withdrawal counts
+  from the start of its session, so it is not booked as a gain or a loss.
+  The file is only ever appended to: a log with a missing session, or one
+  that changes a return already written, is refused.
 
 The input files in [`examples/`](examples) are made up to show the format:
-a ledger for the order sheet, a fills file for the reconciliation, and a
-daily returns file for the monitor below.
+a ledger for the order sheet, a fills file for the reconciliation, a NAV
+log for `nav_to_returns.py` and a daily returns file for the monitor below.
 
 ### 6. Risk controls
 
@@ -350,14 +376,19 @@ for key in mean_reversion seasonality_flows tsmom_trend xsec_etf_mom; do
 done
 python src/ensemble.py
 
-# 5. order sheet for the sample's last session, and the fills check
+# 5. order sheet for the sample's last session (it needs the gate's report
+#    from step 1), and the fills check
 python scripts/live_targets.py --as-of 2021-12-31 --cash 5000 \
     --ledger examples/ledger.example.csv --ignore-ledger-date
 python scripts/reconcile.py examples/fills.example.csv
 
-# 6. stop rules: on the blended backtest, and on a returns file
+# 6. stop rules: on the blended backtest, on a returns file, and on the
+#    returns derived from a NAV log
 python scripts/monitor.py --backtest
 python scripts/monitor.py examples/live_returns.example.csv --as-of 2025-03-31
+python scripts/nav_to_returns.py examples/nav.example.csv \
+    --out sample_data/live_returns.csv
+python scripts/monitor.py sample_data/live_returns.csv --as-of 2025-04-21
 
 # results table and charts (kept inside sample_data/, which Git ignores)
 python scripts/make_results_summary.py --out sample_data/summary
@@ -394,7 +425,7 @@ which command creates it.
 ```bash
 unset QCORE_DATA_DIR
 rm -rf results
-python src/download_data.py
+python src/download_data.py    # add --refresh to replace an existing data/
 python scripts/data_quality.py
 ```
 
@@ -448,7 +479,8 @@ Scripts therefore never replace one silently
   delisted names.
 - **Costs are assumptions.** Commissions, fees, slippage, the cash yield and
   dividend withholding are fixed model parameters, not a current broker
-  schedule or tax accounting. No tax other than dividend withholding is
+  schedule or tax accounting. The regulatory fees use the 2026 rates for
+  every year of the backtest. No tax other than dividend withholding is
   modelled. Costs are computed for $100,000 of capital, and nothing here is
   a capacity estimate.
 - **Share counts and dividends are inferred.** Commissions use a
@@ -456,8 +488,10 @@ Scripts therefore never replace one silently
   in early years (up to the 1% cap) and reverse splits are undercharged.
   Dividends come from the gap between adjusted and unadjusted prices, so
   special distributions and spin-off adjustments are charged withholding
-  like ordinary dividends, and rounding in the vendor's adjusted prices
-  leaves a few spurious payouts of about two millionths of the price.
+  like ordinary dividends. Gaps of five millionths of the price or less are
+  treated as the vendor's rounding and dropped, which would also drop a
+  real payout that small; the smallest real payouts in the cache are about
+  eight millionths.
 - **The blend's weights are fixed and its re-split is free.** The weights
   come from in-sample volatility and are never re-estimated. Moving capital
   between strategies is not costed in the headline.
@@ -485,6 +519,7 @@ scripts/data_quality.py     data-quality gate
 scripts/make_sample_data.py synthetic sample cache
 scripts/live_targets.py     order sheet
 scripts/reconcile.py        fills against the cost and slippage assumptions
+scripts/nav_to_returns.py   NAV log to the daily returns file the monitor reads
 scripts/monitor.py          stop rules
 scripts/trial_registry.py   trial count, deflated Sharpe ratios, bootstrap
 scripts/make_results_summary.py

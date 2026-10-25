@@ -423,12 +423,31 @@ def test_ordinary_gaps_in_the_cash_rate_are_tolerated(monkeypatch, capsys, tmp_p
     index, returns = two_year_file(mod)
     irx = full_irx(mod, index)
     # Thursday, Friday and Monday without a print: Tuesday is priced off a
-    # six-day-old Wednesday print, inside MAX_RATE_AGE_DAYS = 7.
+    # six-day-old Wednesday print, inside MAX_RATE_AGE_DAYS = 10.
     irx = irx.drop(pd.to_datetime(["2021-03-11", "2021-03-12", "2021-03-15", "2022-06-01"]))
     mod = rated_monitor(monkeypatch, irx)
-    assert mod.MAX_RATE_AGE_DAYS == 7
+    assert mod.MAX_RATE_AGE_DAYS == 10
     code, out = run(mod, monkeypatch, capsys, tmp_path, {"ENSEMBLE": returns}, index)
     assert code == 2 and out.rstrip().endswith("overall: KILL")
+
+
+@pytest.mark.parametrize("first, last, code", [
+    ("2021-03-11", "2021-03-17", 2),  # Thursday 18 March priced off Wednesday 10: 8 days
+    ("2021-03-10", "2021-03-18", 2),  # Friday 19 March priced off Tuesday 9: 10 days, the limit
+    ("2021-03-12", "2021-03-19", 3),  # Monday 22 March priced off Thursday 11: 11 days
+])
+def test_a_cash_rate_print_prices_return_dates_for_ten_calendar_days(monkeypatch, capsys, tmp_path,
+                                                                     first, last, code):
+    mod = load_monitor()
+    index, returns = two_year_file(mod)
+    irx = full_irx(mod, index)
+    mod = rated_monitor(monkeypatch, irx.drop(irx.loc[first:last].index))
+    got, out = run(mod, monkeypatch, capsys, tmp_path, {"ENSEMBLE": returns}, index)
+    assert got == code
+    if code == 3:
+        assert "have no print in the prior 10 days" in out and "overall" not in out
+    else:
+        assert out.rstrip().endswith("overall: KILL")
 
 
 def test_pending_sharpe_window_does_not_need_the_cash_rate(monkeypatch, capsys, tmp_path):

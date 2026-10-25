@@ -32,7 +32,8 @@ For `r_t = close_t / close_{t-1} - 1`:
    `t`. Features should be invariant when later rows are removed. Signals
    must score each date using its own available features, and fitting may
    use only the supplied training rows.
-2. Holdings are `H_t = W_{t-lag}` and earn `gross_t = sum(H_t * r_t)`.
+2. Holdings are `H_t = W_{t-lag}` and earn `gross_t = sum(H_t * r_t)`
+   (across a price gap, see "Walk-forward and missing data").
    **The default is `execution_lag=2`:** a target computed after Monday's
    close executes at Tuesday's close and first earns Wednesday's return.
    `lag=1` assumes the target can already be fixed before the same close
@@ -69,15 +70,35 @@ For `r_t = close_t / close_{t-1} - 1`:
   untouched out-of-sample interpretation.
 - `walkforward: null` fits on the full sample and is a diagnostic mode.
 - Unavailable scores or ineligible assets receive zero target weights;
-  holdings still follow the configured lag. Prices are not forward-filled.
-  Missing returns contribute zero, and lagged positions can persist after
-  prices disappear. A price gap inside a holding period makes two returns
-  missing (the gap day and the day the price returns), so the move across
-  the gap is dropped, not booked when the price reappears. No delisting
-  payout or forced liquidation is modeled; turnover costs still follow the
-  configured cost model. Results involving missing prices require separate
-  review. A run warns and records `meta.missing_held_return_cells`
-  whenever a held return is missing.
+  holdings still follow the configured lag. Prices are not forward-filled,
+  and lagged positions can persist after prices disappear. A missing return
+  contributes zero on its day. When a held asset's price returns after a
+  gap inside the panel, the day it returns books the whole move since the
+  last available close (`close_t / close_s - 1`), so the gap days book zero
+  and the move across them is not lost. Only past prices are read.
+- That move is booked on the part of the position held through the whole
+  gap: the smallest holding from the day after the last price to the day
+  the price returns, when all of them have the same sign. Exposure opened
+  or added during a gap could only trade at a stale price and earns none of
+  the move: a target decided at the last close before the gap would
+  otherwise earn a move from its own decision close. Exposure cut during a
+  gap counts as sold at the last available price, like any trade dated in
+  a gap. The library's constructors give an asset without a price zero
+  weight, so a gap of at least `execution_lag` days closes the position at
+  the stale price and its move is not booked; with the default lag of 2
+  the move across a one-day gap is booked.
+- A position whose price never returns (a delisting, the end of the data)
+  and an asset's first price have no move to bridge and book zero. No
+  delisting payout or forced liquidation is modeled; turnover costs still
+  follow the configured cost model. Only the engine's booked return bridges
+  a gap: features, volatility targeting and the cost model's volatility
+  estimate use one-day returns, which leave the move across a gap out.
+  Results involving missing prices require separate review. A run warns
+  whenever a held return is missing and records
+  `meta.missing_held_return_cells` (held cells whose one-day return is
+  missing) and `meta.bridged_held_return_cells` (those of them on which a
+  move across a gap was booked). Runs saved before the second key existed
+  lack it: they booked no such move.
 
 ## Scores and portfolio construction
 

@@ -63,9 +63,9 @@ Result
       10% target, cap 1.5       0.53 / 0.72 / 0.23    10.58%   -26.97%
       10% target, cap 2.0       0.54 / 0.76 / 0.22    11.49%   -35.17%
       constant 1.64x            0.62 / 0.76 / 0.37    10.29%   -23.47%
-      concentrated, unscaled    0.44 / 0.58 / 0.19    10.52%   -26.29%
+      concentrated, unscaled    0.44 / 0.58 / 0.19    10.52%   -26.28%
     The rule selects constant 1.64x: it ties the cap-2.0 variant at 0.76 in
-    sample and has the shallower in-sample drawdown (-12.59% against
+    sample and has the shallower in-sample drawdown (-12.58% against
     -19.28%). At double slippage it scores 0.61 / 0.75 / 0.36. Its daily
     returns correlate 0.997 with the baseline's.
 

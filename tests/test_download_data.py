@@ -54,7 +54,7 @@ def _fake_vendor(equity, index, calls=None):
     return fetch
 
 
-def _refresh(monkeypatch, tmp_path, equity, index=None, **kwargs):
+def _refresh(monkeypatch, tmp_path, equity, index=None, calls=None, **kwargs):
     """Run main() against a fake vendor, with tmp_path as the cache."""
     monkeypatch.setattr(download_data, "DATA_DIR", tmp_path)
     monkeypatch.setattr(qcore.data, "DATA_DIR", tmp_path)
@@ -62,7 +62,7 @@ def _refresh(monkeypatch, tmp_path, equity, index=None, **kwargs):
     monkeypatch.setattr(download_data, "STOCK_UNIVERSE", ["BBB"])
     monkeypatch.setattr(download_data, "OPERATIONAL_UNIVERSE", [])
     index = _index_response(len(equity)) if index is None else index
-    monkeypatch.setattr(download_data.yf, "download", _fake_vendor(equity, index))
+    monkeypatch.setattr(download_data.yf, "download", _fake_vendor(equity, index, calls))
     download_data.main(**kwargs)
 
 
@@ -406,13 +406,119 @@ def test_command_line_passes_the_escape_hatch_to_the_refresh(monkeypatch, capsys
     monkeypatch.setattr(download_data, "main", lambda **kwargs: seen.append(kwargs))
     download_data._cli([])
     download_data._cli(["--allow-shrink"])
-    assert seen == [{"allow_shrink": False}, {"allow_shrink": True}]
-    with pytest.raises(SystemExit) as stop:
-        download_data._cli(["--allow-shrnk"])  # a mistyped flag must not start a refresh
-    assert stop.value.code == 2 and len(seen) == 2
+    download_data._cli(["--refresh"])
+    download_data._cli(["--refresh", "--allow-shrink"])
+    assert seen == [{"allow_shrink": False, "refresh": False},
+                    {"allow_shrink": True, "refresh": False},
+                    {"allow_shrink": False, "refresh": True},
+                    {"allow_shrink": True, "refresh": True}]
+    # a mistyped or abbreviated flag must not start a refresh
+    for wrong in ("--allow-shrnk", "--allow", "--ref", "--refres"):
+        with pytest.raises(SystemExit) as stop:
+            download_data._cli([wrong])
+        assert stop.value.code == 2 and len(seen) == 4, wrong
+    capsys.readouterr()
     with pytest.raises(SystemExit) as stop:
         download_data._cli(["--help"])
-    assert stop.value.code == 0 and "--allow-shrink" in capsys.readouterr().out
+    shown = capsys.readouterr().out
+    assert stop.value.code == 0 and "--allow-shrink" in shown and "--refresh" in shown
+
+
+# ------------------------------------------------ the default (frozen) cache
+def _as_default(monkeypatch, folder):
+    """Make `folder` the default cache directory, as data/ is without
+    QCORE_DATA_DIR."""
+    monkeypatch.setattr(download_data, "DEFAULT_DATA_DIR", folder)
+    return folder
+
+
+def test_downloader_knows_the_default_cache_and_the_files_it_writes():
+    assert download_data.DEFAULT_DATA_DIR == qcore.data.DEFAULT_DATA_DIR
+    assert sorted(download_data.CACHE_FILES) == sorted(CACHE_FILES)
+
+
+@pytest.mark.parametrize("state", ["absent", "empty", "other files only"])
+def test_first_download_into_the_default_directory_needs_no_flag(monkeypatch, tmp_path, state):
+    home = _as_default(monkeypatch, tmp_path / "data")
+    if state != "absent":
+        home.mkdir()
+    if state == "other files only":
+        # hand-kept files beside the cache are not a cache
+        (home / "dq_known_events.csv").write_text("check,ticker,date,note\r\n")
+        (home / ".refresh-interrupted").mkdir()
+    _refresh(monkeypatch, home, _response())
+    written = {p.name for p in home.iterdir() if p.suffix == ".csv"}
+    assert {f"{n}.csv" for n in CACHE_FILES} <= written
+
+
+@pytest.mark.parametrize("held", CACHE_FILES)
+def test_replacing_the_default_cache_needs_refresh(monkeypatch, tmp_path, held):
+    home = _as_default(monkeypatch, tmp_path / "data")
+    home.mkdir()
+    (home / f"{held}.csv").write_text(f"original {held}")
+    (home / "dq_known_events.csv").write_text("check,ticker,date,note\r\n")
+    before = _snapshot(home)
+    calls = []
+    with pytest.raises(SystemExit) as stop:
+        _refresh(monkeypatch, home, _response(), calls=calls, allow_shrink=True)
+    assert calls == []  # stopped before any network request
+    assert _snapshot(home) == before
+    # a message, not a status number: python prints it on stderr and exits 1
+    message = stop.value.code
+    assert isinstance(message, str) and "\n" not in message
+    assert str(home) in message and f"{held}.csv" in message
+    assert "frozen research cache" in message
+    assert "--refresh" in message and "QCORE_DATA_DIR" in message
+
+
+def test_refresh_replaces_the_default_cache_and_keeps_the_history_guard(monkeypatch, tmp_path):
+    home = _as_default(monkeypatch, tmp_path / "data")
+    _refresh(monkeypatch, home, _response())  # the first download
+    before = _snapshot(home)
+    with pytest.raises(SystemExit, match="--refresh"):
+        _refresh(monkeypatch, home, _response(8))
+    assert _snapshot(home) == before
+    # --refresh does not stand in for --allow-shrink: lost history is refused
+    with pytest.raises(ValueError, match=r"(?s)refresh refused.*adj_close\.csv AAA: 4 of 6"):
+        _refresh(monkeypatch, home, _lose(_response(), slice(0, 4), "AAA"), refresh=True)
+    assert _snapshot(home) == before
+    _refresh(monkeypatch, home, _response(8), refresh=True)
+    assert len(_read(home / "adj_close.csv")) == 8
+    _refresh(monkeypatch, home, _lose(_response(8), slice(0, 4), "AAA"),
+             refresh=True, allow_shrink=True)
+    assert _read(home / "adj_close.csv")["AAA"].notna().sum() == 4
+
+
+def test_cache_named_by_qcore_data_dir_is_replaced_without_the_flag(monkeypatch, tmp_path):
+    home = _as_default(monkeypatch, tmp_path / "data")
+    _refresh(monkeypatch, home, _response())
+    frozen = _snapshot(home)
+    live = tmp_path / "live_cache"
+    _refresh(monkeypatch, live, _response())       # first download there
+    _refresh(monkeypatch, live, _response(8))      # and a later refresh
+    assert len(_read(live / "adj_close.csv")) == 8
+    assert _snapshot(home) == frozen
+
+
+def test_refused_default_refresh_exits_with_one_line_on_stderr(tmp_path):
+    src = Path(download_data.__file__).resolve().parent
+    home = tmp_path / "data"
+    home.mkdir()
+    (home / "adj_close.csv").write_text("original adj_close")
+    code = ("import sys, pathlib, download_data as d\n"
+            "home = pathlib.Path(sys.argv[1])\n"
+            "d.DEFAULT_DATA_DIR = d.DATA_DIR = home\n"
+            "def vendor(*args, **kwargs):\n"
+            "    raise AssertionError('network request')\n"
+            "d.yf.download = vendor\n"
+            "d._cli([])\n")
+    env = {k: v for k, v in os.environ.items() if k != "QCORE_DATA_DIR"}
+    env.update(PYTHONPATH=str(src), PYTHONDONTWRITEBYTECODE="1")
+    done = subprocess.run([sys.executable, "-c", code, str(home)], env=env,
+                          capture_output=True, text=True)
+    assert done.returncode == 1 and done.stdout == ""
+    assert done.stderr.count("\n") == 1 and "--refresh" in done.stderr
+    assert (home / "adj_close.csv").read_text() == "original adj_close"
 
 
 # ------------------------------------------------------ download validation
@@ -550,6 +656,37 @@ def test_refresh_that_loses_cached_history_is_refused_and_cache_untouched(monkey
     with pytest.raises(ValueError, match=message) as refusal:
         _refresh(monkeypatch, tmp_path, equity, index=index)
     assert "refresh refused" in str(refusal.value) and "--allow-shrink" in str(refusal.value)
+    assert _snapshot(tmp_path) == before
+
+
+def _with_closed_day_print(index, value=13.2):
+    """`index` plus a ^VIX print on 2024-01-01, New Year's Day, when the
+    exchange was closed (as a vendor's holiday print, e.g. ^VIX on Memorial
+    Day 2026)."""
+    holiday = pd.Timestamp("2024-01-01")
+    extra = pd.DataFrame(np.nan, index=[holiday], columns=index.columns)
+    extra.loc[holiday, ("Close", "^VIX")] = value
+    return pd.concat([extra, index])
+
+
+def test_withdrawn_index_print_on_a_closed_day_does_not_block_a_refresh(monkeypatch, tmp_path):
+    _refresh(monkeypatch, tmp_path, _response(), index=_with_closed_day_print(_index_response()))
+    assert pd.Timestamp("2024-01-01") in _read(tmp_path / "indices.csv").index
+    _refresh(monkeypatch, tmp_path, _response())  # the vendor withdrew the holiday print
+    indices = _read(tmp_path / "indices.csv")
+    assert list(indices.index) == list(_index_response().index)
+
+
+def test_withdrawn_index_print_on_a_session_is_still_refused(monkeypatch, tmp_path):
+    _refresh(monkeypatch, tmp_path, _response(), index=_with_closed_day_print(_index_response()))
+    before = _snapshot(tmp_path)
+    # the holiday print goes (exempt) and so does a session print (guarded);
+    # only the session is reported, out of the six session observations
+    with pytest.raises(ValueError, match=r"indices\.csv \^VIX: 1 of 6 cached observations "
+                                         r"missing \(2024-01-03 \.\. 2024-01-03\)") as refusal:
+        _refresh(monkeypatch, tmp_path, _response(),
+                 index=_lose(_index_response(), [1], "^VIX"))
+    assert "2024-01-01" not in str(refusal.value)
     assert _snapshot(tmp_path) == before
 
 
@@ -734,18 +871,33 @@ def test_dividend_noise_floor_decides_which_differences_count_as_payouts(monkeyp
     expected = pd.DataFrame(False, index=dates, columns=raw.columns)
     expected.iloc[ex_rows, 0] = True
 
-    # the shipped floor keeps every payout, and also the positive half of the
-    # noise above it; changing the value moves saved results, so it is pinned
-    assert qcore.data.DIVIDEND_NOISE_FLOOR == 1e-6
+    # the shipped floor separates the rounding noise from every payout;
+    # changing the value moves saved results, so it is pinned
+    assert qcore.data.DIVIDEND_NOISE_FLOOR == 5e-6
+    clean = qcore.data.dividend_yields()
+    pd.testing.assert_frame_equal(clean > 0, expected)
+    assert clean.iloc[ex_rows, 0].to_numpy() == pytest.approx(paid, rel=0.02)
+
+    # a floor inside the noise band keeps every payout, and also the positive
+    # half of the noise above it
+    monkeypatch.setattr(qcore.data, "DIVIDEND_NOISE_FLOOR", 1e-6)
     kept = qcore.data.dividend_yields()
     assert (kept >= 0).all().all() and (kept[expected] > 0).sum().sum() == len(ex_rows)
     spurious = (kept > 0) & ~expected
     assert spurious.sum().sum() > 10 and kept[spurious].max().max() < 2.5e-6
 
-    monkeypatch.setattr(qcore.data, "DIVIDEND_NOISE_FLOOR", 5e-6)
-    clean = qcore.data.dividend_yields()
-    pd.testing.assert_frame_equal(clean > 0, expected)
-    assert clean.iloc[ex_rows, 0].to_numpy() == pytest.approx(paid, rel=0.02)
+
+def test_dividend_noise_floor_sits_between_the_noise_and_the_smallest_payouts(monkeypatch):
+    dates = pd.bdate_range("2020-01-01", periods=4)
+    raw = pd.DataFrame(100.0, index=dates, columns=["AAA"])
+    # adjusted return minus price return: 7.6e-6 (a small real payout), then
+    # 2.3e-6 (the largest rounding noise seen), then nothing
+    steps = np.array([1.0, 1.0 + 7.6e-6, 1.0 + 2.3e-6, 1.0])
+    adjusted = raw.mul(np.cumprod(steps), axis=0)
+    monkeypatch.setattr(qcore.data, "load", lambda name: adjusted if name == "adj_close" else raw)
+    kept = qcore.data.dividend_yields()["AAA"]
+    assert kept.iloc[1] == pytest.approx(7.6e-6, rel=1e-6)
+    assert kept.iloc[[0, 2, 3]].tolist() == [0.0, 0.0, 0.0]
 
 
 def test_blank_close_guard_passes_a_late_listing_and_names_every_later_hole():

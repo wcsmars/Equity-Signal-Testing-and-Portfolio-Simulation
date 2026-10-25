@@ -48,14 +48,14 @@ def test_engine_charges_commission_regulatory_fees_and_slippage_by_hand():
     cm = IBKRHKCostModel()  # $100k account, 3 bps slippage, default SEC/TAF rates
     res = bt.run_backtest(_entry(px), px, cm, cash_rate=0.0, withholding=0.0)
     # $100k at $50 = 2,000 shares: commission 2,000 x $0.005 = $10.00;
-    # SEC fee $100k x 0.0000278 = $2.78; TAF 2,000 x $0.000166 = $0.332;
-    # the two sell-only fees are halved across both sides: $1.556.
-    # ($10 + $1.556) / $100k = 1.1556 bps, plus 3 bps slippage = 4.1556 bps.
-    assert res["costs"].loc[px.index[K]] == pytest.approx(4.1556e-4, rel=1e-12)
+    # SEC fee $100k x 0.0000206 = $2.06; TAF 2,000 x $0.000195 = $0.39;
+    # the two sell-only fees are halved across both sides: 0.5 x $2.45 = $1.225.
+    # ($10 + $1.225) / $100k = 1.1225 bps, plus 3 bps slippage = 4.1225 bps.
+    assert res["costs"].loc[px.index[K]] == pytest.approx(4.1225e-4, rel=1e-12)
     assert res["costs"].drop(px.index[K]).abs().max() == 0.0
     assert res["turnover"].loc[px.index[K]] == pytest.approx(1.0)
     # the public helper and the engine's inline arithmetic must agree
-    assert cm.cost_bps_per_side(price=50.0, trade_notional=100_000.0) == pytest.approx(4.1556, rel=1e-12)
+    assert cm.cost_bps_per_side(price=50.0, trade_notional=100_000.0) == pytest.approx(4.1225, rel=1e-12)
 
 
 def test_slippage_is_charged_once_per_side_on_top_of_commission():
@@ -74,17 +74,35 @@ def test_regulatory_fees_are_halved_and_the_taf_is_capped():
     cm = IBKRHKCostModel(slippage_bps=0.0)
     res = bt.run_backtest(_entry(px), px, cm, cash_rate=0.0, withholding=0.0)
     # 200,000 shares at $0.50: commission $1,000 (also the 1% cap);
-    # SEC $2.78; TAF 200,000 x $0.000166 = $33.20, capped at $8.30;
-    # ($1,000 + 0.5 x ($2.78 + $8.30)) / $100k = 100.554 bps
-    assert res["costs"].loc[px.index[K]] == pytest.approx(0.0100554, rel=1e-12)
-    assert cm.cost_bps_per_side(0.50, 100_000.0) == pytest.approx(100.554, rel=1e-12)
+    # SEC $2.06; TAF 200,000 x $0.000195 = $39.00, capped at $9.79;
+    # ($1,000 + 0.5 x ($2.06 + $9.79)) / $100k = $1,005.925 / $100k = 100.5925 bps
+    assert res["costs"].loc[px.index[K]] == pytest.approx(0.01005925, rel=1e-12)
+    assert cm.cost_bps_per_side(0.50, 100_000.0) == pytest.approx(100.5925, rel=1e-12)
     # below the cap the TAF is proportional to the share count
     sec_taf_only = IBKRHKCostModel(slippage_bps=0.0, commission_per_share=0.0, min_commission=0.0)
-    # 10,000 shares at $10: 0.5 x ($2.78 + $1.66) = $2.22 on $100k = 0.222 bps
-    assert sec_taf_only.cost_bps_per_side(10.0, 100_000.0) == pytest.approx(0.222, rel=1e-12)
+    # 10,000 shares at $10: 0.5 x ($2.06 + $1.95) = $2.005 on $100k = 0.2005 bps
+    assert sec_taf_only.cost_bps_per_side(10.0, 100_000.0) == pytest.approx(0.2005, rel=1e-12)
     px = _flat(price=10.0)
     res = bt.run_backtest(_entry(px), px, sec_taf_only, cash_rate=0.0, withholding=0.0)
-    assert res["costs"].loc[px.index[K]] == pytest.approx(0.222e-4, rel=1e-12)
+    assert res["costs"].loc[px.index[K]] == pytest.approx(0.2005e-4, rel=1e-12)
+
+
+def test_the_taf_cap_is_a_cost_model_field_that_the_engine_reads():
+    assert IBKRHKCostModel().finra_taf_cap == 9.79
+    px = _flat(price=0.50)
+    cm = IBKRHKCostModel(slippage_bps=0.0, finra_taf_cap=20.0)
+    res = bt.run_backtest(_entry(px), px, cm, cash_rate=0.0, withholding=0.0)
+    # 200,000 shares at $0.50: TAF $39.00, capped at the model's $20.00;
+    # ($1,000 + 0.5 x ($2.06 + $20.00)) / $100k = $1,011.03 / $100k = 101.103 bps
+    assert res["costs"].loc[px.index[K]] == pytest.approx(0.0101103, rel=1e-12)
+    assert cm.cost_bps_per_side(0.50, 100_000.0) == pytest.approx(101.103, rel=1e-12)
+    # a cap of zero removes the TAF: ($1,000 + 0.5 x $2.06) / $100k = 100.103 bps
+    assert IBKRHKCostModel(slippage_bps=0.0, finra_taf_cap=0.0).cost_bps_per_side(
+        0.50, 100_000.0) == pytest.approx(100.103, rel=1e-12)
+    # the cap is validated like every other field
+    for bad in (-0.01, np.nan, np.inf):
+        with pytest.raises(ValueError, match="finra_taf_cap must be finite and nonnegative"):
+            IBKRHKCostModel(finra_taf_cap=bad)
 
 
 def test_share_counts_use_the_raw_close_with_a_per_column_fallback(monkeypatch):
@@ -118,8 +136,8 @@ def test_turnover_counts_the_buy_leg_and_the_sell_leg():
     assert res["turnover"].loc[px.index[K]] == pytest.approx(1.0)
     assert res["turnover"].loc[px.index[K + 5]] == pytest.approx(2.0)
     assert res["turnover"].drop(px.index[[K, K + 5]]).abs().max() == 0.0
-    # each leg pays the 4.1556 bps worked out above
-    assert res["costs"].loc[px.index[K + 5]] == pytest.approx(2 * 4.1556e-4, rel=1e-12)
+    # each leg pays the 4.1225 bps worked out above
+    assert res["costs"].loc[px.index[K + 5]] == pytest.approx(2 * 4.1225e-4, rel=1e-12)
     # 3.0 of traded weight over the 20 live days, annualised: 3 / 20 x 252 = 37.8
     assert len(res["turnover"]) == 20
     assert bt.metrics(res)["ann_turnover_oneside"] == 37.8
