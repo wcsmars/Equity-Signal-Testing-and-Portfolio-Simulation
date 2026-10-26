@@ -313,3 +313,14 @@ def test_the_monitor_accepts_the_file_it_produces(nav, tmp_path, capsys, monkeyp
                            "--as-of", "2024-01-05"], capture_output=True, text=True,
                           env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
     assert done.returncode == 0 and done.stdout.rstrip().endswith("overall: ok")
+
+
+@pytest.mark.parametrize('rows', [
+    ['2024-01-02,1e308,', '2024-01-03,1e308,1e308'],  # capital overflows
+    ['2024-01-02,1e-308,', '2024-01-03,1e308,'],       # return overflows
+])
+def test_finite_nav_inputs_that_overflow_arithmetic_are_refused(nav, tmp_path, capsys, rows):
+    out = tmp_path / 'returns.csv'
+    code, shown = _run(nav, capsys, _log(tmp_path, rows), '--out', out)
+    assert code == 3 and 'not finite' in shown
+    assert not out.exists()

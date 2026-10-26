@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -207,6 +208,31 @@ def test_run_id_collision_gets_suffix(tmp_path, monkeypatch):
     assert third.run_id == expected_base + "-3"
     # all three are independently loadable
     assert tracker.load_run(third.run_id)["path"] == third.path
+
+
+def test_concurrent_run_id_claim_retries_without_touching_other_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(tracker_mod, "_utcnow", lambda: datetime(2026, 1, 2, 3, 4, 5))
+    cfg = config_from_dict({})
+    tracker = ExperimentTracker(tmp_path)
+    base = "20260102-030405_" + config_hash(cfg)[:8] + "_dup"
+    other = tmp_path / base
+    mkdir = Path.mkdir
+    claimed = False
+
+    def concurrent_mkdir(path, *args, **kwargs):
+        nonlocal claimed
+        if path == other and not claimed:
+            claimed = True
+            mkdir(path)
+            (path / "other-worker.txt").write_text("keep")
+        return mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", concurrent_mkdir)
+    rec = tracker.log_run(cfg, _small_result(), {}, name="dup")
+    assert rec.run_id == base + "-2"
+    assert (other / "other-worker.txt").read_text() == "keep"
+    assert list(tracker.list_runs()["run_id"]) == [rec.run_id]
+    assert tracker.load_run(rec.run_id)["path"] == rec.path
 
 
 def test_corrupt_registry_line_is_skipped(tmp_path):

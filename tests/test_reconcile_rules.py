@@ -358,3 +358,13 @@ def test_the_script_entry_point_uses_those_codes(monkeypatch, tmp_path, capsys, 
         exit_code = exc.code
     assert exit_code == code
     capsys.readouterr()
+
+
+def test_one_ticker_on_one_date_cannot_have_two_official_closes():
+    mod = module()
+    fills = _frame([
+        ['2024-01-02', 'SPY', 'BUY', 10., 100.1, 0.5, 100.],
+        ['2024-01-02', 'SPY', 'SELL', 10., 100.1, 0.5, 101.],
+    ])
+    with pytest.raises(ValueError, match='inconsistent reference_close.*SPY.*2024-01-02'):
+        mod.reconcile_fills(fills)

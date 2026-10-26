@@ -351,6 +351,27 @@ def test_margin_follows_leverage_decided_at_the_previous_close(monkeypatch):
     assert result["leverage"].tolist() == pytest.approx([0.0] * 5 + [0.5] * 3)
 
 
+def test_margin_aligns_sparse_targets_before_lagging(monkeypatch):
+    from strategies import tsmom_voltarget as vt
+    dates = pd.bdate_range("2024-01-02", periods=4)
+    weights = pd.DataFrame({"X": 1.5}, index=dates[[0, 2]])
+    monkeypatch.setattr(vt, "load_indices", lambda: pd.DataFrame({"^IRX": 5.0}, index=dates))
+    returns = pd.Series(0.0, index=dates)
+    result = vt.charge_margin({"returns": returns.copy(), "gross_returns": returns.copy()}, weights)
+    # Missing target rows mean zero exposure in run_backtest. Financing
+    # follows that same full return calendar, rather than the sparse rows.
+    daily = 0.5 * (1.065 ** (1 / 252) - 1)
+    assert result["margin_drag"].tolist() == pytest.approx([0.0, daily, 0.0, daily])
+
+
+def test_borrow_preserves_the_previous_close_when_returns_are_sliced():
+    from strategies.pairs_statarb import apply_borrow
+    dates = pd.bdate_range("2024-01-02", periods=4)
+    weights = pd.DataFrame({"X": -0.5}, index=dates)
+    result = apply_borrow({"returns": pd.Series(0.0, index=dates[2:])}, weights)
+    assert result["returns"].tolist() == pytest.approx([-0.5 * 0.01 / 252] * 2)
+
+
 def test_voltarget_uses_the_trend_module_itself_not_a_second_copy():
     from strategies import tsmom_trend
     from strategies import tsmom_voltarget as vt

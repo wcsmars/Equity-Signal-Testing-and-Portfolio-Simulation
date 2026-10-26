@@ -400,3 +400,49 @@ def test_report_of_a_cache_named_by_the_override_is_written_beside_it(runs):
     saved = json.loads(report.read_text())
     assert (saved["worst"], saved["data_dir"]) == ("ok", str(r.cache))
     assert f"overall: ok   (0 findings -> {report})" in r.out, r.out
+
+
+def test_unwritable_failure_report_still_exits_fail(tmp_path):
+    # An output below a regular file cannot be created. Reporting that failure
+    # must not itself crash with exit 1 (the pipeline's WARN status).
+    blocked = tmp_path / "not_a_folder"
+    blocked.write_text("keep me")
+    done = subprocess.run(
+        [sys.executable, str(SCRIPT), "--out", str(blocked / "report.json")],
+        env={**os.environ, "QCORE_DATA_DIR": str(tmp_path / "missing")},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "data quality: FAIL" in done.stdout
+    assert "cannot write failure report" in done.stderr
+    assert "Traceback" not in done.stderr
+    assert blocked.read_text() == "keep me"
+
+
+def test_report_cannot_overwrite_an_input_cache_file(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    source = cache / "close.csv"
+    original = "Date,SPY\n2024-01-02,100\n"
+    source.write_text(original)
+    done = subprocess.run(
+        [sys.executable, str(SCRIPT), "--out", str(source)],
+        env={**os.environ, "QCORE_DATA_DIR": str(cache)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert done.returncode == 2
+    assert "report output names an input file" in done.stdout
+    assert source.read_text() == original
+
+
+def test_dependency_failure_exits_fail_instead_of_warn(tmp_path):
+    # Shadow pandas only inside the subprocess: no installed package changes.
+    (tmp_path / "pandas.py").write_text("raise ImportError('injected missing dependency')\n")
+    done = subprocess.run(
+        [sys.executable, str(SCRIPT)],
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "data quality: FAIL" in done.stdout and "start-up" in done.stdout
+    assert "Traceback" not in done.stderr

@@ -290,7 +290,7 @@ def _cache(tmp_path, end, gate=True):
     px = _panel(probe, end).round(4)
     cache = tmp_path / 'live_cache'
     cache.mkdir()
-    for name in ('adj_close', 'close'):
+    for name in ('adj_close', 'close', 'open', 'high', 'low', 'volume', 'indices'):
         px.to_csv(cache / f'{name}.csv')
     if gate:
         _gate_report(cache, end)
@@ -371,7 +371,7 @@ def _gated(monkeypatch, tmp_path, default=False, report=None):
     cache = project / 'data' if default else tmp_path.resolve() / 'live_cache'
     for folder in (cache, project / 'results'):
         folder.mkdir(parents=True, exist_ok=True)
-    for name in ('adj_close', 'close'):
+    for name in mod.GATE_PRICE_FILES:
         (cache / f'{name}.csv').write_text(f'Date,SPY\n{DAY},100.0\n')
     monkeypatch.setattr(mod, 'ROOT', project)
     monkeypatch.setattr(mod, 'DEFAULT_DATA_DIR', project / 'data')
@@ -1189,3 +1189,15 @@ def test_the_script_entry_point_never_exits_one(monkeypatch, capsys, error, code
         runpy.run_path(str(ROOT / 'scripts' / 'live_targets.py'), run_name='__main__')
     assert exc.value.code == code
     assert 'MOC ORDERS' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('missing', ['open', 'high', 'low', 'volume', 'indices'])
+def test_gate_refuses_when_a_required_cache_file_disappears(monkeypatch, tmp_path, missing):
+    mod, path = _gated(monkeypatch, tmp_path, report=None)
+    for name in mod.GATE_PRICE_FILES:
+        (mod.DATA_DIR / f'{name}.csv').write_text(f'Date,SPY\n{DAY},100.0\n')
+    path.write_text(json.dumps(_report()))
+    assert mod.quality_gate(pd.Timestamp(DAY)).startswith('data-quality gate:')
+    (mod.DATA_DIR / f'{missing}.csv').unlink()
+    with pytest.raises(ValueError, match=rf'required cache file.*{missing}\.csv'):
+        mod.quality_gate(pd.Timestamp(DAY))

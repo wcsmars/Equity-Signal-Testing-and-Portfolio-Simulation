@@ -433,6 +433,34 @@ def test_a_sleeve_that_deletes_its_record_gets_it_back(mod, monkeypatch, tmp_pat
     assert record.read_bytes() == kept
 
 
+def test_sleeve_capture_uses_final_returns_after_borrow_adjustment(mod, monkeypatch, tmp_path):
+    """Financing may return a copy of the engine result, as pairs does."""
+    import qcore.backtest as bt
+
+    monkeypatch.setattr(bt, "_raw_close", lambda: pd.DataFrame())
+    source = '''
+        import pandas as pd
+        from qcore.backtest import run_backtest, metrics
+        from strategies.pairs_statarb import apply_borrow
+
+        dates = pd.bdate_range("2017-01-03", periods=65)
+        prices = pd.DataFrame({"ZZA": 100.0}, index=dates)
+        weights = pd.DataFrame({"ZZA": -0.5}, index=dates)
+        raw = run_backtest(weights, prices, name="financed", cash_rate=0.0, withholding=0.0)
+        final = apply_borrow(raw, weights)
+        metrics(final)
+    '''
+    (tmp_path / "strategies" / "financed.py").write_text(textwrap.dedent(source))
+    (tmp_path / "results" / "financed.json").write_text(json.dumps({"name": "financed"}))
+    metric_before = bt.metrics
+    returns = mod.sleeve_returns("financed")
+    # Flat prices and constant short weights incur no subsequent turnover;
+    # every return after entry still owes borrow on the half-NAV short.
+    assert returns.iloc[1:].tolist() == pytest.approx([-0.5 * 0.01 / 252] * 64)
+    assert mod._last_sleeve_result["borrow_drag_ann"] > 0
+    assert bt.metrics is metric_before
+
+
 def test_a_declared_name_the_module_does_not_produce_is_explained(mod, monkeypatch, tmp_path):
     """A stored record can carry a run name its module has since changed. The
     record is kept as it is, so the message must not suggest rewriting it."""

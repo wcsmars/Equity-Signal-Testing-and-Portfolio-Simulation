@@ -226,6 +226,23 @@ def test_constant_nonzero_excess_has_no_sharpe():
         probabilistic_sharpe(wobble)
 
 
+def test_bootstrap_does_not_report_constant_positive_draws_as_zero_sharpe():
+    # The original sample has nonzero variance, but many resamples miss
+    # its one outlier. Those constant positive draws have undefined Sharpe;
+    # assigning zero would invent a large probability of nonpositive Sharpe.
+    excess = pd.Series([0.001] * 59 + [0.002])
+    with pytest.raises(ValueError, match="constant nonzero.*bootstrap"):
+        block_bootstrap_sharpe_ci(excess, n_boot=200, block=1, seed=7)
+
+
+def test_bootstrap_applies_the_same_all_cash_noise_floor_as_sharpe():
+    excess = pd.Series([1e-15] * 31 + [-1e-15] * 29)
+    assert sharpe_daily(excess) == 0.0
+    result = block_bootstrap_sharpe_ci(excess, n_boot=200, block=1, seed=7)
+    assert result["ci"] == [0.0, 0.0]
+    assert result["prob_sharpe_le_0"] == 1.0
+
+
 def test_statistics_reject_short_non_finite_and_malformed_input():
     r = _skewed_fat_tailed()
     with pytest.raises(ValueError, match=">= 60 daily observations, got 59"):

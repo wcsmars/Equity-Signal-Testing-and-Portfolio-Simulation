@@ -25,13 +25,18 @@ import os
 import sys
 from pathlib import Path
 
-import pandas as pd
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-import qcore.data as qdata  # noqa: E402
-from qcore.quality import PriceBundle, apply_known_events, run_all  # noqa: E402
+try:
+    import pandas as pd
+
+    import qcore.data as qdata
+    from qcore.quality import PriceBundle, apply_known_events, run_all
+except Exception as exc:  # a broken dependency must not look like WARN
+    print(f"data quality: FAIL - start-up failed: {type(exc).__name__}: {exc}; "
+          "install the packages in requirements.txt")
+    sys.exit(2)
 
 BADGE = {"FAIL": "!", "WARN": "?", "INFO": " "}
 DEFAULT_OUT = ROOT / "results" / "data_quality.json"
@@ -62,6 +67,17 @@ def main() -> None:
     args = ap.parse_args()
     if args.out is None:
         args.out = _default_out()
+
+    inputs = [qdata.DATA_DIR / f"{name}.csv"
+              for name in (*PriceBundle.FIELDS, "indices", "coverage")]
+    inputs.extend(path for path in (args.known or DEFAULT_KNOWN, args.fundamentals)
+                  if path is not None)
+    if any(args.out.resolve() == path.resolve()
+           or (args.out.exists() and path.exists() and args.out.samefile(path))
+           for path in inputs):
+        # Do not call _fail here: its report would destroy the input too.
+        print(f"data quality: FAIL - report output names an input file: {_shown(args.out)}")
+        sys.exit(2)
 
     try:
         if (args.known is not None and not args.strict
@@ -110,13 +126,17 @@ def _fail(out: Path, check: str, what: str, e: Exception) -> None:
     "WARN - eyeball" to the pipeline gating on us."""
     detail = _describe(e)
     print(f"data quality: FAIL - {what}: {detail}")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"worst": "FAIL", "n_findings": 1,
-                               "findings": [{"check": check,
-                                             "severity": "FAIL",
-                                             "ticker": "", "date": "",
-                                             "detail": detail}]},
-                              indent=1))
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"worst": "FAIL", "n_findings": 1,
+                                   "findings": [{"check": check,
+                                                 "severity": "FAIL",
+                                                 "ticker": "", "date": "",
+                                                 "detail": detail}]},
+                                  indent=1))
+    except OSError as error:
+        print(f"data quality: FAIL - cannot write failure report: {_describe(error)}",
+              file=sys.stderr)
     sys.exit(2)
 
 

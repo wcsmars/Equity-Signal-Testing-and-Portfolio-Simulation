@@ -155,8 +155,10 @@ def pair_weights(px: pd.DataFrame, a: str, b: str, H: int = H, Z: int = Z,
 def apply_borrow(result: dict, weights: pd.DataFrame, rate: float = BORROW_RATE) -> dict:
     """1%/yr borrow on short notional (lagged weights = in force)."""
     # Align before lagging, matching run_backtest's zero-target convention
-    # for omitted price-calendar rows.
-    aligned = weights.reindex(result["returns"].index).fillna(0.0).clip(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT)
+    # for omitted price-calendar rows; retain earlier targets when the
+    # supplied result is a slice of the complete return stream.
+    calendar = weights.index.union(result["returns"].index).sort_values()
+    aligned = weights.reindex(calendar).fillna(0.0).clip(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT)
     short = aligned.clip(upper=0).abs().sum(axis=1).shift(1).fillna(0.0)
     drag = (rate / 252.0) * short.reindex(result["returns"].index).fillna(0.0)
     result = dict(result)

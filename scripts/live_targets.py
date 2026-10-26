@@ -275,9 +275,13 @@ def quality_gate(t: pd.Timestamp) -> str:
             raise ValueError(f"data-quality report {shown} judged the cache in {recorded}, not "
                              f"this run's cache {_shown(DATA_DIR)}; {rerun}")
     written = path.stat().st_mtime_ns
+    missing = [f"{name}.csv" for name in GATE_PRICE_FILES
+               if not (DATA_DIR / f"{name}.csv").is_file()]
+    if missing:
+        raise ValueError(f"required cache file(s) missing since the data-quality gate ran: "
+                         f"{', '.join(missing)}; {rerun}")
     newer = [f"{name}.csv" for name in GATE_PRICE_FILES
-             if (DATA_DIR / f"{name}.csv").is_file()
-             and (DATA_DIR / f"{name}.csv").stat().st_mtime_ns > written]
+             if (DATA_DIR / f"{name}.csv").stat().st_mtime_ns > written]
     if newer:
         raise ValueError(f"data-quality report {shown} is older than the cache's "
                          f"{', '.join(newer)}: the prices changed after the gate ran; {rerun}")

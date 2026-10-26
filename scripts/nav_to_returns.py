@@ -208,12 +208,21 @@ def read_nav_log(path: Path) -> pd.DataFrame:
 def daily_returns(log: pd.DataFrame) -> pd.Series:
     """r_t = nav_t / (nav_{t-1} + flow_t) - 1 for every row after the first."""
     base = log["nav"].shift(1) + log["flow"]
+    invalid = ~base.iloc[1:].map(math.isfinite)
+    if invalid.any():
+        day = invalid.index[invalid.to_numpy()][0]
+        raise Refused(f"on {day.date()} the previous nav plus the flow is not finite")
     bad = base.iloc[1:] <= 0
     if bad.any():
         day = bad.index[bad.to_numpy()][0]
         raise Refused(f"on {day.date()} the previous nav plus the flow is "
                       f"{base[day]:,.2f}, not positive: a withdrawal cannot exceed the account")
-    return (log["nav"] / base - 1).iloc[1:].rename("ENSEMBLE")
+    returns = (log["nav"] / base - 1).iloc[1:].rename("ENSEMBLE")
+    invalid = ~returns.map(math.isfinite)
+    if invalid.any():
+        day = invalid.index[invalid.to_numpy()][0]
+        raise Refused(f"on {day.date()} the calculated return is not finite")
+    return returns
 
 
 def read_written(path: Path) -> list[tuple[str, float]]:

@@ -167,6 +167,7 @@ def reconcile_fills(fills: pd.DataFrame, close: pd.DataFrame | None = None) -> p
     order_shares = fills.groupby(order_keys)["shares"].transform("sum")
     order_notional = (fills["shares"] * fills["price"]).groupby(order_keys).transform("sum")
     rows = []
+    references = {}
     for position, f in enumerate(fills.itertuples()):
         supplied = getattr(f, "reference_close", np.nan)
         if pd.notna(supplied):
@@ -179,6 +180,11 @@ def reconcile_fills(fills: pd.DataFrame, close: pd.DataFrame | None = None) -> p
                              "in the fill's historical traded units; cached prices cannot prove this")
         if not np.isfinite(ref) or ref <= 0:
             raise ValueError(f"invalid reference_close for {f.ticker} on {f.date.date()}")
+        key = (f.date, f.ticker)
+        if key in references and not np.isclose(ref, references[key], rtol=0, atol=1e-10):
+            raise ValueError(f"inconsistent reference_close for {f.ticker} on {f.date.date()}: "
+                             "every fill must use the same official close")
+        references[key] = ref
         sign = 1.0 if f.side == "BUY" else -1.0
         slip_bps = sign * (f.price - ref) / ref * 1e4
         whole_order = modeled_cost(cm, f.side, float(order_shares.iloc[position]),

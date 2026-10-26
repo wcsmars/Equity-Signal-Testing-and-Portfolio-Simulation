@@ -219,11 +219,18 @@ class ExperimentTracker:
         run_name = name or cfg.experiment.name
         base = "_".join([_utcnow().strftime("%Y%m%d-%H%M%S"), chash[:8], slug(run_name)])
         run_id, n = base, 2
-        while (self.runs_dir / run_id).exists():
-            run_id = f"{base}-{n}"
-            n += 1
-        run_dir = self.runs_dir / run_id
-        run_dir.mkdir(parents=True)
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        while True:
+            run_dir = self.runs_dir / run_id
+            try:
+                # Claim the id atomically: another sweep worker can choose
+                # the same timestamp/hash/name between an exists() check
+                # and mkdir(). Only the worker that created it owns cleanup.
+                run_dir.mkdir()
+                break
+            except FileExistsError:
+                run_id = f"{base}-{n}"
+                n += 1
         try:
             (run_dir / "config.yaml").write_text(
                 yaml.safe_dump(_portable_config(cfg.to_dict(), run_dir), sort_keys=False)

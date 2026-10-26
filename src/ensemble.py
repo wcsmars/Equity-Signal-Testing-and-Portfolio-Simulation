@@ -87,6 +87,7 @@ DEFAULT_SLEEVES = ["mean_reversion", "seasonality_flows",
 
 _captured: list[dict] = []
 _orig_run_backtest = bt.run_backtest
+_orig_metrics = bt.metrics
 _capital_scale = 1.0
 _last_sleeve_result: dict = {}
 _collected_results: dict[str, dict] = {}
@@ -104,6 +105,19 @@ def _capturing_run_backtest(*args, **kwargs):
     res = _orig_run_backtest(*args, **kwargs)
     _captured.append(res)
     return res
+
+
+def _capturing_metrics(result, *args, **kwargs):
+    """Retain the reported stream when a financing step returned a copy.
+
+    Updating only a uniquely named run preserves the duplicate-name guard:
+    metrics must not make two ambiguous engine runs look like one.
+    """
+    matches = [i for i, r in enumerate(_captured)
+               if r.get("name") == result.get("name")]
+    if len(matches) == 1:
+        _captured[matches[0]] = result
+    return _orig_metrics(result, *args, **kwargs)
 
 
 def _skip_sleeve_record(path, content, **_) -> Path:
@@ -150,15 +164,18 @@ def sleeve_returns(key: str) -> pd.Series | None:
 
     _captured.clear()
     previous_run = bt.run_backtest
+    previous_metrics = bt.metrics
     previous_argv = sys.argv
     previous_save = records.save_record
     bt.run_backtest = _capturing_run_backtest
+    bt.metrics = _capturing_metrics
     sys.argv = [str(module)]
     records.save_record = _skip_sleeve_record
     try:
         runpy.run_path(str(module), run_name="__main__")
     finally:
         bt.run_backtest = previous_run
+        bt.metrics = previous_metrics
         sys.argv = previous_argv
         records.save_record = previous_save
         # a module that writes its results file directly is undone here

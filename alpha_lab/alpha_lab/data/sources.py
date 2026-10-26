@@ -160,12 +160,14 @@ class CSVSource(DataSource):
         if not self.path.is_file():
             raise DataError(f"long csv source expects a single file: {self.path}")
         try:
-            # tickers stay literal strings, as in the wide format and config:
-            # no numeric inference ('10001') and no NA conversion ('NA')
+            # Protect identifiers from pandas' missing-string inference.
+            # Recent pandas versions apply it even after a str converter;
+            # wrap each literal during parsing and unwrap below. Numeric
+            # columns retain the parser's normal missing-value handling.
             raw = pd.read_csv(
                 self.path,
                 dtype={"date": str},
-                converters={"ticker": str},
+                converters={"ticker": lambda value: (value,)},
                 float_precision="round_trip",
             )
         except (ValueError, KeyError) as exc:
@@ -174,6 +176,7 @@ class CSVSource(DataSource):
         missing = required - set(raw.columns)
         if missing:
             raise DataError(f"{self.path}: long csv missing columns {sorted(missing)}")
+        raw["ticker"] = raw["ticker"].map(lambda value: value[0])
         raw["date"] = _parse_dates(raw["date"], self.path)
         value_cols = [c for c in raw.columns if c not in ("date", "ticker")]
         unknown = [c for c in value_cols if c not in _LONG_FIELDS]

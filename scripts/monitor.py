@@ -162,6 +162,10 @@ MAX_STALE_SESSIONS = 5  # one trading week, the check cadence
 # days of margin over that gap, and a rate series that has stopped updating
 # is still refused within two weeks.
 MAX_RATE_AGE_DAYS = 10
+# nav_to_returns writes 12 decimal places. A window entirely within half
+# that last decimal of cash has no measurable excess return; a tiny export
+# residual must not turn its zero variance into an infinite losing Sharpe.
+EXCESS_ROUNDING_TOL = 5e-13 + 1e-15
 
 
 def current_ny_date() -> pd.Timestamp:
@@ -253,7 +257,10 @@ def evaluate(returns: pd.Series, since=None) -> list[tuple[str, str, str]]:
               else np.asarray(r.index >= pd.Timestamp(since)))
     if not judged.any():
         raise ValueError(f"no session on or after {pd.Timestamp(since).date()} to judge")
-    eq = (1 + r).cumprod()
+    with np.errstate(over="ignore", invalid="ignore"):
+        eq = (1 + r).cumprod()
+    if not np.isfinite(eq.to_numpy(dtype=float)).all():
+        raise ValueError("monitor account equity is not finite; check the return units")
     peak = eq.cummax().clip(lower=1.0)
 
     dd = (eq / peak - 1).to_numpy(dtype=float)
@@ -270,6 +277,7 @@ def evaluate(returns: pd.Series, since=None) -> list[tuple[str, str, str]]:
             sharpe[first:] = np.where(
                 std > 0, mean / std * np.sqrt(TRADING_DAYS),
                 np.where(mean != 0, np.sign(mean) * np.inf, np.nan))
+        sharpe[first:][np.max(np.abs(windows), axis=1) <= EXCESS_ROUNDING_TOL] = np.nan
     at_peak = (eq >= peak - 1e-12).to_numpy()
     last_peak = np.maximum.accumulate(np.where(at_peak, np.arange(n), 0))
     underwater_m = np.asarray((r.index - r.index[last_peak]).days, dtype=float) / 30.44

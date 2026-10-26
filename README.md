@@ -11,7 +11,7 @@ page. A second, configurable library, Alpha Lab, packages the same
 discipline (walk-forward evaluation, an explicit execution lag, leakage
 tests) for testing new signals.
 
-**Author:** https://github.com/wcsmars
+**Maintainer:** [GitHub profile](https://github.com/wcsmars)
 
 ## Results at a glance
 
@@ -184,8 +184,8 @@ assumption, not a verified broker schedule.
   stock momentum re-trades to its monthly target every day.
 - **Costs.** $0.005 a share with a $1 minimum and a cap of 1% of the trade,
   sell-side regulatory fees, and slippage of 2, 3 or 5 bps per side by
-  liquidity tier, on $100,000 of capital. The regulatory fees are the rates
-  as published for 2026: an SEC fee of $20.60 per million dollars of sale
+  liquidity tier, on $100,000 of capital. The model applies an SEC fee of
+  $20.60 per million dollars of sale
   proceeds and a FINRA fee of $0.000195 per share sold, capped at $9.79 a
   trade. One rate is applied to the whole history; it is not a fee history.
 - **Cash.** Idle cash earns the previous day's 13-week bill yield less 10
@@ -206,7 +206,8 @@ Nothing here places an order or connects to a broker.
 - [`scripts/live_targets.py`](scripts/live_targets.py) prints the order
   sheet: target shares per strategy, then one net market-on-close order per
   ticker for a person to enter. It reuses the strategy modules' own signal
-  code, so the backtest and the order sheet cannot drift apart.
+  code, so both use the same rule implementation. Near-close inputs and final-close
+  backtest inputs can still produce different decisions.
 - **Timing gates.** A live run is refused unless the price cache ends on
   today's session and the clock is between 30 and 10 minutes before the
   close. Earlier, the snapshot is not a near-close price; later, the order
@@ -233,8 +234,9 @@ Nothing here places an order or connects to a broker.
   log of the account's net asset value, with deposits and withdrawals, into
   the returns file the monitor below reads. A deposit or withdrawal counts
   from the start of its session, so it is not booked as a gain or a loss.
-  The file is only ever appended to: a log with a missing session, or one
-  that changes a return already written, is refused.
+  New sessions are appended; a log with a missing session, or one that
+  changes a return already written, is refused. Explicit `--rebuild`
+  replaces the file deliberately after a correction.
 
 The input files in [`examples/`](examples) are made up to show the format:
 a ledger for the order sheet, a fills file for the reconciliation, a NAV
@@ -264,8 +266,10 @@ longest spell below a previous peak is 22.9 months, both inside the limits.
 The two-year Sharpe rule is not: it falls to -0.64 on 2020-03-18 and is
 below -0.30 on 20 sessions (February and March 2020, October and November
 2023). That rule would have stopped the strategy inside its own backtest.
-The thresholds are shown as they were set; whether to set them again is an
-open question, not a settled one.
+The registered thresholds remain unchanged. A live-file verdict uses the
+worst judged session, so a recovered breach remains visible until the review
+window moves past it. Backtest calibration defaults to the final session;
+use `--since` to inspect an earlier window.
 
 Other limits sit earlier in the pipeline: the data-quality gate, a cap of
 150% on any single weight in the engine, and position caps, gross leverage
@@ -363,6 +367,11 @@ The sample cache is simulated. It exercises every command; the figures it
 produces mean nothing.
 
 ```bash
+# Preserve any earlier run before initializing the sample's records.
+mkdir -p state
+if test -d results; then
+  mv results "state/prior-results-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
 python scripts/make_sample_data.py
 export QCORE_DATA_DIR="$PWD/sample_data"
 
@@ -424,13 +433,18 @@ which command creates it.
 
 ```bash
 unset QCORE_DATA_DIR
-rm -rf results
+mkdir -p state
+if test -d results; then
+  mv results "state/synthetic-results-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
 python src/download_data.py    # add --refresh to replace an existing data/
 python scripts/data_quality.py
 ```
 
-Then run the same commands as above, with the last date of the downloaded
-cache for `--as-of`. `python scripts/make_results_summary.py` without `--out`
+Then run the strategy, blend and diagnostic commands from the sample section,
+with the last date of the downloaded cache for `--as-of`. Keep `QCORE_DATA_DIR`
+unset; do not repeat the sample-generation or sample-cache export commands.
+`python scripts/make_results_summary.py` without `--out`
 rewrites `examples/qcore/` from your download. The download goes through
 `yfinance`; it can be rate-limited or revised by the provider, and the data
 must be obtained under the provider's terms. Expect the gate to exit with
@@ -440,8 +454,8 @@ before reading any result; exit 2 means stop. A close that stays flat for
 weeks is a failure for an ordinary ticker but only a warning for a
 Treasury-bill fund: SGOV, where the order sheet parks idle cash, printed the
 same close for 11 to 13 sessions three times in 2020.
-`rm -rf results` matters: records computed from the sample must not be mixed
-with records from market data.
+Keep the previous results in the ignored `state/` archive: records computed
+from the sample must not be mixed with records from market data.
 
 ### Saved records are protected
 
@@ -479,7 +493,7 @@ Scripts therefore never replace one silently
   delisted names.
 - **Costs are assumptions.** Commissions, fees, slippage, the cash yield and
   dividend withholding are fixed model parameters, not a current broker
-  schedule or tax accounting. The regulatory fees use the 2026 rates for
+  schedule or tax accounting. One regulatory-fee schedule is applied to
   every year of the backtest. No tax other than dividend withholding is
   modelled. Costs are computed for $100,000 of capital, and nothing here is
   a capacity estimate.
@@ -542,20 +556,20 @@ examples/qcore/             results table and charts from market data
 
 ## Validation
 
-1535 tests collected. In clean environments they were run on Python 3.12
-with pandas 2.3 and with pandas 3.0, and on Python 3.11 with the lowest
-versions that `requirements.txt` allows: in each, 1534 pass and 1 is skipped
-(it needs `pyarrow`, which is not a requirement). With `pyarrow` installed,
-three more parametrised cases are collected and nothing is skipped. SciPy is
-not required.
+1675 tests collected in an isolated Python 3.12.14 environment with NumPy
+2.5.4 and pandas 3.1.0 on 2026-10-27: 1674 pass and 1 is skipped because it
+requires optional `pyarrow`. The additional Parquet cases depend on that
+optional package. SciPy is not required.
 
-Every command in [How to run](#how-to-run) was run from a fresh clone on
-Python 3.12, except the live download of market data. The downloader is
-tested offline against simulated responses; a live download is not part of
-the automated checks. One manual download of the full list was checked
-separately: the strategies, the blend, the order sheet and the monitor ran
-on it, and the gate's only failures were the three flat stretches in the
-Treasury-bill fund that it now reports as warnings.
+The same source also passes in a standalone copy with the declared minimum
+versions on Python 3.11.7: 1673 pass and 2 are skipped (optional Parquet and
+a Git-metadata check because the relocated copy has no `.git` directory).
+The synthetic Alpha Lab report reproduces byte for byte from a standalone
+copy, and the Alpha Lab wheel installs and imports outside the repository.
+The offline suite exercises the data gate, strategies, blend, order sheet,
+fill reconciliation, NAV conversion and monitor as subprocesses. The downloader
+is tested against simulated responses; no live vendor download or real broker
+execution was performed for this revision.
 
 The GitHub workflow runs the tests, the offline example (comparing its
 report with `examples/synthetic_report.md`) and the sample-cache pipeline on

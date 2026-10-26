@@ -1657,6 +1657,15 @@ def check_fundamentals(fund: pd.DataFrame,
     metric_cols = [c for c in fund.columns
                    if c not in ("ticker", "period_end", "report_date")
                    and pd.api.types.is_numeric_dtype(fund[c])]
+    for metric in metric_cols:
+        invalid = fund[metric].notna() & ~np.isfinite(fund[metric])
+        for _, row in fund.loc[invalid].head(10).iterrows():
+            out.append(Finding(
+                "fund_numeric", "FAIL", row["ticker"], _fmt_d(row["period_end"]),
+                f"nonfinite {metric}: {row[metric]}"))
+        # Report the defect above, then avoid spurious unit-break and
+        # copy-forward conclusions derived from infinity arithmetic.
+        fund.loc[invalid, metric] = np.nan
 
     # a row with no period_end cannot be placed in time: report it, then
     # keep it out of the per-period checks (NaT sorts last and would be

@@ -633,6 +633,25 @@ def test_long_csv_keeps_numeric_and_na_like_tickers_as_strings(tmp_path):
     assert loaded.close.notna().all().all()
 
 
+def test_literal_ticker_parsing_preserves_numeric_missing_values(tmp_path):
+    file = tmp_path / "long.csv"
+    file.write_text(
+        "date,ticker,close,volume\n"
+        "2024-01-02,NA,100,NA\n"
+        "2024-01-02,NULL,101,NULL\n"
+        "2024-01-02,N/A,102,\n"
+        "2024-01-03,NA,NaN,123\n"
+        "2024-01-03,NULL,103,124\n"
+        "2024-01-03,N/A,104,125\n"
+    )
+    loaded = CSVSource(file, format="long", tickers=["NA", "NULL", "N/A"]).load()
+    assert list(loaded.close.columns) == ["NA", "NULL", "N/A"]
+    assert loaded.close.iloc[0].tolist() == [100., 101., 102.]
+    assert np.isnan(loaded.close.loc["2024-01-03", "NA"])
+    assert loaded.volume.iloc[0].isna().all()
+    assert loaded.volume.iloc[1].tolist() == [123., 124., 125.]
+
+
 def test_tickers_start_end_filtering(tmp_path, market_simple):
     directory = write_wide_dir(tmp_path / "wide", market_simple)
     dates = market_simple.dates

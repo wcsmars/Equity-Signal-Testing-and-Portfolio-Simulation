@@ -179,7 +179,10 @@ def charge_margin(result, w_daily):
     the 150bp spread; ^IRX floored at 0.
     """
     idx = result["returns"].index
-    effective = w_daily.clip(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT)
+    # Insert omitted target rows before lagging (the engine sets them to
+    # zero), while retaining prior target dates for a sliced result.
+    calendar = w_daily.index.union(idx).sort_values()
+    effective = w_daily.reindex(calendar).fillna(0.0).clip(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT)
     lev = (effective.shift(1).clip(lower=0.0).sum(axis=1) - 1.0).clip(lower=0.0)
     lev = lev.reindex(idx).fillna(0.0)
     irx = load_indices()["^IRX"].dropna()

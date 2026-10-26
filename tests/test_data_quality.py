@@ -1373,6 +1373,14 @@ def test_fund_negative_revenue_fails():
     assert grab(check_fundamentals(df), "fund_signs", "FAIL")
 
 
+def test_fund_infinite_metric_fails():
+    for metric, value in [("revenue", np.inf), ("eps", -np.inf)]:
+        df = build_clean_fundamentals()
+        df.loc[0, metric] = value
+        hits = grab(check_fundamentals(df), "fund_numeric", "FAIL")
+        assert any(metric in f.detail for f in hits)
+
+
 def test_fund_copy_forward_warns():
     df = build_clean_fundamentals()
     mask = df.ticker == "BBB"

@@ -479,3 +479,21 @@ def test_cash_benchmark_matches_the_engine_rate_when_covered(monkeypatch):
     rf = mod.cash_benchmark(index)
     assert rf.index.equals(index)
     np.testing.assert_allclose(rf.to_numpy(), 1.03 ** (1 / 252) - 1, rtol=0, atol=1e-15)
+
+
+def test_nav_export_rounding_cannot_kill_an_exactly_cash_matching_book(monitor, monkeypatch):
+    idx = pd.bdate_range('2020-01-01', periods=504)
+    benchmark = 0.0001234567894
+    monkeypatch.setattr(monitor, 'cash_benchmark', lambda dates: pd.Series(benchmark, index=dates))
+    # nav_to_returns writes 12 decimals: this rounds down by 4e-13.
+    r = pd.Series(round(benchmark, 12), index=idx)
+    assert monitor.evaluate(r)[1][2] == 'ok'
+    assert monitor.evaluate(r)[1][1].startswith('nan ')
+    # A real shortfall outside the export precision remains a breach.
+    assert monitor.evaluate(r - 1e-8)[1][2] == 'KILL'
+
+
+def test_overflowing_account_growth_produces_no_monitor_verdict(monitor):
+    idx = pd.bdate_range('2020-01-01', periods=3)
+    with pytest.raises(ValueError, match='account equity.*not finite'):
+        monitor.evaluate(pd.Series([1e308, 1e308, -0.5], index=idx))

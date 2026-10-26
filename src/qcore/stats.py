@@ -126,7 +126,12 @@ def block_bootstrap_sharpe_ci(excess: pd.Series, n_boot: int = 2000,
     samples = r[idx]
     mu = samples.mean(axis=1)
     sd = samples.std(axis=1, ddof=1)
-    sr = np.divide(mu, sd, out=np.zeros_like(mu), where=sd > _ZERO_TOL) * math.sqrt(TRADING_DAYS)
+    all_cash = np.all(np.abs(samples) <= _ZERO_TOL, axis=1)
+    if ((sd <= _ZERO_TOL) & ~all_cash).any():
+        raise ValueError("constant nonzero excess returns in bootstrap sample; "
+                         "Sharpe confidence interval is undefined")
+    sr = np.divide(mu, sd, out=np.zeros_like(mu),
+                   where=(sd > _ZERO_TOL) & ~all_cash) * math.sqrt(TRADING_DAYS)
     lo, hi = np.quantile(sr, [alpha / 2, 1 - alpha / 2])
     return {
         "sharpe_ann": round(observed * math.sqrt(TRADING_DAYS), 3),
